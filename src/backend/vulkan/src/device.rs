@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ops::Range;
 
-use {Backend as B, Device};
+use {Backend as B, Device, DeviceRef};
 use {conv, native as n, result, window as w};
 use pool::RawCommandPool;
 
@@ -55,6 +55,15 @@ impl Device {
             },
             Err(string) => Err(d::ShaderError::CompilationFailed(string)),
         }
+    }
+
+    #[cfg(feature = "portable")]
+    pub(crate) fn get_ref(&self) -> DeviceRef {
+        unsafe { mem::transmute(&*self.raw) }
+    }
+    #[cfg(not(feature = "portable"))]
+    pub (crate) fn get_ref(&self) -> DeviceRef {
+        self.raw.clone()
     }
 }
 
@@ -99,7 +108,7 @@ impl d::Device<B> for Device {
 
         RawCommandPool {
             raw: command_pool_raw,
-            device: self.raw.clone(),
+            device: self.get_ref(),
         }
     }
 

@@ -1,5 +1,4 @@
 use std::ptr;
-use std::sync::Arc;
 use ash::vk;
 use ash::version::DeviceV1_0;
 use smallvec::SmallVec;
@@ -7,12 +6,12 @@ use smallvec::SmallVec;
 use command::CommandBuffer;
 use conv;
 use hal::{pool, command};
-use {Backend, RawDevice};
+use {Backend, DeviceRef};
 
 
 pub struct RawCommandPool {
     pub(crate) raw: vk::CommandPool,
-    pub(crate) device: Arc<RawDevice>,
+    pub(crate) device: DeviceRef,
 }
 
 impl pool::RawCommandPool<Backend> for RawCommandPool {

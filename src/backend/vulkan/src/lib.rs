@@ -387,7 +387,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             raw: Arc::new(RawDevice(device_raw)),
         };
 
-        let device_arc = device.raw.clone();
+        let device_ref = device.get_ref();
         let queues = families
             .into_iter()
             .map(|(family, priorities)| {
@@ -395,11 +395,11 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                 let mut family_raw = hal::backend::RawQueueGroup::new(family);
                 for id in 0 .. priorities.len() {
                     let queue_raw = unsafe {
-                        device_arc.0.get_device_queue(family_index, id as _)
+                        device_ref.0.get_device_queue(family_index, id as _)
                     };
                     family_raw.add_queue(CommandQueue {
                         raw: Arc::new(queue_raw),
-                        device: device_arc.clone(),
+                        device: device_ref.clone(),
                         swapchain_fn: swapchain_fn.clone(),
                     });
                 }
@@ -588,12 +588,16 @@ impl Drop for RawDevice {
     }
 }
 
-// Need to explicitly synchronize on submission and present.
-pub type RawCommandQueue = Arc<vk::Queue>;
+#[cfg(feature = "portable")]
+type DeviceRef = &'static RawDevice;
 
+#[cfg(not(feature = "portable"))]
+type DeviceRef = Arc<RawDevice>;
+
+// Need to explicitly synchronize on submission and present.
 pub struct CommandQueue {
-    raw: RawCommandQueue,
-    device: Arc<RawDevice>,
+    raw: Arc<vk::Queue>,
+    device: DeviceRef,
     swapchain_fn: vk::SwapchainFn,
 }
 
