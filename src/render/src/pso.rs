@@ -105,17 +105,18 @@ define_descriptors! {
 impl<B: Backend> Bind<B> for SampledImage {
     type Handle = handle::raw::ImageView<B>;
 
-    fn write<'a, I>(views: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
+    fn write<'a, I>(_views: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
     where
         I: IntoIterator,
         I::Item: Borrow<&'a Self::Handle>,
     {
-        hal::pso::DescriptorWrite::SampledImage(views
+        hal::pso::DescriptorWrite::SampledImage(&[])
+        /* views
             .into_iter()
             .map(|view| {
                 let layout = ImageLayout::ShaderReadOnlyOptimal;
                 (view.borrow().resource(), layout)
-            }).collect())
+            }).collect())*/
     }
 
     fn require<'a>(
@@ -126,7 +127,7 @@ impl<B: Backend> Bind<B> for SampledImage {
     ) {
         let img = view.info();
         let levels = img.info().mip_levels;
-        let layers = img.info().kind.get_num_layers();
+        let layers = img.info().kind.num_layers();
         let state = (image::Access::SHADER_READ, ImageLayout::ShaderReadOnlyOptimal);
         for level in 0..levels {
             for layer in 0..layers {
@@ -139,15 +140,17 @@ impl<B: Backend> Bind<B> for SampledImage {
 impl<B: Backend> Bind<B> for Sampler {
     type Handle = handle::raw::Sampler<B>;
 
-    fn write<'a, I>(samplers: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
+    fn write<'a, I>(_samplers: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
     where
         I: IntoIterator,
         I::Item: Borrow<&'a Self::Handle>,
     {
-        hal::pso::DescriptorWrite::Sampler(samplers
+        hal::pso::DescriptorWrite::Sampler(&[])
+        /*
+        samplers
             .into_iter()
             .map(|sampler| sampler.borrow().resource())
-            .collect())
+            .collect())*/
     }
 
     fn require<'a>(
@@ -168,7 +171,7 @@ pub struct DescriptorSetBindRef<'a, 'b, B: Backend, T: Bind<B>> {
 
 pub struct DescriptorSetsUpdate<'a, B: Backend> {
     device: &'a mut Device<B>,
-    writes: Vec<hal::pso::DescriptorSetWrite<'a, 'a, B, (Option<u64>, Option<u64>)>>,
+    writes: Vec<hal::pso::DescriptorSetWrite<'a, B, (Option<u64>, Option<u64>)>>,
 }
 
 impl<'a, B: Backend> DescriptorSetsUpdate<'a, B> {
@@ -202,7 +205,7 @@ impl<'a, B: Backend> DescriptorSetsUpdate<'a, B> {
 
     pub fn finish(self) {
         use hal::Device;
-        self.device.raw.update_descriptor_sets(&self.writes);
+        self.device.raw.write_descriptor_sets(self.writes);
     }
 }
 
@@ -315,7 +318,7 @@ where
     ) where 'a: 'b {
         let img = data.as_ref().info();
         let levels = img.info().mip_levels;
-        let layers = img.info().kind.get_num_layers();
+        let layers = img.info().kind.num_layers();
         // TODO: READ not always necessary
         let state = (image::Access::COLOR_ATTACHMENT_READ | image::Access::COLOR_ATTACHMENT_WRITE,
             ImageLayout::ColorAttachmentOptimal);

@@ -127,7 +127,7 @@ fn main() {
         .memory_types;
     let limits = adapter
         .physical_device
-        .get_limits();
+        .limits();
 
     // Build a new device and associated command queues
     let (device, mut queue_group) =
@@ -431,18 +431,18 @@ fn main() {
         )
     );
 
-    device.update_descriptor_sets::<_,Range<_>>(&[
+    device.write_descriptor_sets::<_, Range<_>>(vec![
         pso::DescriptorSetWrite {
             set: &desc_set,
             binding: 0,
             array_offset: 0,
-            write: pso::DescriptorWrite::SampledImage(vec![(&image_srv, i::ImageLayout::Undefined)]),
+            write: pso::DescriptorWrite::SampledImage(&[(&image_srv, i::ImageLayout::Undefined)]),
         },
         pso::DescriptorSetWrite {
             set: &desc_set,
             binding: 1,
             array_offset: 0,
-            write: pso::DescriptorWrite::Sampler(vec![&sampler]),
+            write: pso::DescriptorWrite::Sampler(&[&sampler]),
         },
     ]);
 
@@ -538,7 +538,7 @@ fn main() {
             cmd_buffer.bind_graphics_descriptor_sets(&pipeline_layout, 0, Some(&desc_set)); //TODO
 
             {
-                let mut encoder = cmd_buffer.begin_renderpass_inline(
+                let mut encoder = cmd_buffer.begin_render_pass_inline(
                     &render_pass,
                     &framebuffers[frame.id()],
                     viewport.rect,
@@ -580,7 +580,7 @@ fn main() {
     device.destroy_fence(frame_fence);
     device.destroy_semaphore(frame_semaphore);
     device.destroy_pipeline_layout(pipeline_layout);
-    device.destroy_renderpass(render_pass);
+    device.destroy_render_pass(render_pass);
     device.free_memory(buffer_memory);
     device.free_memory(image_memory);
     device.free_memory(image_upload_memory);

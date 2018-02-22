@@ -7,15 +7,15 @@ use std::marker::PhantomData;
 mod compute;
 mod graphics;
 mod raw;
-mod renderpass;
+mod render_pass;
 mod transfer;
 
 pub use self::graphics::*;
 pub use self::raw::{ClearValueRaw, ClearColorRaw, ClearDepthStencilRaw, RawCommandBuffer, CommandBufferFlags, Level as RawLevel};
-pub use self::renderpass::*;
+pub use self::render_pass::*;
 pub use self::transfer::*;
 
-use std::borrow::Borrow;
+use std::borrow::{Cow};
 
 /// Trait indicating how many times a Submit can be submitted.
 pub trait Shot {
@@ -47,21 +47,19 @@ impl<B: Backend, C, S, L> Submit<B, C, S, L> {
 }
 unsafe impl<B: Backend, C, S, L> Send for Submit<B, C, S, L> {}
 
+
 /// A trait representing a command buffer that can be added to a `Submission`.
 pub unsafe trait Submittable<'a, B: Backend, C, L: Level> {
     ///
-    type RawBuffer: Borrow<B::CommandBuffer> + 'a;
-    ///
-    unsafe fn as_buffer(self) -> Self::RawBuffer;
+    unsafe fn into_buffer(self) -> Cow<'a, B::CommandBuffer>;
 }
 
 unsafe impl<'a, B: Backend, C, L: Level> Submittable<'a, B, C, L> for Submit<B, C, OneShot, L> {
-    type RawBuffer = B::CommandBuffer;
-    unsafe fn as_buffer(self) -> B::CommandBuffer { self.0 }
+    unsafe fn into_buffer(self) -> Cow<'a, B::CommandBuffer> { Cow::Owned(self.0) }
 }
+
 unsafe impl<'a, B: Backend, C, L: Level> Submittable<'a, B, C, L> for &'a Submit<B, C, MultiShot, L> {
-    type RawBuffer = &'a B::CommandBuffer;
-    unsafe fn as_buffer(self) -> &'a B::CommandBuffer { &self.0 }
+    unsafe fn into_buffer(self) -> Cow<'a, B::CommandBuffer> { Cow::Borrowed(&self.0) }
 }
 
 /// A convenience for not typing out the full signature of a secondary command buffer.
@@ -111,7 +109,7 @@ impl<'a, B: Backend, C, S: Shot> CommandBuffer<'a, B, C, S, Primary> {
         C: Supports<K>,
     {
         let submits = submits.into_iter().collect::<Vec<_>>();
-        self.raw.execute_commands(submits.into_iter().map(|submit| unsafe { submit.as_buffer() }));
+        self.raw.execute_commands(submits.into_iter().map(|submit| unsafe { submit.into_buffer() }));
     }
 }
 

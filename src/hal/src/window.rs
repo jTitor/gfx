@@ -60,7 +60,7 @@ use std::ops::Range;
 ///
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Extent2d {
+pub struct Extent2D {
     ///
     pub width: u32,
     ///
@@ -81,12 +81,12 @@ pub struct SurfaceCapabilities {
     /// Current extent of the surface.
     ///
     /// `None` if the surface has no explicit size, depending on the swapchain extent.
-    pub current_extent: Option<Extent2d>,
+    pub current_extent: Option<Extent2D>,
 
     /// Range of supported extents.
     ///
     /// `current_extent` must be inside this range.
-    pub extents: Range<Extent2d>,
+    pub extents: Range<Extent2D>,
 
     /// Maximum number of layers supported for presentable images.
     ///
@@ -97,7 +97,7 @@ pub struct SurfaceCapabilities {
 /// A `Surface` abstracts the surface of a native window, which will be presented
 pub trait Surface<B: Backend> {
     /// Retrieve the surface image kind.
-    fn get_kind(&self) -> image::Kind;
+    fn kind(&self) -> image::Kind;
 
     /// Check if the queue family supports presentation for this surface.
     ///

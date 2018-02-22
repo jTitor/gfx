@@ -13,7 +13,7 @@ extern crate winapi;
 extern crate winit;
 #[cfg(all(unix, not(target_os = "android")))]
 extern crate x11;
-#[cfg(all(unix, not(target_os = "android"), feature = "xcb"))]
+#[cfg(all(unix, not(target_os = "android")))]
 extern crate xcb;
 
 #[cfg(feature = "glsl-to-spirv")]
@@ -287,7 +287,7 @@ impl hal::Instance for Instance {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueueFamily {
     properties: vk::QueueFamilyProperties,
     device: vk::PhysicalDevice,
@@ -315,7 +315,7 @@ pub struct PhysicalDevice {
 
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, families: Vec<(QueueFamily, Vec<hal::QueuePriority>)>
+        &self, families: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>
     ) -> Result<hal::Gpu<Backend>, DeviceCreationError> {
         let family_infos = families
             .iter()
@@ -388,7 +388,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             .into_iter()
             .map(|(family, priorities)| {
                 let family_index = family.index;
-                let mut family_raw = hal::backend::RawQueueGroup::new(family);
+                let mut family_raw = hal::backend::RawQueueGroup::new(family.clone());
                 for id in 0 .. priorities.len() {
                     let queue_raw = unsafe {
                         device_arc.0.get_device_queue(family_index, id as _)
@@ -466,7 +466,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         }
     }
 
-    fn get_features(&self) -> Features {
+    fn features(&self) -> Features {
         let features = self.instance.0.get_physical_device_features(self.handle);
         let mut bits = Features::empty();
 
@@ -553,7 +553,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         bits
     }
 
-    fn get_limits(&self) -> Limits {
+    fn limits(&self) -> Limits {
         let limits = &self.properties.limits;
         let max_group_count = limits.max_compute_work_group_count;
         let max_group_size = limits.max_compute_work_group_size;
@@ -715,7 +715,7 @@ impl hal::Backend for Backend {
 
     type ShaderModule = native::ShaderModule;
     type RenderPass = native::RenderPass;
-    type Framebuffer = native::FrameBuffer;
+    type Framebuffer = native::Framebuffer;
 
     type UnboundBuffer = device::UnboundBuffer;
     type Buffer = native::Buffer;

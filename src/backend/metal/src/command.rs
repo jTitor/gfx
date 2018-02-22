@@ -10,13 +10,8 @@ use std::mem;
 use hal::{error, memory, pool, pso};
 use hal::{VertexCount, VertexOffset, InstanceCount, IndexCount};
 use hal::buffer::{IndexBufferView};
+use hal::command as com;
 use hal::image::{ImageLayout, SubresourceRange};
-use hal::command::{
-    AttachmentClear, ClearColorRaw, ClearDepthStencilRaw, ClearValueRaw,
-    BufferImageCopy, BufferCopy, ImageCopy, ImageResolve,
-    SubpassContents, RawCommandBuffer, CommandBufferFlags,
-    ColorValue, StencilValue, Rect, Viewport, RawLevel,
-};
 use hal::query::{Query, QueryControl, QueryId};
 use hal::queue::{RawCommandQueue, RawSubmission};
 
@@ -144,7 +139,7 @@ impl CommandBufferInner {
         }
     }
 
-    fn begin_renderpass(&mut self, encoder: metal::RenderCommandEncoder) {
+    fn begin_render_pass(&mut self, encoder: metal::RenderCommandEncoder) {
         self.stop_ecoding();
 
         self.encoder_state = EncoderState::Render(encoder);
@@ -329,7 +324,7 @@ impl pool::RawCommandPool<Backend> for CommandPool {
         }
     }
 
-    fn allocate(&mut self, num: usize, level: RawLevel) -> Vec<CommandBuffer> { //TODO: Implement secondary buffers
+    fn allocate(&mut self, num: usize, _level: com::RawLevel) -> Vec<CommandBuffer> { //TODO: Implement secondary buffers
         let buffers: Vec<_> = (0..num).map(|_| CommandBuffer {
             inner: Arc::new({
                 // TODO: maybe use unretained command buffer for efficiency?
@@ -418,7 +413,7 @@ impl CommandBuffer {
         }
     }
 
-    fn expect_renderpass(&self) -> &metal::RenderCommandEncoderRef {
+    fn expect_render_pass(&self) -> &metal::RenderCommandEncoderRef {
         if let EncoderState::Render(ref encoder) = self.inner_ref().encoder_state {
             encoder
         } else {
@@ -433,8 +428,8 @@ impl CommandBuffer {
     }
 }
 
-impl RawCommandBuffer<Backend> for CommandBuffer {
-    fn begin(&mut self, flags: CommandBufferFlags) { // TODO: Implement flags somehow
+impl com::RawCommandBuffer<Backend> for CommandBuffer {
+    fn begin(&mut self, _flags: com::CommandBufferFlags) { // TODO: Implement flags somehow
         if let Some(ref queue) = self.queue {
             unsafe { &mut *self.inner.get() }
                 .reset(queue);
@@ -495,7 +490,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         _image: &native::Image,
         _layout: ImageLayout,
         _range: SubresourceRange,
-        _value: ClearColorRaw,
+        _value: com::ClearColorRaw,
     ) {
         unimplemented!()
     }
@@ -505,7 +500,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         _image: &native::Image,
         _layout: ImageLayout,
         _range: SubresourceRange,
-        _value: ClearDepthStencilRaw,
+        _value: com::ClearDepthStencilRaw,
     ) {
         unimplemented!()
     }
@@ -516,9 +511,9 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         _rects: U,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<AttachmentClear>,
+        T::Item: Borrow<com::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<Rect>,
+        U::Item: Borrow<com::Rect>,
     {
         unimplemented!()
     }
@@ -532,7 +527,22 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         _regions: T,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<ImageResolve>,
+        T::Item: Borrow<com::ImageResolve>,
+    {
+        unimplemented!()
+    }
+
+    fn blit_image<T>(
+        &mut self,
+        _src: &native::Image,
+        _src_layout: ImageLayout,
+        _dst: &native::Image,
+        _dst_layout: ImageLayout,
+        _filter: com::BlitFilter,
+        _regions: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<com::ImageBlit>
     {
         unimplemented!()
     }
@@ -569,7 +579,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
     fn set_viewports<T>(&mut self, vps: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<Viewport>,
+        T::Item: Borrow<com::Viewport>,
     {
         let mut vps = vps.into_iter();
         let vp_borrowable = vps.next().expect("No viewport provided, Metal supports exactly one");
@@ -595,7 +605,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
     fn set_scissors<T>(&mut self, rects: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<Rect>,
+        T::Item: Borrow<com::Rect>,
     {
         let mut rects = rects.into_iter();
         let rect_borrowable = rects.next().expect("No scissor provided, Metal supports exactly one");
@@ -616,24 +626,24 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn set_stencil_reference(&mut self, _front: StencilValue, _back: StencilValue) {
+    fn set_stencil_reference(&mut self, _front: com::StencilValue, _back: com::StencilValue) {
         unimplemented!()
     }
 
-    fn set_blend_constants(&mut self, _color: ColorValue) {
+    fn set_blend_constants(&mut self, _color: com::ColorValue) {
         unimplemented!()
     }
 
-    fn begin_renderpass_raw<T>(
+    fn begin_render_pass_raw<T>(
         &mut self,
         render_pass: &native::RenderPass,
         frame_buffer: &native::FrameBuffer,
-        _render_area: Rect,
+        _render_area: com::Rect,
         clear_values: T,
-        _first_subpass: SubpassContents,
+        _first_subpass: com::SubpassContents,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<ClearValueRaw>,
+        T::Item: Borrow<com::ClearValueRaw>,
     {
         let inner = self.inner();
 
@@ -672,14 +682,14 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
                 .to_owned()
         };
 
-        inner.begin_renderpass(encoder);
+        inner.begin_render_pass(encoder);
     }
 
-    fn next_subpass(&mut self, _contents: SubpassContents) {
+    fn next_subpass(&mut self, _contents: com::SubpassContents) {
         unimplemented!()
     }
 
-    fn end_renderpass(&mut self) {
+    fn end_render_pass(&mut self) {
         match self.inner().encoder_state {
             EncoderState::Render(ref encoder) => {
                 encoder.end_encoding();
@@ -922,7 +932,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         regions: T,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<BufferCopy>,
+        T::Item: Borrow<com::BufferCopy>,
     {
         let encoder = self.encode_blit();
 
@@ -949,7 +959,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         _regions: T,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<ImageCopy>,
+        T::Item: Borrow<com::ImageCopy>,
     {
         unimplemented!()
     }
@@ -962,7 +972,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         regions: T,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<BufferImageCopy>,
+        T::Item: Borrow<com::BufferImageCopy>,
     {
         let encoder = self.encode_blit();
         let extent = MTLSize {
@@ -1007,7 +1017,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         regions: T,
     ) where
         T: IntoIterator,
-        T::Item: Borrow<BufferImageCopy>,
+        T::Item: Borrow<com::BufferImageCopy>,
     {
         let encoder = self.encode_blit();
         let extent = MTLSize {
@@ -1050,7 +1060,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
         instances: Range<InstanceCount>,
     ) {
         let primitive_type = self.inner().primitive_type;
-        let encoder = self.expect_renderpass();
+        let encoder = self.expect_render_pass();
 
         unsafe {
             msg_send![encoder,
@@ -1071,7 +1081,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
     ) {
         let (buffer, offset, index_type) = self.inner_ref().index_buffer.as_ref().cloned().expect("must bind index buffer");
         let primitive_type = self.inner_ref().primitive_type;
-        let encoder = self.expect_renderpass();
+        let encoder = self.expect_render_pass();
         let index_offset = match index_type {
             MTLIndexType::UInt16 => indices.start as u64 * 2,
             MTLIndexType::UInt32 => indices.start as u64 * 4,
@@ -1163,7 +1173,7 @@ impl RawCommandBuffer<Backend> for CommandBuffer {
 
     fn execute_commands<I>(
         &mut self,
-        buffers: I,
+        _buffers: I,
     ) where
         I: IntoIterator,
         I::Item: Borrow<CommandBuffer>

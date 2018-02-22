@@ -533,7 +533,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn begin_renderpass_raw<T>(
+    fn begin_render_pass_raw<T>(
         &mut self,
         render_pass: &n::RenderPass,
         framebuffer: &n::FrameBuffer,
@@ -596,7 +596,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn end_renderpass(&mut self) {
+    fn end_render_pass(&mut self) {
         // TODO
     }
 
@@ -662,6 +662,21 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     ) where
         T: IntoIterator,
         T::Item: Borrow<command::ImageResolve>,
+    {
+        unimplemented!()
+    }
+
+    fn blit_image<T>(
+        &mut self,
+        _src: &n::Image,
+        _src_layout: image::ImageLayout,
+        _dst: &n::Image,
+        _dst_layout: image::ImageLayout,
+        _filter: command::BlitFilter,
+        _regions: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<command::ImageBlit>
     {
         unimplemented!()
     }

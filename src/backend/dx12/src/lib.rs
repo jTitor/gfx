@@ -186,7 +186,7 @@ pub struct PhysicalDevice {
 
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, families: Vec<(QueueFamily, Vec<hal::QueuePriority>)>
+        &self, families: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>
     ) -> Result<hal::Gpu<Backend>, error::DeviceCreationError> {
         let lock = self.is_open.try_lock();
         let mut open_guard = match lock {
@@ -245,7 +245,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 
         let queue_groups = families
             .into_iter()
-            .map(|(family, priorities)| {
+            .map(|(&family, priorities)| {
                 let mut group = hal::backend::RawQueueGroup::new(family);
 
                 let create_idle_event = || unsafe {
@@ -324,8 +324,8 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         self.memory_properties.clone()
     }
 
-    fn get_features(&self) -> Features { self.features }
-    fn get_limits(&self) -> Limits { self.limits }
+    fn features(&self) -> Features { self.features }
+    fn limits(&self) -> Limits { self.limits }
 }
 
 #[derive(Clone)]

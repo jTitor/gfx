@@ -451,8 +451,8 @@ impl Device {
     ) where
         F: FnMut(&pso::DescriptorWrite<B, R>, &mut Vec<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>),
         I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetWrite<'a, 'a, B, R>>,
-        R: RangeArg<u64>,
+        I::Item: Borrow<pso::DescriptorSetWrite<'a, B, R>>,
+        R: 'a + RangeArg<u64>,
     {
         let mut dst_starts = Vec::new();
         let mut dst_sizes = Vec::new();
@@ -505,7 +505,7 @@ impl Device {
         //TODO: use subresource range
         let handle = self.rtv_pool.lock().unwrap().alloc_handles(1).cpu;
 
-        if kind.get_dimensions().3 != image::AaMode::Single {
+        if kind.dimensions().3 != image::AaMode::Single {
             error!("No MSAA supported yet!");
         }
 
@@ -543,7 +543,7 @@ impl Device {
         //TODO: use subresource range
         let handle = self.dsv_pool.lock().unwrap().alloc_handles(1).cpu;
 
-        if kind.get_dimensions().3 != image::AaMode::Single {
+        if kind.dimensions().3 != image::AaMode::Single {
             error!("No MSAA supported yet!");
         }
 
@@ -1528,7 +1528,7 @@ impl d::Device<B> for Device {
         let bytes_per_block = (format_desc.bits / 8) as _;
         let block_dim = format_desc.dim;
 
-        let (width, height, depth, aa) = kind.get_dimensions();
+        let (width, height, depth, aa) = kind.dimensions();
         let dimension = match kind {
             image::Kind::D1(..) |
             image::Kind::D1Array(..) => d3d12::D3D12_RESOURCE_DIMENSION_TEXTURE1D,
@@ -1550,7 +1550,7 @@ impl d::Device<B> for Device {
                 None => return Err(image::CreationError::Format(format)),
             },
             SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
-                Count: aa.get_num_fragments() as u32,
+                Count: aa.num_fragments() as u32,
                 Quality: 0,
             },
             Layout: d3d12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
@@ -1583,7 +1583,7 @@ impl d::Device<B> for Device {
             bytes_per_block,
             block_dim,
             num_levels: mip_levels,
-            num_layers: kind.get_num_layers(),
+            num_layers: kind.num_layers(),
         })
     }
 
@@ -1824,17 +1824,17 @@ impl d::Device<B> for Device {
         }
     }
 
-    fn update_descriptor_sets<'a, I, R>(&self, writes: I)
+    fn write_descriptor_sets<'a, I, R>(&self, writes: I)
     where
         I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetWrite<'a, 'a, B, R>>,
-        R: RangeArg<u64>,
+        I::Item: Borrow<pso::DescriptorSetWrite<'a, B, R>>,
+        R: 'a + RangeArg<u64>,
     {
         let writes = writes.into_iter().collect::<Vec<_>>();
         // Create temporary non-shader visible views for uniform and storage buffers.
         let mut num_views = 0;
-        for sw in &writes {
-            let sw = sw.borrow();
+        for write in &writes {
+            let sw = write.borrow();
             match sw.write {
                 pso::DescriptorWrite::UniformBuffer(ref views) |
                 pso::DescriptorWrite::StorageBuffer(ref views) => {
@@ -1859,8 +1859,8 @@ impl d::Device<B> for Device {
                 max_size: num_views as _,
             };
             // Create views
-            for sw in &writes {
-                let sw = sw.borrow();
+            for write in &writes {
+                let sw = write.borrow();
                 match sw.write {
                     pso::DescriptorWrite::UniformBuffer(ref views) => {
                         handles.extend(views.iter().map(|&(buffer, ref range)| {
@@ -1952,6 +1952,16 @@ impl d::Device<B> for Device {
                 }
                 _ => ()
             });
+    }
+
+    fn copy_descriptor_sets<'a, I>(&self, copies: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<pso::DescriptorSetCopy<'a, B>>,
+    {
+        for _copy in copies {
+            unimplemented!()
+        }
     }
 
     fn map_memory<R>(&self, memory: &n::Memory, range: R) -> Result<*mut u8, mapping::Error>
@@ -2186,7 +2196,7 @@ impl d::Device<B> for Device {
         }
     }
 
-    fn destroy_renderpass(&self, _rp: n::RenderPass) {
+    fn destroy_render_pass(&self, _rp: n::RenderPass) {
         // Just drop
     }
 

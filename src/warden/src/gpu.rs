@@ -134,7 +134,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             .memory_types;
         let limits = adapter
             .physical_device
-            .get_limits();
+            .limits();
 
         // initialize graphics
         let (device, queue_group) = adapter.open_with(1, |_| true)?;
@@ -320,7 +320,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             (access, layout)
                         } else {
                             // calculate required sizes
-                            let (w, h, d, aa) = kind.get_dimensions();
+                            let (w, h, d, aa) = kind.dimensions();
                             assert_eq!(aa, i::AaMode::Single);
 
                             let base_format = format.base_format();
@@ -539,7 +539,14 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         // fill it up
                         let set = &resources.desc_sets[name];
                         let res_buffers = &resources.buffers;
-                        let updates = binding_starts
+                        // pre-allocate the buffers
+                        let desc_buffers = data.iter().flat_map(|range| match *range {
+                            raw::DescriptorRange::StorageBuffers(ref names) => {
+                                names.iter().map(|s| (&res_buffers[s].handle, ..))
+                            }
+                        }).collect::<Vec<_>>();
+                        let mut count_buffers = 0;
+                        let writes = binding_starts
                             .iter()
                             .zip(data)
                             .map(|(&binding, range)| hal::pso::DescriptorSetWrite {
@@ -548,16 +555,13 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                 array_offset: 0,
                                 write: match *range {
                                     raw::DescriptorRange::StorageBuffers(ref names) => {
-                                        let buffers = names
-                                            .iter()
-                                            .map(|s| (&res_buffers[s].handle, ..))
-                                            .collect();
-                                        hal::pso::DescriptorWrite::StorageBuffer(buffers)
+                                        let r = count_buffers .. count_buffers + names.len();
+                                        count_buffers += names.len();
+                                        hal::pso::DescriptorWrite::StorageBuffer(&desc_buffers[r])
                                     }
                                 },
-                            })
-                            .collect::<Vec<_>>();
-                        device.update_descriptor_sets(&updates);
+                            });
+                        device.write_descriptor_sets(writes);
                     }
                     raw::Resource::PipelineLayout { ref set_layouts, ref push_constant_ranges } => {
                         let layout = {
@@ -716,7 +720,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         w: extent.width as _,
                         h: extent.height as _,
                     };
-                    let mut encoder = command_buf.begin_renderpass_inline(&rp.handle, fb, rect, clear_values);
+                    let mut encoder = command_buf.begin_render_pass_inline(&rp.handle, fb, rect, clear_values);
                     encoder.set_scissors(Some(rect));
                     encoder.set_viewports(Some(c::Viewport {
                         rect,
@@ -933,7 +937,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             .expect(&format!("Unable to find image to fetch: {}", name));
         let limits = &self.limits;
 
-        let (width, height, depth, aa) = image.kind.get_dimensions();
+        let (width, height, depth, aa) = image.kind.dimensions();
         assert_eq!(aa, i::AaMode::Single);
 
         // TODO:

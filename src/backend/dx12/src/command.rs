@@ -618,7 +618,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         self.reset();
     }
 
-    fn begin_renderpass_raw<T>(
+    fn begin_render_pass_raw<T>(
         &mut self,
         render_pass: &n::RenderPass,
         framebuffer: &n::Framebuffer,
@@ -686,7 +686,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         self.bind_targets();
     }
 
-    fn end_renderpass(&mut self) {
+    fn end_render_pass(&mut self) {
         self.cur_subpass = !0;
         self.insert_subpass_barriers();
         self.pass_cache = None;
@@ -876,9 +876,9 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn resolve_image<T>(
         &mut self,
         src: &n::Image,
-        _: image::ImageLayout,
+        _src_layout: image::ImageLayout,
         dst: &n::Image,
-        _: image::ImageLayout,
+        _dst_layout: image::ImageLayout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -899,14 +899,14 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
 
         for region in regions {
-            let region = region.borrow();
-            for l in 0..region.num_layers as _ {
+            let r = region.borrow();
+            for layer in 0 .. r.extent.depth as UINT {
                 unsafe {
                     self.raw.ResolveSubresource(
                         src.resource,
-                        src.calc_subresource(region.src_subresource.0 as UINT, l + region.src_subresource.1 as UINT, 0),
+                        src.calc_subresource(r.src_subresource.level as UINT, r.src_subresource.layers.start as UINT + layer, 0),
                         dst.resource,
-                        dst.calc_subresource(region.dst_subresource.0 as UINT, l + region.dst_subresource.1 as UINT, 0),
+                        dst.calc_subresource(r.dst_subresource.level as UINT, r.dst_subresource.layers.start as UINT + layer, 0),
                         src.dxgi_format,
                     );
                 }
@@ -925,6 +925,21 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             );
             unsafe { self.raw.ResourceBarrier(1, &transition_barrier) };
         }
+    }
+
+    fn blit_image<T>(
+        &mut self,
+        _src: &n::Image,
+        _src_layout: image::ImageLayout,
+        _dst: &n::Image,
+        _dst_layout: image::ImageLayout,
+        _filter: com::BlitFilter,
+        _regions: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<com::ImageBlit>
+    {
+        unimplemented!()
     }
 
     fn bind_index_buffer(&mut self, ibv: IndexBufferView<Backend>) {
@@ -1253,7 +1268,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             u: unsafe { mem::zeroed() },
         };
-        let (width, height, depth, _) = image.kind.get_dimensions();
+        let (width, height, depth, _) = image.kind.dimensions();
         for region in regions {
             let region = region.borrow();
             // Copy each layer in the region
@@ -1336,7 +1351,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             Type: d3d12::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             u: unsafe { mem::zeroed() },
         };
-        let (width, height, depth, _) = image.kind.get_dimensions();
+        let (width, height, depth, _) = image.kind.dimensions();
         for region in regions {
             let region = region.borrow();
             // Copy each layer in the region

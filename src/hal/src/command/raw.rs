@@ -8,10 +8,10 @@ use image::{ImageLayout, SubresourceRange};
 use memory::Barrier;
 use query::{Query, QueryControl, QueryId};
 use super::{
-    ColorValue, StencilValue, Rect, Viewport,
+    BlitFilter, ColorValue, StencilValue, Rect, Viewport,
     AttachmentClear, BufferCopy, BufferImageCopy,
     ClearColor, ClearDepthStencil, ClearValue,
-    ImageCopy, ImageResolve, SubpassContents,
+    ImageBlit, ImageCopy, ImageResolve, SubpassContents,
 };
 
 /// Unsafe variant of `ClearColor`.
@@ -179,6 +179,19 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Send {
         T: IntoIterator,
         T::Item: Borrow<ImageResolve>;
 
+    ///
+    fn blit_image<T>(
+        &mut self,
+        src: &B::Image,
+        src_layout: ImageLayout,
+        dst: &B::Image,
+        dst_layout: ImageLayout,
+        filter: BlitFilter,
+        regions: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<ImageBlit>;
+
     /// Bind index buffer view.
     fn bind_index_buffer(&mut self, IndexBufferView<B>);
 
@@ -236,7 +249,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Send {
     fn set_blend_constants(&mut self, ColorValue);
 
     ///
-    fn begin_renderpass<T>(
+    fn begin_render_pass<T>(
         &mut self,
         render_pass: &B::RenderPass,
         framebuffer: &B::Framebuffer,
@@ -262,7 +275,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Send {
                 }
             });
 
-        self.begin_renderpass_raw(
+        self.begin_render_pass_raw(
             render_pass,
             framebuffer,
             render_area,
@@ -272,7 +285,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Send {
     }
 
     ///
-    fn begin_renderpass_raw<T>(
+    fn begin_render_pass_raw<T>(
         &mut self,
         render_pass: &B::RenderPass,
         framebuffer: &B::Framebuffer,
@@ -287,7 +300,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Send {
     fn next_subpass(&mut self, contents: SubpassContents);
 
     ///
-    fn end_renderpass(&mut self);
+    fn end_render_pass(&mut self);
 
     /// Bind a graphics pipeline.
     ///

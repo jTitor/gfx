@@ -56,7 +56,7 @@ impl hal::Backend for Backend {
 pub struct PhysicalDevice;
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, _: Vec<(QueueFamily, Vec<hal::QueuePriority>)>
+        &self, _: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>
     ) -> Result<hal::Gpu<Backend>, error::DeviceCreationError> {
         unimplemented!()
     }
@@ -69,11 +69,11 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         unimplemented!()
     }
 
-    fn get_features(&self) -> hal::Features {
+    fn features(&self) -> hal::Features {
         unimplemented!()
     }
 
-    fn get_limits(&self) -> hal::Limits {
+    fn limits(&self) -> hal::Limits {
         unimplemented!()
     }
 }
@@ -214,11 +214,19 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
-    fn update_descriptor_sets<'a, I, R>(&self, _: I)
+    fn write_descriptor_sets<'a, I, R>(&self, _: I)
     where
         I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetWrite<'a, 'a, Backend, R>>,
-        R: RangeArg<u64>,
+        I::Item: Borrow<pso::DescriptorSetWrite<'a, Backend, R>>,
+        R: 'a + RangeArg<u64>,
+    {
+        unimplemented!()
+    }
+
+    fn copy_descriptor_sets<'a, I>(&self, _: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<pso::DescriptorSetCopy<'a, Backend>>
     {
         unimplemented!()
     }
@@ -277,7 +285,7 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
-    fn destroy_renderpass(&self, _: ()) {
+    fn destroy_render_pass(&self, _: ()) {
         unimplemented!()
     }
 
@@ -445,6 +453,21 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
+    fn blit_image<T>(
+        &mut self,
+        _: &(),
+        _: image::ImageLayout,
+        _: &(),
+        _: image::ImageLayout,
+        _: command::BlitFilter,
+        _: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<command::ImageBlit>,
+    {
+        unimplemented!()
+    }
+
     fn bind_index_buffer(&mut self, _: buffer::IndexBufferView<Backend>) {
         unimplemented!()
     }
@@ -480,7 +503,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     }
 
 
-    fn begin_renderpass_raw<T>(
+    fn begin_render_pass_raw<T>(
         &mut self,
         _: &(),
         _: &(),
@@ -498,7 +521,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn end_renderpass(&mut self) {
+    fn end_render_pass(&mut self) {
         unimplemented!()
     }
 
@@ -686,7 +709,7 @@ impl hal::DescriptorPool<Backend> for DescriptorPool {
 /// Dummy surface.
 pub struct Surface;
 impl hal::Surface<Backend> for Surface {
-    fn get_kind(&self) -> hal::image::Kind {
+    fn kind(&self) -> hal::image::Kind {
         unimplemented!()
     }
 

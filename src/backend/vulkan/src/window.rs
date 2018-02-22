@@ -81,7 +81,7 @@ impl Instance {
         self.create_surface_from_vk_surface_khr(surface, width, height)
     }
 
-    #[cfg(all(unix, not(target_os = "android"), feature = "xcb"))]
+    #[cfg(all(unix, not(target_os = "android")))]
     pub fn create_surface_from_xcb(
         &self, connection: *mut vk::xcb_connection_t, window: vk::xcb_window_t
     ) -> Surface {
@@ -287,7 +287,7 @@ impl Instance {
 }
 
 impl hal::Surface<Backend> for Surface {
-    fn get_kind(&self) -> hal::image::Kind {
+    fn kind(&self) -> hal::image::Kind {
         use hal::image::Size;
 
         let aa = hal::image::AaMode::Single;
@@ -309,7 +309,7 @@ impl hal::Surface<Backend> for Surface {
         // `0xFFFFFFFF` indicates that the extent depends on the created swapchain.
         let current_extent =
             if caps.current_extent.width != 0xFFFFFFFF && caps.current_extent.height != 0xFFFFFFFF {
-                Some(hal::window::Extent2d {
+                Some(hal::window::Extent2D {
                     width: caps.current_extent.width,
                     height: caps.current_extent.height,
                 })
@@ -317,12 +317,12 @@ impl hal::Surface<Backend> for Surface {
                 None
             };
 
-        let min_extent = hal::window::Extent2d {
+        let min_extent = hal::window::Extent2D {
             width: caps.min_image_extent.width,
             height: caps.min_image_extent.height,
         };
 
-        let max_extent = hal::window::Extent2d {
+        let max_extent = hal::window::Extent2D {
             width: caps.max_image_extent.width,
             height: caps.max_image_extent.height,
         };

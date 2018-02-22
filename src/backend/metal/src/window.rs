@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use hal::{self, format, image};
 use hal::{Backbuffer, SwapchainConfig};
-use hal::window::Extent2d;
+use hal::window::Extent2D;
 
 use metal::{self, MTLPixelFormat, MTLTextureUsage};
 use objc::runtime::{Object};
@@ -53,7 +53,7 @@ impl Swapchain {
 const kCVPixelFormatType_32RGBA: u32 = (b'R' as u32) << 24 | (b'G' as u32) << 16 | (b'B' as u32) << 8 | b'A' as u32;
 
 impl hal::Surface<Backend> for Surface {
-    fn get_kind(&self) -> image::Kind {
+    fn kind(&self) -> image::Kind {
         let (width, height) = self.pixel_dimensions();
 
         image::Kind::D2(width, height, image::AaMode::Single)
@@ -65,7 +65,7 @@ impl hal::Surface<Backend> for Surface {
         let caps = hal::SurfaceCapabilities {
             image_count: 1..8,
             current_extent: None,
-            extents: Extent2d { width: 4, height: 4} .. Extent2d { width: 4096, height: 4096 },
+            extents: Extent2D { width: 4, height: 4} .. Extent2D { width: 4096, height: 4096 },
             max_image_layers: 1,
         };
         let formats = Some(vec![format::Format::Rgba8Srgb]);

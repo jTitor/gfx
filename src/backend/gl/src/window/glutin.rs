@@ -105,14 +105,14 @@ impl Surface {
 }
 
 impl hal::Surface<B> for Surface {
-    fn get_kind(&self) -> hal::image::Kind {
+    fn kind(&self) -> hal::image::Kind {
         let (w, h, _, a) = get_window_dimensions(&self.window);
         hal::image::Kind::D2(w, h, a)
     }
 
     fn capabilities_and_formats(&self, _: &PhysicalDevice) -> (hal::SurfaceCapabilities, Option<Vec<f::Format>>) {
         let dim = get_window_dimensions(&self.window);
-        let extent = hal::window::Extent2d {
+        let extent = hal::window::Extent2D {
             width: dim.0 as u32,
             height: dim.1 as u32,
         };
@@ -120,7 +120,7 @@ impl hal::Surface<B> for Surface {
         (hal::SurfaceCapabilities {
             image_count: if self.window.get_pixel_format().double_buffer { 2..3 } else { 1..2 },
             current_extent: Some(extent),
-            extents: extent..hal::window::Extent2d {
+            extents: extent..hal::window::Extent2D {
                 width: dim.0 as u32 + 1,
                 height: dim.1 as u32 + 1
             },

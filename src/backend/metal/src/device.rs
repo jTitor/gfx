@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::{cmp, mem, ptr, slice};
 
 use hal::{self, error, image, pass, format, mapping, memory, buffer, pso, query};
-use hal::device::{WaitFor, BindError, OutOfMemory, FramebufferError, ShaderError, Extent};
+use hal::device::{BindError, OutOfMemory, FramebufferError, ShaderError, Extent};
 use hal::memory::Properties;
 use hal::pool::CommandPoolCreateFlags;
 use hal::pso::{DescriptorType, DescriptorSetLayoutBinding, AttributeDesc, DepthTest, StencilTest};
@@ -154,12 +154,12 @@ impl PhysicalDevice {
 
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, mut families: Vec<(QueueFamily, Vec<hal::QueuePriority>)>,
+        &self, mut families: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>,
     ) -> Result<hal::Gpu<Backend>, error::DeviceCreationError> {
         // TODO: Handle opening a physical device multiple times
 
         assert_eq!(families.len(), 1);
-        let family = families.remove(0).0;
+        let family = *families.remove(0).0;
         let id = family.id();
 
         let mut queue_group = hal::backend::RawQueueGroup::new(family);
@@ -202,11 +202,11 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         }
     }
 
-    fn get_features(&self) -> hal::Features {
+    fn features(&self) -> hal::Features {
         hal::Features::empty() //TODO
     }
 
-    fn get_limits(&self) -> hal::Limits {
+    fn limits(&self) -> hal::Limits {
         hal::Limits {
             max_texture_size: 4096, // TODO: feature set
             max_patch_size: 0, // No tessellation
@@ -973,11 +973,11 @@ impl hal::Device<Backend> for Device {
         n::DescriptorSetLayout::ArgumentBuffer(encoder, stage_flags)
     }
 
-    fn update_descriptor_sets<'a, I, R>(&self, writes: I)
+    fn write_descriptor_sets<'a, I, R>(&self, writes: I)
     where
         I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetWrite<'a, 'a, Backend, R>>,
-        R: RangeArg<u64>,
+        I::Item: Borrow<pso::DescriptorSetWrite<'a, Backend, R>>,
+        R: 'a + RangeArg<u64>,
     {
         use hal::pso::DescriptorWrite::*;
 
@@ -986,25 +986,25 @@ impl hal::Device<Backend> for Device {
         let mut mtl_buffers = Vec::new();
         let mut mtl_offsets = Vec::new();
 
-        for write in writes.into_iter() {
-            let write = write.borrow();
-            match *write.set {
+        for write in writes {
+            let w = write.borrow();
+            match *w.set {
                 n::DescriptorSet::Emulated(ref inner) => {
                     let mut set = inner.lock().unwrap();
 
                     // Find layout entry
                     let layout = set.layout.iter()
-                        .find(|layout| layout.binding == write.binding)
+                        .find(|layout| layout.binding == w.binding)
                         .expect("invalid descriptor set binding index")
                         .clone();
 
-                    match (&write.write, set.bindings.get_mut(&write.binding)) {
+                    match (&w.write, set.bindings.get_mut(&w.binding)) {
                         (&Sampler(ref samplers), Some(&mut n::DescriptorSetBinding::Sampler(ref mut vec))) => {
-                            if write.array_offset + samplers.len() > layout.count {
+                            if w.array_offset + samplers.len() > layout.count {
                                 panic!("out of range descriptor write");
                             }
 
-                            let target_iter = vec[write.array_offset..(write.array_offset + samplers.len())].iter_mut();
+                            let target_iter = vec[w.array_offset..(w.array_offset + samplers.len())].iter_mut();
 
                             for (new, old) in samplers.iter().zip(target_iter) {
                                 *old = Some(new.0.clone());
@@ -1012,11 +1012,11 @@ impl hal::Device<Backend> for Device {
                         }
                         (&SampledImage(ref images), Some(&mut n::DescriptorSetBinding::Image(ref mut vec))) |
                         (&StorageImage(ref images), Some(&mut n::DescriptorSetBinding::Image(ref mut vec))) => {
-                            if write.array_offset + images.len() > layout.count {
+                            if w.array_offset + images.len() > layout.count {
                                 panic!("out of range descriptor write");
                             }
 
-                            let target_iter = vec[write.array_offset..(write.array_offset + images.len())].iter_mut();
+                            let target_iter = vec[w.array_offset..(w.array_offset + images.len())].iter_mut();
 
                             for (&(image, offset), old) in images.iter().zip(target_iter) {
                                 *old = Some((image.0.clone(), offset));
@@ -1024,11 +1024,11 @@ impl hal::Device<Backend> for Device {
                         }
                         (&UniformBuffer(ref buffers), Some(&mut n::DescriptorSetBinding::Buffer(ref mut vec))) |
                         (&StorageBuffer(ref buffers), Some(&mut n::DescriptorSetBinding::Buffer(ref mut vec))) => {
-                            if write.array_offset + buffers.len() > layout.count {
+                            if w.array_offset + buffers.len() > layout.count {
                                 panic!("out of range descriptor write");
                             }
 
-                            let target_iter = vec[write.array_offset..(write.array_offset + buffers.len())].iter_mut();
+                            let target_iter = vec[w.array_offset..(w.array_offset + buffers.len())].iter_mut();
 
                             for (new, old) in buffers.iter().zip(target_iter) {
                                 let (buffer, ref range) = *new;
@@ -1051,18 +1051,18 @@ impl hal::Device<Backend> for Device {
 
                     encoder.set_argument_buffer(buffer, offset);
                     //TODO: range checks, need to keep some layout metadata around
-                    assert_eq!(write.array_offset, 0); //TODO
+                    assert_eq!(w.array_offset, 0); //TODO
 
-                    match write.write {
+                    match w.write {
                         Sampler(ref samplers) => {
                             mtl_samplers.clear();
                             mtl_samplers.extend(samplers.iter().map(|sampler| &*sampler.0));
-                            encoder.set_sampler_states(&mtl_samplers, write.binding as _);
+                            encoder.set_sampler_states(&mtl_samplers, w.binding as _);
                         },
                         SampledImage(ref images) => {
                             mtl_textures.clear();
                             mtl_textures.extend(images.iter().map(|image| &*((image.0).0)));
-                            encoder.set_textures(&mtl_textures, write.binding as _);
+                            encoder.set_textures(&mtl_textures, w.binding as _);
                         },
                         UniformBuffer(ref buffers) | StorageBuffer(ref buffers) => {
                             mtl_buffers.clear();
@@ -1091,6 +1091,16 @@ impl hal::Device<Backend> for Device {
         }
     }
 
+    fn copy_descriptor_sets<'a, I>(&self, copies: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<pso::DescriptorSetCopy<'a, Backend>>,
+    {
+        for _copy in copies {
+            unimplemented!()
+        }
+    }
+
     fn destroy_descriptor_pool(&self, _pool: n::DescriptorPool) {
     }
 
@@ -1103,7 +1113,7 @@ impl hal::Device<Backend> for Device {
     fn destroy_shader_module(&self, _module: n::ShaderModule) {
     }
 
-    fn destroy_renderpass(&self, _pass: n::RenderPass) {
+    fn destroy_render_pass(&self, _pass: n::RenderPass) {
     }
 
     fn destroy_graphics_pipeline(&self, _pipeline: n::GraphicsPipeline) {
