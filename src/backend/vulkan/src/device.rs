@@ -4,7 +4,7 @@ use ash::version::DeviceV1_0;
 use smallvec::SmallVec;
 
 use hal::{buffer, device as d, format, image, mapping, pass, pso, query, queue};
-use hal::{Backbuffer, MemoryTypeId, SwapchainConfig};
+use hal::{Backbuffer, Features, MemoryTypeId, SwapchainConfig};
 use hal::error::HostExecutionError;
 use hal::memory::Requirements;
 use hal::pool::CommandPoolCreateFlags;
@@ -406,7 +406,16 @@ impl d::Device<B> for Device {
                 s_type: vk::StructureType::PipelineRasterizationStateCreateInfo,
                 p_next: ptr::null(),
                 flags: vk::PipelineRasterizationStateCreateFlags::empty(),
-                depth_clamp_enable: if desc.rasterizer.depth_clamping { vk::VK_TRUE } else { vk::VK_FALSE },
+                depth_clamp_enable: if desc.rasterizer.depth_clamping {
+                    if self.raw.1.contains(Features::DEPTH_CLAMP) {
+                        vk::VK_TRUE
+                    } else {
+                        warn!("Depth clamping was requested on a device with disabled feature");
+                        vk::VK_FALSE
+                    }
+                } else {
+                    vk::VK_FALSE
+                },
                 rasterizer_discard_enable: if desc.shaders.fragment.is_none() { vk::VK_TRUE } else { vk::VK_FALSE },
                 polygon_mode: polygon_mode,
                 cull_mode: desc.rasterizer.cull_face.map(conv::map_cull_face).unwrap_or(vk::CULL_MODE_NONE),
@@ -768,7 +777,18 @@ impl d::Device<B> for Device {
     fn create_sampler(&self, sampler_info: image::SamplerInfo) -> n::Sampler {
         use hal::pso::Comparison;
 
-        let (min_filter, mag_filter, mipmap_mode, aniso) = conv::map_filter(sampler_info.filter);
+        let (min_filter, mag_filter, mipmap_mode) = conv::map_filter(sampler_info.filter);
+        let (anisotropy_enable, max_anisotropy) = match sampler_info.filter {
+            image::FilterMethod::Anisotropic(aniso) => {
+                if self.raw.1.contains(Features::SAMPLER_ANISOTROPY) {
+                    (vk::VK_TRUE, aniso as f32)
+                } else {
+                    warn!("Anisotropy({}) was requested on a device with disabled feature", aniso);
+                    (vk::VK_FALSE, 0.0)
+                }
+            }
+            _ => (vk::VK_FALSE, 0.0)
+        };
         let info = vk::SamplerCreateInfo {
             s_type: vk::StructureType::SamplerCreateInfo,
             p_next: ptr::null(),
@@ -780,8 +800,8 @@ impl d::Device<B> for Device {
             address_mode_v: conv::map_wrap(sampler_info.wrap_mode.1),
             address_mode_w: conv::map_wrap(sampler_info.wrap_mode.2),
             mip_lod_bias: sampler_info.lod_bias.into(),
-            anisotropy_enable: if aniso > 1.0 { vk::VK_TRUE } else { vk::VK_FALSE },
-            max_anisotropy: aniso,
+            anisotropy_enable,
+            max_anisotropy,
             compare_enable: if sampler_info.comparison.is_some() { vk::VK_TRUE } else { vk::VK_FALSE },
             compare_op: conv::map_comparison(sampler_info.comparison.unwrap_or(Comparison::Never)),
             min_lod: sampler_info.lod_range.start.into(),
@@ -1423,7 +1443,7 @@ impl d::Device<B> for Device {
                 height: surface.height,
             },
             image_array_layers: 1,
-            image_usage: vk::IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            image_usage: vk::IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk::IMAGE_USAGE_TRANSFER_DST_BIT,
             image_sharing_mode: vk::SharingMode::Exclusive,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
