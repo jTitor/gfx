@@ -383,10 +383,19 @@ fn main() {
 
     let img = image::load(Cursor::new(&img_data[..]), image::PNG).unwrap().to_rgba();
     let (width, height) = img.dimensions();
+    //Setup image specification
     let kind = i::Kind::D2(width as i::Size, height as i::Size, i::AaMode::Single);
-    let row_alignment_mask = limits.min_buffer_copy_pitch_alignment as u32 - 1;
+    //The image is unpacked as 32-bit RGBA, so
+    //each pixel is 4 bytes...
     let image_stride = 4usize;
+    //...but we may need to ensure the memory allocated
+    //is aligned too, so the final allocation may be larger than
+    //needed.
+    //Ask the limit info for the smallest alignment requirement.
+    let row_alignment_mask = limits.min_buffer_copy_pitch_alignment as u32 - 1;
+    //Now round the data length of a row to that alignment.
     let row_pitch = (width * image_stride as u32 + row_alignment_mask) & !row_alignment_mask;
+    //That gives us the actual buffer size.
     let upload_size = (height * row_pitch) as u64;
 
     let image_buffer_unbound = device.create_buffer(upload_size, buffer::Usage::TRANSFER_SRC).unwrap();
@@ -400,8 +409,12 @@ fn main() {
             .acquire_mapping_writer::<u8>(&image_upload_memory, 0..upload_size)
             .unwrap();
         for y in 0 .. height as usize {
+            //Get the raw row bytes from source.
             let row = &(*img)[y*(width as usize)*image_stride .. (y+1)*(width as usize)*image_stride];
+            //The destination may have a different width,
             let dest_base = y * row_pitch as usize;
+            //but the remainder is just padding for
+            //memory alignment.
             data[dest_base .. dest_base + row.len()].copy_from_slice(row);
         }
         device.release_mapping_writer(data);
@@ -431,6 +444,7 @@ fn main() {
         )
     );
 
+    //Bind the descriptor sets to their image/sampler instances
     device.write_descriptor_sets::<_, Range<_>>(vec![
         pso::DescriptorSetWrite {
             set: &desc_set,
@@ -523,6 +537,7 @@ fn main() {
             }
         });
 
+        // Now prepare for the actual render
         device.reset_fence(&frame_fence);
         command_pool.reset();
         let frame = swap_chain.acquire_frame(FrameSync::Semaphore(&mut frame_semaphore));
