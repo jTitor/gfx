@@ -57,7 +57,6 @@ struct TestResults {
 
 #[derive(Default)]
 struct Disabilities {
-    no_command_buffer_reuse: bool,
 }
 
 
@@ -108,7 +107,7 @@ impl Harness {
     fn run<I: hal::Instance>(
         &self,
         instance: I,
-        disabilities: Disabilities,
+        _disabilities: Disabilities,
     ) -> usize {
         use hal::{PhysicalDevice};
 
@@ -155,9 +154,9 @@ impl Harness {
                 let mut max_compute_groups = [0; 3];
                 for job_name in &test.jobs {
                     if let warden::raw::Job::Compute { dispatch, .. } = tg.scene.jobs[job_name] {
-                         max_compute_groups[0] = max_compute_groups[0].max(dispatch.0);
-                         max_compute_groups[1] = max_compute_groups[1].max(dispatch.1);
-                         max_compute_groups[2] = max_compute_groups[2].max(dispatch.2);
+                        for (max, count) in max_compute_groups.iter_mut().zip(dispatch.iter()) {
+                            *max = (*max).max(*count);
+                        }
                     }
                 }
                 if  max_compute_groups[0] > limits.max_compute_group_size[0] ||
@@ -185,11 +184,6 @@ impl Harness {
                 } else {
                     println!("FAIL {:?}", guard.row(row));
                     results.fail += 1;
-                }
-
-                if disabilities.no_command_buffer_reuse {
-                    println!("Command buffer re-use is not ready, exiting");
-                    return results.fail;
                 }
             }
         }
@@ -232,7 +226,6 @@ fn main() {
         println!("Warding Metal:");
         let instance = gfx_backend_metal::Instance::create("warden", 1);
         num_failures += harness.run(instance, Disabilities {
-            no_command_buffer_reuse: true,
             .. Disabilities::default()
         });
     }

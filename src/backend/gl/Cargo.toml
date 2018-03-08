@@ -25,4 +25,4 @@ gfx-hal = { path = "../../hal", version = "0.1" }
 smallvec = "0.6"
 #jtitor: point this at custom fork that has RI implemented
 glutin = { git = "https://github.com/jTitor/glutin" version = "*", optional = true }
-spirv_cross = "0.6"
+spirv_cross = "0.7"

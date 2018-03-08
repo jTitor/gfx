@@ -29,7 +29,6 @@ use hal::pso::{PipelineStage, ShaderStageFlags, Specialization};
 use hal::queue::Submission;
 
 use std::io::Cursor;
-use std::ops::Range;
 
 const ENTRY_NAME: &str = "main";
 
@@ -51,7 +50,7 @@ const QUAD: [Vertex; 6] = [
 ];
 
 const COLOR_RANGE: i::SubresourceRange = i::SubresourceRange {
-    aspects: f::AspectFlags::COLOR,
+    aspects: f::Aspects::COLOR,
     levels: 0 .. 1,
     layers: 0 .. 1,
 };
@@ -431,18 +430,22 @@ fn main() {
         )
     );
 
-    device.write_descriptor_sets::<_, Range<_>>(vec![
+    device.write_descriptor_sets(vec![
         pso::DescriptorSetWrite {
             set: &desc_set,
             binding: 0,
             array_offset: 0,
-            write: pso::DescriptorWrite::SampledImage(&[(&image_srv, i::ImageLayout::Undefined)]),
+            descriptors: Some(
+                pso::Descriptor::Image(&image_srv, i::ImageLayout::Undefined)
+            ),
         },
         pso::DescriptorSetWrite {
             set: &desc_set,
             binding: 1,
             array_offset: 0,
-            write: pso::DescriptorWrite::Sampler(&[&sampler]),
+            descriptors: Some(
+                pso::Descriptor::Sampler(&sampler)
+            ),
         },
     ]);
 
@@ -469,7 +472,11 @@ fn main() {
                 target: &image_logo,
                 range: COLOR_RANGE.clone(),
             };
-            cmd_buffer.pipeline_barrier(PipelineStage::TOP_OF_PIPE .. PipelineStage::TRANSFER, &[image_barrier]);
+            cmd_buffer.pipeline_barrier(
+                PipelineStage::TOP_OF_PIPE .. PipelineStage::TRANSFER,
+                m::Dependencies::empty(),
+                &[image_barrier],
+            );
 
             cmd_buffer.copy_buffer_to_image(
                 &image_upload_buffer,
@@ -480,11 +487,11 @@ fn main() {
                     buffer_width: row_pitch / (image_stride as u32),
                     buffer_height: height as u32,
                     image_layers: i::SubresourceLayers {
-                        aspects: f::AspectFlags::COLOR,
+                        aspects: f::Aspects::COLOR,
                         level: 0,
                         layers: 0 .. 1,
                     },
-                    image_offset: command::Offset { x: 0, y: 0, z: 0 },
+                    image_offset: i::Offset { x: 0, y: 0, z: 0 },
                     image_extent: d::Extent { width, height, depth: 1 },
                 }]);
 
@@ -494,7 +501,11 @@ fn main() {
                 target: &image_logo,
                 range: COLOR_RANGE.clone(),
             };
-            cmd_buffer.pipeline_barrier(PipelineStage::TRANSFER .. PipelineStage::FRAGMENT_SHADER, &[image_barrier]);
+            cmd_buffer.pipeline_barrier(
+                PipelineStage::TRANSFER .. PipelineStage::FRAGMENT_SHADER,
+                m::Dependencies::empty(),
+                &[image_barrier],
+            );
 
             cmd_buffer.finish()
         };

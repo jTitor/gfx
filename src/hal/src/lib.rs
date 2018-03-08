@@ -18,8 +18,10 @@ extern crate serde;
 
 use std::any::Any;
 use std::error::Error;
-use std::fmt::{self, Debug};
+use std::fmt;
 use std::hash::Hash;
+
+//TODO: reconsider what is publicly exported
 
 pub use self::adapter::{
     Adapter, AdapterInfo, MemoryProperties, MemoryType, MemoryTypeId,
@@ -27,7 +29,7 @@ pub use self::adapter::{
 };
 pub use self::device::Device;
 pub use self::pool::CommandPool;
-pub use self::pso::{DescriptorPool};
+pub use self::pso::DescriptorPool;
 pub use self::queue::{
     CommandQueue, QueueGroup, QueueFamily, QueueType, Submission,
     Capability, Supports, General, Graphics, Compute, Transfer,
@@ -66,6 +68,8 @@ pub type IndexCount = u32;
 pub type InstanceCount = u32;
 /// Number of vertices in a patch
 pub type PatchSize = u8;
+/// Number of work groups.
+pub type WorkGroupCount = [u32; 3];
 
 /// Slot for an attribute.
 pub type AttributeSlot = u8;
@@ -217,7 +221,7 @@ bitflags! {
     }
 }
 
-/// Limits of the device.
+/// Resource limits of a particular graphics device.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Limits {
@@ -228,20 +232,21 @@ pub struct Limits {
     /// Maximum number of viewports.
     pub max_viewports: usize,
     ///
-    pub max_compute_group_count: [u32; 3],
+    pub max_compute_group_count: WorkGroupCount,
     ///
     pub max_compute_group_size: [u32; 3],
 
     /// The alignment of the start of the buffer used as a GPU copy source, in bytes, non-zero.
-    pub min_buffer_copy_offset_alignment: usize,
+    pub min_buffer_copy_offset_alignment: buffer::Offset,
     /// The alignment of the row pitch of the texture data stored in a buffer that is
     /// used in a GPU copy operation, in bytes, non-zero.
-    pub min_buffer_copy_pitch_alignment: usize,
+    pub min_buffer_copy_pitch_alignment: buffer::Offset,
     /// The alignment of the start of buffer used for uniform buffer updates, in bytes, non-zero.
-    pub min_uniform_buffer_offset_alignment: usize,
+    pub min_uniform_buffer_offset_alignment: buffer::Offset,
 }
 
-/// Describes what geometric primitives are created from vertex data.
+/// Describes the type of geometric primitives,
+/// created from vertex data.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
@@ -286,7 +291,7 @@ pub enum Primitive {
     PatchList(PatchSize),
 }
 
-/// A type of each index value in the slice's index buffer
+/// An enum describing the type of an index value in a slice's index buffer
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -300,13 +305,15 @@ pub enum IndexType {
 pub trait Instance: Any + Send + Sync {
     /// Associated backend type of this instance.
     type Backend: Backend;
-    /// Enumerate all available adapters.
+    /// Return all available adapters.
     fn enumerate_adapters(&self) -> Vec<Adapter<Self::Backend>>;
 }
 
-/// Different types of a specific API.
+/// The `Backend` trait wraps together all the types needed
+/// for a graphics backend. Each backend module, such as OpenGL
+/// or Metal, will implement this trait with its own concrete types.
 #[allow(missing_docs)]
-pub trait Backend: 'static + Sized + Eq + Clone + Hash + Debug + Any + Send + Sync {
+pub trait Backend: 'static + Sized + Eq + Clone + Hash + fmt::Debug + Any + Send + Sync {
     //type Instance:          Instance<Self>;
     type PhysicalDevice:      PhysicalDevice<Self>;
     type Device:              Device<Self>;
@@ -318,34 +325,34 @@ pub trait Backend: 'static + Sized + Eq + Clone + Hash + Debug + Any + Send + Sy
     type CommandQueue:        queue::RawCommandQueue<Self>;
     type CommandBuffer:       command::RawCommandBuffer<Self>;
 
-    type ShaderModule:        Debug + Any + Send + Sync;
-    type RenderPass:          Debug + Any + Send + Sync;
-    type Framebuffer:         Debug + Any + Send + Sync;
+    type ShaderModule:        fmt::Debug + Any + Send + Sync;
+    type RenderPass:          fmt::Debug + Any + Send + Sync;
+    type Framebuffer:         fmt::Debug + Any + Send + Sync;
 
-    type Memory:              Debug + Any + Send + Sync;
+    type Memory:              fmt::Debug + Any + Send + Sync;
     type CommandPool:         pool::RawCommandPool<Self>;
 
-    type UnboundBuffer:       Debug + Any + Send + Sync;
-    type Buffer:              Debug + Any + Send + Sync;
-    type BufferView:          Debug + Any + Send + Sync;
-    type UnboundImage:        Debug + Any + Send + Sync;
-    type Image:               Debug + Any + Send + Sync;
-    type ImageView:           Debug + Any + Send + Sync;
-    type Sampler:             Debug + Any + Send + Sync;
+    type UnboundBuffer:       fmt::Debug + Any + Send + Sync;
+    type Buffer:              fmt::Debug + Any + Send + Sync;
+    type BufferView:          fmt::Debug + Any + Send + Sync;
+    type UnboundImage:        fmt::Debug + Any + Send + Sync;
+    type Image:               fmt::Debug + Any + Send + Sync;
+    type ImageView:           fmt::Debug + Any + Send + Sync;
+    type Sampler:             fmt::Debug + Any + Send + Sync;
 
-    type ComputePipeline:     Debug + Any + Send + Sync;
-    type GraphicsPipeline:    Debug + Any + Send + Sync;
-    type PipelineLayout:      Debug + Any + Send + Sync;
-    type DescriptorPool:      DescriptorPool<Self>;
-    type DescriptorSet:       Debug + Any + Send + Sync;
-    type DescriptorSetLayout: Debug + Any + Send + Sync;
+    type ComputePipeline:     fmt::Debug + Any + Send + Sync;
+    type GraphicsPipeline:    fmt::Debug + Any + Send + Sync;
+    type PipelineLayout:      fmt::Debug + Any + Send + Sync;
+    type DescriptorPool:      pso::DescriptorPool<Self>;
+    type DescriptorSet:       fmt::Debug + Any + Send + Sync;
+    type DescriptorSetLayout: fmt::Debug + Any + Send + Sync;
 
-    type Fence:               Debug + Any + Send + Sync;
-    type Semaphore:           Debug + Any + Send + Sync;
-    type QueryPool:           Debug + Any + Send + Sync;
+    type Fence:               fmt::Debug + Any + Send + Sync;
+    type Semaphore:           fmt::Debug + Any + Send + Sync;
+    type QueryPool:           fmt::Debug + Any + Send + Sync;
 }
 
-#[allow(missing_docs)]
+/// Marks that an error occured submitting a command to a command buffer.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SubmissionError {}
@@ -362,16 +369,17 @@ impl Error for SubmissionError {
     }
 }
 
-#[allow(missing_docs)]
+/// Submission result for DX11 backend.  Currently mostly unused.
 pub type SubmissionResult<T> = Result<T, SubmissionError>;
 
 
-/// Represents a handle to a physical device.
+/// Represents a combination of a logical device and the
+/// hardware queues it provides.
 ///
 /// This structure is typically created using an `Adapter`.
 pub struct Gpu<B: Backend> {
-    /// Logical device.
+    /// Logical device for a given backend.
     pub device: B::Device,
-    ///
+    /// The command queues that the device provides.
     pub queues: queue::Queues<B>,
 }

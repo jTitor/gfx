@@ -4,14 +4,13 @@ use std::borrow::Borrow;
 use std::mem;
 use std::marker::PhantomData;
 
-use {hal, handle};
-use hal::image::{self, ImageLayout};
+use {hal, format, handle};
+use hal::image::ImageLayout;
 use hal::pass::{AttachmentOps, AttachmentLoadOp, AttachmentStoreOp};
 
-use format::{self, Format};
 use {Backend, Device, Primitive, Supports, Transfer, Graphics, Encoder};
 
-pub use hal::pso::{Rasterizer, CreationError, InstanceRate};
+pub use hal::pso::{DescriptorBinding, DescriptorArrayIndex, Rasterizer, CreationError, InstanceRate};
 
 #[derive(Debug)]
 pub struct RawDescriptorSet<B: Backend> {
@@ -40,7 +39,7 @@ pub trait BindDesc {
 pub trait Bind<B: Backend>: BindDesc {
     type Handle: 'static + Clone;
 
-    fn write<'a, I>(views: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
+    fn write<'a, I>(views: I) -> Vec<hal::pso::Descriptor<'a, B>>
     where
         I: IntoIterator,
         I::Item: Borrow<&'a Self::Handle>;
@@ -48,7 +47,7 @@ pub trait Bind<B: Backend>: BindDesc {
     fn require<'a>(
         &'a Self::Handle,
         &mut Vec<(&'a handle::raw::Buffer<B>, hal::buffer::State)>,
-        &mut Vec<(&'a handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+        &mut Vec<(&'a handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
         &mut handle::Bag<B>,
     );
 }
@@ -66,7 +65,7 @@ macro_rules! define_descriptors {
             {
                 type Handle = T::Handle;
 
-                fn write<'a, I>(handles: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
+                fn write<'a, I>(handles: I) -> Vec<hal::pso::Descriptor<'a, B>>
                 where
                     I: IntoIterator,
                     I::Item: Borrow<&'a Self::Handle>
@@ -77,7 +76,7 @@ macro_rules! define_descriptors {
                 fn require<'a>(
                     handle: &'a Self::Handle,
                     buffers: &mut Vec<(&'a handle::raw::Buffer<B>, hal::buffer::State)>,
-                    images: &mut Vec<(&'a handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+                    images: &mut Vec<(&'a handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
                     others: &mut handle::Bag<B>
                 ) {
                     T::require(handle, buffers, images, others)
@@ -105,12 +104,12 @@ define_descriptors! {
 impl<B: Backend> Bind<B> for SampledImage {
     type Handle = handle::raw::ImageView<B>;
 
-    fn write<'a, I>(_views: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
+    fn write<'a, I>(_views: I) -> Vec<hal::pso::Descriptor<'a, B>>
     where
         I: IntoIterator,
         I::Item: Borrow<&'a Self::Handle>,
     {
-        hal::pso::DescriptorWrite::SampledImage(&[])
+        Vec::new()
         /* views
             .into_iter()
             .map(|view| {
@@ -122,13 +121,13 @@ impl<B: Backend> Bind<B> for SampledImage {
     fn require<'a>(
         view: &'a Self::Handle,
         _: &mut Vec<(&'a handle::raw::Buffer<B>, hal::buffer::State)>,
-        images: &mut Vec<(&'a handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+        images: &mut Vec<(&'a handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
         _: &mut handle::Bag<B>,
     ) {
         let img = view.info();
         let levels = img.info().mip_levels;
         let layers = img.info().kind.num_layers();
-        let state = (image::Access::SHADER_READ, ImageLayout::ShaderReadOnlyOptimal);
+        let state = (hal::image::Access::SHADER_READ, ImageLayout::ShaderReadOnlyOptimal);
         for level in 0..levels {
             for layer in 0..layers {
                 images.push((img, (level, layer), state));
@@ -140,12 +139,12 @@ impl<B: Backend> Bind<B> for SampledImage {
 impl<B: Backend> Bind<B> for Sampler {
     type Handle = handle::raw::Sampler<B>;
 
-    fn write<'a, I>(_samplers: I) -> hal::pso::DescriptorWrite<'a, B, (Option<u64>, Option<u64>)>
+    fn write<'a, I>(_samplers: I) -> Vec<hal::pso::Descriptor<'a, B>>
     where
         I: IntoIterator,
         I::Item: Borrow<&'a Self::Handle>,
     {
-        hal::pso::DescriptorWrite::Sampler(&[])
+        Vec::new()
         /*
         samplers
             .into_iter()
@@ -156,7 +155,7 @@ impl<B: Backend> Bind<B> for Sampler {
     fn require<'a>(
         sampler: &'a Self::Handle,
         _: &mut Vec<(&'a handle::raw::Buffer<B>, hal::buffer::State)>,
-        _: &mut Vec<(&'a handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+        _: &mut Vec<(&'a handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
         others: &mut handle::Bag<B>,
     ) {
         others.add(sampler.clone());
@@ -165,13 +164,13 @@ impl<B: Backend> Bind<B> for Sampler {
 
 pub struct DescriptorSetBindRef<'a, 'b, B: Backend, T: Bind<B>> {
     pub set: &'a B::DescriptorSet,
-    pub binding: usize,
+    pub binding: DescriptorBinding,
     pub handles: &'b mut [Option<T::Handle>],
 }
 
 pub struct DescriptorSetsUpdate<'a, B: Backend> {
     device: &'a mut Device<B>,
-    writes: Vec<hal::pso::DescriptorSetWrite<'a, B, (Option<u64>, Option<u64>)>>,
+    writes: Vec<hal::pso::DescriptorSetWrite<'a, B, Vec<hal::pso::Descriptor<'a, B>>>>,
 }
 
 impl<'a, B: Backend> DescriptorSetsUpdate<'a, B> {
@@ -197,8 +196,8 @@ impl<'a, B: Backend> DescriptorSetsUpdate<'a, B> {
         self.writes.push(hal::pso::DescriptorSetWrite {
             set: bind_ref.set,
             binding: bind_ref.binding,
-            array_offset,
-            write: T::write(handles)
+            array_offset: 0,
+            descriptors: T::write(handles),
         });
         self
     }
@@ -259,11 +258,11 @@ pub trait Component<'a, B: Backend> {
     fn require<'b>(
         &'b Self::Data,
         &mut Vec<(&'b handle::raw::Buffer<B>, hal::buffer::State)>,
-        &mut Vec<(&'b handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+        &mut Vec<(&'b handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
         &mut handle::Bag<B>,
     ) where 'a: 'b {}
 
-    fn vertex_buffer<'b>(&'b Self::Data) -> Option<(&'b B::Buffer, hal::pso::BufferOffset)>
+    fn vertex_buffer<'b>(&'b Self::Data) -> Option<(&'b B::Buffer, hal::buffer::Offset)>
         where 'a: 'b
     {
         None
@@ -277,7 +276,7 @@ pub trait Component<'a, B: Backend> {
 }
 
 pub struct Attachment {
-    pub format: Format,
+    pub format: format::Format,
     pub ops: AttachmentOps,
     pub stencil_ops: AttachmentOps,
     pub required_layout: ImageLayout,
@@ -313,14 +312,14 @@ where
     fn require<'b>(
         data: &'b Self::Data,
         _: &mut Vec<(&'b handle::raw::Buffer<B>, hal::buffer::State)>,
-        images: &mut Vec<(&'b handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+        images: &mut Vec<(&'b handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
         _: &mut handle::Bag<B>,
     ) where 'a: 'b {
         let img = data.as_ref().info();
         let levels = img.info().mip_levels;
         let layers = img.info().kind.num_layers();
         // TODO: READ not always necessary
-        let state = (image::Access::COLOR_ATTACHMENT_READ | image::Access::COLOR_ATTACHMENT_WRITE,
+        let state = (hal::image::Access::COLOR_ATTACHMENT_READ | hal::image::Access::COLOR_ATTACHMENT_WRITE,
             ImageLayout::ColorAttachmentOptimal);
         for level in 0..levels {
             for layer in 0..layers {
@@ -331,7 +330,7 @@ where
 }
 
 pub trait Structure: Sized {
-    fn elements() -> Vec<hal::pso::Element<Format>>;
+    fn elements() -> Vec<hal::pso::Element<format::Format>>;
 }
 
 /// Helper trait to support variable instance rate.
@@ -391,13 +390,13 @@ impl<'a, B, T, I> Component<'a, B> for VertexBuffer<T, I>
     fn require<'b>(
         data: &'b Self::Data,
         buffers: &mut Vec<(&'b handle::raw::Buffer<B>, hal::buffer::State)>,
-        _: &mut Vec<(&'b handle::raw::Image<B>, image::Subresource, hal::image::State)>,
+        _: &mut Vec<(&'b handle::raw::Image<B>, hal::image::Subresource, hal::image::State)>,
         _: &mut handle::Bag<B>,
     ) where 'a: 'b {
         buffers.push((data.as_ref(), hal::buffer::Access::VERTEX_BUFFER_READ));
     }
 
-    fn vertex_buffer<'b>(data: &'b Self::Data) -> Option<(&'b B::Buffer, hal::pso::BufferOffset)>
+    fn vertex_buffer<'b>(data: &'b Self::Data) -> Option<(&'b B::Buffer, hal::buffer::Offset)>
         where 'a: 'b
     {
         // TODO: offset
