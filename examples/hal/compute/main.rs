@@ -13,7 +13,6 @@ extern crate gfx_backend_vulkan as back;
 extern crate gfx_backend_metal as back;
 
 use std::str::FromStr;
-use std::ops::Range;
 
 use hal::{
     Backend, Compute, Device, DescriptorPool, Instance, PhysicalDevice, QueueFamily,
@@ -108,7 +107,9 @@ fn main() {
             set: &desc_set,
             binding: 0,
             array_offset: 0,
-            write: pso::DescriptorWrite::StorageBuffer(&[(&device_buffer, 0..stride * numbers.len() as u64)])
+            descriptors: Some(
+                pso::Descriptor::Buffer(&device_buffer, None .. None)
+            ),
         }
     ));
 
@@ -118,26 +119,24 @@ fn main() {
         let mut command_buffer = command_pool.acquire_command_buffer(false);
         command_buffer.copy_buffer(&staging_buffer, &device_buffer, &[command::BufferCopy { src: 0, dst: 0, size: stride * numbers.len() as u64}]);
         command_buffer.pipeline_barrier(
-            Range { start: pso::PipelineStage::TRANSFER, end: pso::PipelineStage::COMPUTE_SHADER },
-                &[memory::Barrier::Buffer {
-                    states: Range {
-                        start: buffer::Access::TRANSFER_WRITE,
-                        end: buffer::Access::SHADER_READ | buffer::Access::SHADER_WRITE
-                    },
-                    target: &device_buffer
-                }]);
+            pso::PipelineStage::TRANSFER .. pso::PipelineStage::COMPUTE_SHADER,
+            memory::Dependencies::empty(),
+            Some(memory::Barrier::Buffer {
+                states: buffer::Access::TRANSFER_WRITE .. buffer::Access::SHADER_READ | buffer::Access::SHADER_WRITE,
+                target: &device_buffer
+            }),
+        );
         command_buffer.bind_compute_pipeline(&pipeline);
         command_buffer.bind_compute_descriptor_sets(&pipeline_layout, 0, &[desc_set]);
-        command_buffer.dispatch(numbers.len() as u32, 1, 1);
+        command_buffer.dispatch([numbers.len() as u32, 1, 1]);
         command_buffer.pipeline_barrier(
-            Range { start: pso::PipelineStage::COMPUTE_SHADER, end: pso::PipelineStage::TRANSFER },
-                &[memory::Barrier::Buffer {
-                    states: Range {
-                        start: buffer::Access::SHADER_READ | buffer::Access::SHADER_WRITE,
-                        end: buffer::Access::TRANSFER_READ
-                    },
-                    target: &device_buffer
-                }]);
+            pso::PipelineStage::COMPUTE_SHADER .. pso::PipelineStage::TRANSFER,
+            memory::Dependencies::empty(),
+            Some(memory::Barrier::Buffer {
+                states: buffer::Access::SHADER_READ | buffer::Access::SHADER_WRITE .. buffer::Access::TRANSFER_READ,
+                target: &device_buffer
+            }),
+        );
         command_buffer.copy_buffer(&device_buffer, &staging_buffer, &[command::BufferCopy { src: 0, dst: 0, size: stride * numbers.len() as u64}]);
         command_buffer.finish()
     }));

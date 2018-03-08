@@ -81,9 +81,7 @@ unsafe impl Sync for ComputePipeline {}
 #[derive(Debug)]
 pub struct Image {
     pub(crate) raw: metal::Texture,
-    pub(crate) bytes_per_block: u8,
-    // Dimension of a texel block (compressed formats).
-    pub(crate) block_dim: (u8, u8),
+    pub(crate) format_desc: hal::format::FormatDesc,
 }
 
 unsafe impl Send for Image {}
@@ -156,10 +154,7 @@ impl hal::DescriptorPool<Backend> for DescriptorPool {
                         pso::DescriptorType::StorageBuffer => {
                             DescriptorSetBinding::Buffer(vec![None; layout.count])
                         }
-                        pso::DescriptorType::UniformTexelBuffer |
-                        pso::DescriptorType::StorageTexelBuffer |
-                        pso::DescriptorType::CombinedImageSampler |
-                        pso::DescriptorType::InputAttachment => unimplemented!()
+                        _ => unimplemented!()
                     };
                     (layout.binding, binding)
                 }).collect();
@@ -219,7 +214,7 @@ unsafe impl Sync for DescriptorSet {}
 #[derive(Debug)]
 pub struct DescriptorSetInner {
     pub(crate) layout: Vec<pso::DescriptorSetLayoutBinding>, // TODO: maybe don't clone?
-    pub(crate) bindings: HashMap<usize, DescriptorSetBinding>,
+    pub(crate) bindings: HashMap<pso::DescriptorBinding, DescriptorSetBinding>,
 }
 unsafe impl Send for DescriptorSetInner {}
 
@@ -311,10 +306,8 @@ unsafe impl Sync for UnboundBuffer {}
 
 #[derive(Debug)]
 pub struct UnboundImage {
-    pub desc: metal::TextureDescriptor,
-    pub bytes_per_block: u8,
-    // Dimension of a texel block (compressed formats).
-    pub block_dim: (u8, u8),
+    pub(crate) texture_desc: metal::TextureDescriptor,
+    pub(crate) format_desc: hal::format::FormatDesc,
 }
 unsafe impl Send for UnboundImage {}
 unsafe impl Sync for UnboundImage {}

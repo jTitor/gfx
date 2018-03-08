@@ -57,21 +57,48 @@ bitflags!(
         /// Cached memory by the CPU
         const CPU_CACHED = 0x8;
 
-        ///
+        /// Memory that may be lazily allocated as needed on the GPU
+        /// and *must not* be visible to the CPU.
         const LAZILY_ALLOCATED = 0x20;
     }
 );
 
-#[allow(missing_docs)] //TODO
+bitflags!(
+    /// Barrier dependency flags.
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct Dependencies: u32 {
+        /// Specifies the memory dependency to be framebuffer-local.
+        const BY_REGION    = 0x1;
+        //const VIEW_LOCAL   = 0x2;
+        //const DEVICE_GROUP = 0x4;
+    }
+);
+
+// DOC TODO: Could be better, but I don't know how to do this without 
+// trying to explain the whole synchronization model.
+/// A [memory barrier](https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#synchronization-memory-barriers)
+/// type for either buffers or images.
+#[allow(missing_docs)] 
 #[derive(Clone, Debug)]
 pub enum Barrier<'a, B: Backend> {
+    /// Applies the given access flags to all buffers in the range.
+    AllBuffers(Range<buffer::Access>),
+    /// Applies the given access flags to all images in the range.
+    AllImages(Range<image::Access>),
+    /// A memory barrier that defines access to a buffer.
     Buffer {
+        /// The access flags controlling the buffer.
         states: Range<buffer::State>,
+        /// The buffer the barrier controls.
         target: &'a B::Buffer,
     },
+    /// A memory barrier that defines access to (a subset of) an image.
     Image {
+        /// The access flags controlling the image.
         states: Range<image::State>,
+        /// The image the barrier controls.
         target: &'a B::Image,
+        /// A `SubresourceRange` that defines which section of an image the barrier applies to.
         range: image::SubresourceRange,
     },
 }

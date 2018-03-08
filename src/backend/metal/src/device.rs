@@ -324,7 +324,7 @@ impl Device {
         let mut entry_point_map = HashMap::new();
         for entry_point in entry_points {
             info!("Entry point {:?}", entry_point);
-            let cleansed = ast.get_cleansed_entry_point_name(&entry_point.name)
+            let cleansed = ast.get_cleansed_entry_point_name(&entry_point.name, entry_point.execution_model)
                 .map_err(|err| {
                     let msg = match err {
                         SpirvErrorCode::CompilationError(msg) => msg,
@@ -384,30 +384,32 @@ impl Device {
         Ok((lib, mtl_function, wg_size))
     }
 
-    fn describe_argument(ty: DescriptorType, index: usize, count: usize) -> metal::ArgumentDescriptor {
+    fn describe_argument(
+        ty: DescriptorType, index: pso::DescriptorBinding, count: usize
+    ) -> metal::ArgumentDescriptor {
         let arg = metal::ArgumentDescriptor::new().to_owned();
-        arg.set_array_length(count as NSUInteger);
+        arg.set_array_length(count as _);
 
         match ty {
             DescriptorType::Sampler => {
                 arg.set_access(MTLArgumentAccess::ReadOnly);
                 arg.set_data_type(MTLDataType::Sampler);
-                arg.set_index(index as NSUInteger);
+                arg.set_index(index as _);
             }
             DescriptorType::SampledImage => {
                 arg.set_access(MTLArgumentAccess::ReadOnly);
                 arg.set_data_type(MTLDataType::Texture);
-                arg.set_index(index as NSUInteger);
+                arg.set_index(index as _);
             }
             DescriptorType::UniformBuffer => {
                 arg.set_access(MTLArgumentAccess::ReadOnly);
                 arg.set_data_type(MTLDataType::Struct);
-                arg.set_index(index as NSUInteger);
+                arg.set_index(index as _);
             }
             DescriptorType::StorageBuffer => {
                 arg.set_access(MTLArgumentAccess::ReadWrite);
                 arg.set_data_type(MTLDataType::Struct);
-                arg.set_index(index as NSUInteger);
+                arg.set_index(index as _);
             }
             _ => unimplemented!()
         }
@@ -514,7 +516,7 @@ impl hal::Device<Backend> for Device {
                             if !set_binding.stage_flags.contains(stage_bit) {
                                 continue
                             }
-                            let count = match set_binding.ty {
+                            let offset = match set_binding.ty {
                                 DescriptorType::UniformBuffer |
                                 DescriptorType::StorageBuffer => &mut counters.buffers,
                                 DescriptorType::SampledImage => &mut counters.textures,
@@ -522,19 +524,18 @@ impl hal::Device<Backend> for Device {
                                 DescriptorType::Sampler => &mut counters.samplers,
                                 _ => unimplemented!()
                             };
-                            for i in 0 .. set_binding.count {
-                                let location = msl::ResourceBindingLocation {
-                                    stage,
-                                    desc_set: set_index as _,
-                                    binding: (set_binding.binding + i) as _,
-                                };
-                                let res_binding = msl::ResourceBinding {
-                                    resource_id: *count as _,
-                                    force_used: false,
-                                };
-                                *count += 1;
-                                res_overrides.insert(location, res_binding);
-                            }
+                            assert_eq!(set_binding.count, 1); //TODO
+                            let location = msl::ResourceBindingLocation {
+                                stage,
+                                desc_set: set_index as _,
+                                binding: set_binding.binding as _,
+                            };
+                            let res_binding = msl::ResourceBinding {
+                                resource_id: *offset as _,
+                                force_used: false,
+                            };
+                            *offset += 1;
+                            res_overrides.insert(location, res_binding);
                         }
                     }
                 }
@@ -581,9 +582,9 @@ impl hal::Device<Backend> for Device {
         let pass_descriptor = &pipeline_desc.subpass;
 
         if pipeline_layout.attribute_buffer_index as usize + pipeline_desc.vertex_buffers.len() > self.private_caps.max_buffers_per_stage {
-            error!("Too many buffers inputs of the vertex stage: {} attributes + {} resources",
+            let msg = format!("Too many buffers inputs of the vertex stage: {} attributes + {} resources",
                 pipeline_desc.vertex_buffers.len(), pipeline_layout.attribute_buffer_index);
-            return Err(pso::CreationError::Other);
+            return Err(pso::CreationError::Shader(ShaderError::InterfaceMismatch(msg)));
         }
         // FIXME: lots missing
 
@@ -613,23 +614,25 @@ impl hal::Device<Backend> for Device {
 
         // Other shaders
         if pipeline_desc.shaders.hull.is_some() {
-            error!("Metal tessellation shaders are not supported");
-            return Err(pso::CreationError::Other);
+            return Err(pso::CreationError::Shader(ShaderError::UnsupportedStage(pso::Stage::Hull)));
         }
         if pipeline_desc.shaders.domain.is_some() {
-            error!("Metal tessellation shaders are not supported");
-            return Err(pso::CreationError::Other);
+            return Err(pso::CreationError::Shader(ShaderError::UnsupportedStage(pso::Stage::Domain)));
         }
         if pipeline_desc.shaders.geometry.is_some() {
-            error!("Metal geometry shaders are not supported");
-            return Err(pso::CreationError::Other);
+            return Err(pso::CreationError::Shader(ShaderError::UnsupportedStage(pso::Stage::Geometry)));
         }
 
         // Copy color target info from Subpass
         for (i, attachment) in pass_descriptor.main_pass.attachments.iter().enumerate() {
-            let (mtl_format, is_depth) = attachment.format.and_then(map_format).expect("unsupported color format for Metal");
+            let (mtl_format, is_depth) = attachment.format
+                .and_then(map_format)
+                .expect("unsupported color format");
             if !is_depth {
-                let descriptor = pipeline.color_attachments().object_at(i).expect("too many color attachments");
+                let descriptor = pipeline
+                    .color_attachments()
+                    .object_at(i)
+                    .expect("too many color attachments");
                 descriptor.set_pixel_format(mtl_format);
             } else {
                 pipeline.set_depth_attachment_pixel_format(mtl_format);
@@ -638,7 +641,10 @@ impl hal::Device<Backend> for Device {
 
         // Blending
         for (i, color_desc) in pipeline_desc.blender.targets.iter().enumerate() {
-            let descriptor = pipeline.color_attachments().object_at(i).expect("too many color attachments");
+            let descriptor = pipeline
+                .color_attachments()
+                .object_at(i)
+                .expect("too many color attachments");
             descriptor.set_write_mask(map_write_mask(color_desc.0));
 
             if let pso::BlendState::On { ref color, ref alpha } = color_desc.1 {
@@ -697,7 +703,8 @@ impl hal::Device<Backend> for Device {
             }
         }
         for (i, &AttributeDesc { binding, element, ..}) in pipeline_desc.attributes.iter().enumerate() {
-            let mtl_vertex_format = map_vertex_format(element.format).expect("unsupported vertex format for Metal");
+            let mtl_vertex_format = map_vertex_format(element.format)
+                .expect("unsupported vertex format");
             let mtl_attribute_desc = vertex_descriptor
                 .attributes()
                 .object_at(i)
@@ -936,7 +943,7 @@ impl hal::Device<Backend> for Device {
             };
             let index = *offset_ref;
             *offset_ref += desc.count;
-            Self::describe_argument(desc.ty, index, desc.count)
+            Self::describe_argument(desc.ty, index as _, desc.count)
         }).collect::<Vec<_>>();
 
         let arg_array = metal::Array::from_owned_slice(&arguments);
@@ -959,7 +966,7 @@ impl hal::Device<Backend> for Device {
     {
         if !self.private_caps.argument_buffers {
             return n::DescriptorSetLayout::Emulated(
-                bindings.into_iter().map(|desc| *desc.borrow()).collect()
+                bindings.into_iter().map(|desc| desc.borrow().clone()).collect()
             )
         }
 
@@ -975,77 +982,49 @@ impl hal::Device<Backend> for Device {
         n::DescriptorSetLayout::ArgumentBuffer(encoder, stage_flags)
     }
 
-    fn write_descriptor_sets<'a, I, R>(&self, writes: I)
+    fn write_descriptor_sets<'a, I, J>(&self, write_iter: I)
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetWrite<'a, Backend, R>>,
-        R: 'a + RangeArg<u64>,
+        I: IntoIterator<Item = pso::DescriptorSetWrite<'a, Backend, J>>,
+        J: IntoIterator,
+        J::Item: Borrow<pso::Descriptor<'a, Backend>>,
     {
-        use hal::pso::DescriptorWrite::*;
-
-        let mut mtl_samplers = Vec::new();
-        let mut mtl_textures = Vec::new();
-        let mut mtl_buffers = Vec::new();
-        let mut mtl_offsets = Vec::new();
-
-        for write in writes {
-            let w = write.borrow();
-            match *w.set {
+        for write in write_iter {
+            match *write.set {
                 n::DescriptorSet::Emulated(ref inner) => {
                     let mut set = inner.lock().unwrap();
+                    let mut array_offset = write.array_offset;
+                    let mut binding = write.binding;
 
-                    // Find layout entry
-                    let layout = set.layout.iter()
-                        .find(|layout| layout.binding == w.binding)
-                        .expect("invalid descriptor set binding index")
-                        .clone();
-
-                    match (&w.write, set.bindings.get_mut(&w.binding)) {
-                        (&Sampler(ref samplers), Some(&mut n::DescriptorSetBinding::Sampler(ref mut vec))) => {
-                            if w.array_offset + samplers.len() > layout.count {
-                                panic!("out of range descriptor write");
-                            }
-
-                            let target_iter = vec[w.array_offset..(w.array_offset + samplers.len())].iter_mut();
-
-                            for (new, old) in samplers.iter().zip(target_iter) {
-                                *old = Some(new.0.clone());
-                            }
+                    for descriptor in write.descriptors {
+                        while array_offset >= set.layout.iter()
+                                .find(|layout| layout.binding == binding)
+                                .expect("invalid descriptor set binding index")
+                                .count
+                        {
+                            array_offset = 0;
+                            binding += 1;
                         }
-                        (&SampledImage(ref images), Some(&mut n::DescriptorSetBinding::Image(ref mut vec))) |
-                        (&StorageImage(ref images), Some(&mut n::DescriptorSetBinding::Image(ref mut vec))) => {
-                            if w.array_offset + images.len() > layout.count {
-                                panic!("out of range descriptor write");
+                        match (descriptor.borrow(), set.bindings.get_mut(&binding).unwrap()) {
+                            (&pso::Descriptor::Sampler(sampler), &mut n::DescriptorSetBinding::Sampler(ref mut vec)) => {
+                                vec[array_offset] = Some(sampler.0.clone());
                             }
-
-                            let target_iter = vec[w.array_offset..(w.array_offset + images.len())].iter_mut();
-
-                            for (&(image, offset), old) in images.iter().zip(target_iter) {
-                                *old = Some((image.0.clone(), offset));
+                            (&pso::Descriptor::Image(image, layout), &mut n::DescriptorSetBinding::Image(ref mut vec)) => {
+                                vec[array_offset] = Some((image.0.clone(), layout));
                             }
-                        }
-                        (&UniformBuffer(ref buffers), Some(&mut n::DescriptorSetBinding::Buffer(ref mut vec))) |
-                        (&StorageBuffer(ref buffers), Some(&mut n::DescriptorSetBinding::Buffer(ref mut vec))) => {
-                            if w.array_offset + buffers.len() > layout.count {
-                                panic!("out of range descriptor write");
-                            }
-
-                            let target_iter = vec[w.array_offset..(w.array_offset + buffers.len())].iter_mut();
-
-                            for (new, old) in buffers.iter().zip(target_iter) {
-                                let (buffer, ref range) = *new;
+                            (&pso::Descriptor::Buffer(buffer, ref range), &mut n::DescriptorSetBinding::Buffer(ref mut vec)) => {
                                 let buf_length = buffer.raw.length();
-                                let start = *range.start().unwrap_or(&0);
-                                let end = *range.end().unwrap_or(&buf_length);
+                                let start = range.start.unwrap_or(0);
+                                let end = range.end.unwrap_or(buf_length);
                                 assert!(end <= buf_length);
-                                *old = Some((buffer.raw.clone(), start));
+                                vec[array_offset] = Some((buffer.raw.clone(), start));
                             }
+                            (&pso::Descriptor::Sampler(..), _) |
+                            (&pso::Descriptor::Image(..), _) |
+                            (&pso::Descriptor::Buffer(..), _) => {
+                                panic!("mismatched descriptor set type")
+                            }
+                            _ => unimplemented!(),
                         }
-
-                        (&Sampler(_), _) | (&SampledImage(_), _) | (&UniformBuffer(_), _) | (&StorageBuffer(_), _) => {
-                            panic!("mismatched descriptor set type")
-                        }
-                        _ => unimplemented!(),
                     }
                 }
                 n::DescriptorSet::ArgumentBuffer { ref buffer, offset, ref encoder, .. } => {
@@ -1053,40 +1032,22 @@ impl hal::Device<Backend> for Device {
 
                     encoder.set_argument_buffer(buffer, offset);
                     //TODO: range checks, need to keep some layout metadata around
-                    assert_eq!(w.array_offset, 0); //TODO
+                    assert_eq!(write.array_offset, 0); //TODO
 
-                    match w.write {
-                        Sampler(ref samplers) => {
-                            mtl_samplers.clear();
-                            mtl_samplers.extend(samplers.iter().map(|sampler| &*sampler.0));
-                            encoder.set_sampler_states(&mtl_samplers, w.binding as _);
-                        },
-                        SampledImage(ref images) => {
-                            mtl_textures.clear();
-                            mtl_textures.extend(images.iter().map(|image| &*((image.0).0)));
-                            encoder.set_textures(&mtl_textures, w.binding as _);
-                        },
-                        UniformBuffer(ref buffers) | StorageBuffer(ref buffers) => {
-                            mtl_buffers.clear();
-                            mtl_buffers.extend(buffers.iter().map(|buf| &*((buf.0).raw)));
-                            mtl_offsets.clear();
-                            mtl_offsets.extend(buffers.iter().map(|buf| *buf.1.start().unwrap_or(&0)));
-
-                            let encoder: &metal::ArgumentEncoderRef = &encoder;
-
-                            let range = NSRange {
-                                location: offset,
-                                length: mtl_buffers.len() as NSUInteger,
-                            };
-                            unsafe {
-                                msg_send![encoder,
-                                          setBuffers: mtl_buffers.as_ptr()
-                                          offsets: mtl_offsets.as_ptr()
-                                          withRange:range
-                                ]
+                    for descriptor in write.descriptors {
+                        match *descriptor.borrow() {
+                            pso::Descriptor::Sampler(sampler) => {
+                                encoder.set_sampler_states(&[&sampler.0], write.binding as _);
                             }
+                            pso::Descriptor::Image(image, _layout) => {
+                                encoder.set_textures(&[&image.0], write.binding as _);
+                            }
+                            pso::Descriptor::Buffer(buffer, ref range) => {
+                                encoder.set_buffer(&buffer.raw, range.start.unwrap_or(0), write.binding as _);
+                            }
+                            pso::Descriptor::CombinedImageSampler(..) |
+                            pso::Descriptor::TexelBuffer(..) => unimplemented!(),
                         }
-                        _ => unimplemented!(),
                     }
                 }
             }
@@ -1247,8 +1208,6 @@ impl hal::Device<Backend> for Device {
     {
         let base_format = format.base_format();
         let format_desc = base_format.0.desc();
-        let bytes_per_block = (format_desc.bits / 8) as _;
-        let block_dim = format_desc.dim;
         let (mtl_format, _) = map_format(format).ok_or(image::CreationError::Format(format))?;
 
         let descriptor = metal::TextureDescriptor::new();
@@ -1267,9 +1226,8 @@ impl hal::Device<Backend> for Device {
         descriptor.set_usage(map_texture_usage(usage));
 
         Ok(n::UnboundImage {
-            desc: descriptor,
-            bytes_per_block,
-            block_dim,
+            texture_desc: descriptor,
+            format_desc,
         })
     }
 
@@ -1284,8 +1242,8 @@ impl hal::Device<Backend> for Device {
                 MTLResourceOptions::StorageModeManaged | MTLResourceOptions::CPUCacheModeWriteCombined,
                 MTLResourceOptions::StorageModePrivate,
             ].iter() {
-                image.desc.set_resource_options(options);
-                let requirements = self.device.heap_texture_size_and_align(&image.desc);
+                image.texture_desc.set_resource_options(options);
+                let requirements = self.device.heap_texture_size_and_align(&image.texture_desc);
                 max_size = cmp::max(max_size, requirements.size);
                 max_alignment = cmp::max(max_alignment, requirements.align);
             }
@@ -1311,26 +1269,25 @@ impl hal::Device<Backend> for Device {
                 let resource_options = resource_options_from_storage_and_cache(
                     heap.storage_mode(),
                     heap.cpu_cache_mode());
-                image.desc.set_resource_options(resource_options);
-                heap.new_texture(&image.desc)
+                image.texture_desc.set_resource_options(resource_options);
+                heap.new_texture(&image.texture_desc)
                     .unwrap_or_else(|| {
                         // TODO: disable hazard tracking?
-                        self.device.new_texture(&image.desc)
+                        self.device.new_texture(&image.texture_desc)
                     })
             },
             n::MemoryHeap::Emulated { memory_type } => {
                 // TODO: disable hazard tracking?
                 let memory_properties = self.memory_types[memory_type].properties;
                 let resource_options = map_memory_properties_to_options(memory_properties);
-                image.desc.set_resource_options(resource_options);
-                self.device.new_texture(&image.desc)
+                image.texture_desc.set_resource_options(resource_options);
+                self.device.new_texture(&image.texture_desc)
             }
         };
 
         Ok(n::Image {
             raw,
-            bytes_per_block: image.bytes_per_block,
-            block_dim: image.block_dim,
+            format_desc: image.format_desc,
         })
     }
 
