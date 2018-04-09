@@ -1,11 +1,6 @@
-//! Texture creation and modification.
+//! Image related structures.
 //!
-//! "Texture" is an overloaded term. In gfx-rs, a texture consists of two
-//! separate pieces of information: an image storage description (which is
-//! immutable for a single texture object), and image data. To actually use a
-//! texture, a "sampler" is needed, which provides a way of accessing the
-//! image data.  Image data consists of an array of "texture elements", or
-//! texels.
+//! An image is a block of GPU memory representing a grid of texels.
 
 use std::error::Error;
 use std::fmt;
@@ -15,15 +10,31 @@ use format;
 use pso::Comparison;
 
 
+/// Dimension size.
+pub type Size = u32;
+/// Number of MSAA samples.
+pub type NumSamples = u8;
 /// Image layer.
 pub type Layer = u16;
 /// Image mipmap level.
 pub type Level = u8;
-/// Maximum accessible mipmap level of a image.
+/// Maximum accessible mipmap level of an image.
 pub const MAX_LEVEL: Level = 15;
 
+/// Describes the size of an image, which may be up to three dimensional.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Extent {
+    /// Image width
+    pub width: Size,
+    /// Image height
+    pub height: Size,
+    /// Image depth.
+    pub depth: Size,
+}
+
 ///
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Offset {
     ///
@@ -34,7 +45,24 @@ pub struct Offset {
     pub z: i32,
 }
 
-/// Pure texture object creation error.
+impl Offset {
+    /// Zero offset shortcut
+    pub const ZERO: Self = Offset { x: 0, y: 0, z: 0 };
+}
+
+/// Image tiling modes.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Tiling {
+    /// Optimal tiling for GPU memory access. Implementation-dependent.
+    Optimal,
+    /// Optimal for CPU read/write. Texels are laid out in row-major order,
+    /// possibly with some padding on each row.
+    Linear,
+}
+
+/// Pure image object creation error.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CreationError {
     /// The format is not supported by the device.
@@ -42,10 +70,10 @@ pub enum CreationError {
     /// The kind doesn't support a particular operation.
     Kind,
     /// Failed to map a given multisampled kind to the device.
-    Samples(AaMode),
+    Samples(NumSamples),
     /// Unsupported size in one of the dimensions.
     Size(Size),
-    /// The given data has a different size than the target texture slice.
+    /// The given data has a different size than the target image slice.
     Data(usize),
     /// The mentioned usage mode is not supported
     Usage(Usage),
@@ -71,8 +99,8 @@ impl Error for CreationError {
             CreationError::Kind => "The kind doesn't support a particular operation",
             CreationError::Samples(_) => "Failed to map a given multisampled kind to the device",
             CreationError::Size(_) => "Unsupported size in one of the dimensions",
-            CreationError::Data(_) => "The given data has a different size than the target texture slice",
-            CreationError::Usage(_) => "The expected texture usage mode is not supported by a graphic API",
+            CreationError::Data(_) => "The given data has a different size than the target image slice",
+            CreationError::Usage(_) => "The expected image usage mode is not supported by a graphic API",
         }
     }
 }
@@ -88,6 +116,8 @@ pub enum ViewError {
     Layer(LayerError),
     /// An incompatible format was requested for the view.
     BadFormat,
+    /// Unsupported view kind.
+    BadKind,
     /// The backend refused for some reason.
     Unsupported,
 }
@@ -113,6 +143,8 @@ impl Error for ViewError {
                 "Selected mip level doesn't exist",
             ViewError::Layer(_) =>
                 "Selected array layer doesn't exist",
+            ViewError::BadKind =>
+                "An incompatible kind was requested for the view",
             ViewError::BadFormat =>
                 "An incompatible format was requested for the view",
             ViewError::Unsupported =>
@@ -129,10 +161,10 @@ impl Error for ViewError {
 }
 
 
-/// An error associated with selected texture layer.
+/// An error associated with selected image layer.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum LayerError {
-    /// The source texture kind doesn't support array slices.
+    /// The source image kind doesn't support array slices.
     NotExpected(Kind),
     /// Selected layer is outside of the provided range.
     OutOfBounds(Range<Layer>),
@@ -150,90 +182,41 @@ impl fmt::Display for LayerError {
 impl Error for LayerError {
     fn description(&self) -> &str {
         match *self {
-            LayerError::NotExpected(_) => "The source texture kind doesn't support array slices",
+            LayerError::NotExpected(_) => "The source image kind doesn't support array slices",
             LayerError::OutOfBounds(_) => "Selected layers are outside of the provided range",
         }
     }
 }
 
-/// Dimension size
-pub type Size = u16;
-/// Number of bits per component
-pub type Bits = u8;
-/// Number of MSAA samples
-pub type NumSamples = u8;
-/// Number of EQAA fragments
-pub type NumFragments = u8;
-
-/// Dimensions: width, height, depth, and samples.
-pub type Dimensions = (Size, Size, Size, AaMode);
-
-/// Describes the configuration of samples inside each texel.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum AaMode {
-    /// No additional sample information
-    Single,
-    /// MultiSampled Anti-Aliasing (MSAA)
-    Multi(NumSamples),
-    /// Coverage Sampling Anti-Aliasing (CSAA/EQAA)
-    Coverage(NumSamples, NumFragments),
-}
-
-impl From<NumSamples> for AaMode {
-    fn from(ns: NumSamples) -> AaMode {
-        if ns > 1 {
-            AaMode::Multi(ns)
-        } else {
-            AaMode::Single
-        }
-    }
-}
-
-impl AaMode {
-    /// Return the number of actual data fragments stored per texel.
-    pub fn num_fragments(&self) -> NumFragments {
-        match *self {
-            AaMode::Single => 1,
-            AaMode::Multi(n) => n,
-            AaMode::Coverage(_, nf) => nf,
-        }
-    }
-    /// Return true if the surface has to be resolved before sampling.
-    pub fn needs_resolve(&self) -> bool {
-        self.num_fragments() > 1
-    }
-}
-
 
 /// How to [filter](https://en.wikipedia.org/wiki/Texture_filtering) the
-/// texture when sampling. They correspond to increasing levels of quality,
-/// but also cost. They "layer" on top of each other: it is not possible to
-/// have bilinear filtering without mipmapping, for example.
-///
-/// These names are somewhat poor, in that "bilinear" is really just doing
-/// linear filtering on each axis, and it is only bilinear in the case of 2D
-/// textures. Similarly for trilinear, it is really Quadralinear(?) for 3D
-/// textures. Alas, these names are simple, and match certain intuitions
-/// ingrained by many years of public use of inaccurate terminology.
+/// image when sampling. They correspond to increasing levels of quality,
+/// but also cost.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum FilterMethod {
-    /// The dumbest filtering possible, nearest-neighbor interpolation.
-    Scale,
-    /// Add simple mipmapping.
-    Mipmap,
-    /// Sample multiple texels within a single mipmap level to increase
-    /// quality.
-    Bilinear,
-    /// Sample multiple texels across two mipmap levels to increase quality.
-    Trilinear,
-    /// Anisotropic filtering with a given "max", must be between 1 and 16,
-    /// inclusive.
-    Anisotropic(u8)
+pub enum Filter {
+    /// Selects a single texel from the current mip level and uses its value.
+    ///
+    /// Mip filtering selects the filtered value from one level.
+    Nearest,
+    /// Selects multiple texels and calculates the value via multivariate interpolation.
+    ///     * 1D: Linear interpolation
+    ///     * 2D/Cube: Bilinear interpolation
+    ///     * 3D: Trilinear interpolation
+    Linear,
 }
 
-/// The face of a cube texture to do an operation on.
+/// Anisotropic filtering description for the sampler.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Anisotropic {
+    /// Disable anisotropic filtering.
+    Off,
+    /// Enable anisotropic filtering with the anisotropy clamp value.
+    On(u8),
+}
+
+/// The face of a cube image to do an operation on.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -254,116 +237,151 @@ pub const CUBE_FACES: [CubeFace; 6] = [
     CubeFace::PosZ, CubeFace::NegZ,
 ];
 
-/// Specifies the kind of a texture storage to be allocated.
+/// Specifies the kind of an image to be allocated.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Kind {
     /// A single one-dimensional row of texels.
-    D1(Size),
-    /// An array of rows of texels. Equivalent to Texture2D except that texels
-    /// in different rows are not sampled, so filtering will be constrained
-    /// to a single row of texels at a time.
-    D1Array(Size, Layer),
-    /// A traditional 2D texture, with rows arranged contiguously.
-    D2(Size, Size, AaMode),
-    /// An array of 2D textures. Equivalent to Texture3D except that texels in
-    /// a different depth level are not sampled.
-    D2Array(Size, Size, Layer, AaMode),
-    /// A volume texture, with each 2D layer arranged contiguously.
+    D1(Size, Layer),
+    /// Two-dimensional image.
+    D2(Size, Size, Layer, NumSamples),
+    /// Volumetric image.
     D3(Size, Size, Size),
-    /// A set of 6 2D textures, one for each face of a cube.
-    Cube(Size),
-    /// An array of Cube textures.
-    CubeArray(Size, Layer),
 }
 
 impl Kind {
-    /// Get texture dimensions
-    pub fn dimensions(&self) -> Dimensions {
-        let s0 = AaMode::Single;
+    /// Get the image extent.
+    pub fn extent(&self) -> Extent {
         match *self {
-            Kind::D1(w) => (w, 1, 1, s0),
-            Kind::D1Array(w, a) => (w, 1, a as Size, s0),
-            Kind::D2(w, h, s) => (w, h, 1, s),
-            Kind::D2Array(w, h, a, s) => (w, h, a as Size, s),
-            Kind::D3(w, h, d) => (w, h, d, s0),
-            Kind::Cube(w) => (w, w, 6, s0),
-            Kind::CubeArray(w, a) => (w, w, 6 * (a as Size), s0)
+            Kind::D1(width, _) => Extent {
+                width,
+                height: 1,
+                depth: 1,
+            },
+            Kind::D2(width, height, _, _) => Extent {
+                width,
+                height,
+                depth: 1,
+            },
+            Kind::D3(width, height, depth) => Extent {
+                width,
+                height,
+                depth,
+            },
         }
     }
-    /// Get the dimensionality of a particular mipmap level.
-    pub fn level_dimensions(&self, level: Level) -> Dimensions {
+
+    /// Get the extent of a particular mipmap level.
+    pub fn level_extent(&self, level: Level) -> Extent {
         use std::cmp::{max, min};
         // must be at least 1
         let map = |val| max(min(val, 1), val >> min(level, MAX_LEVEL));
-        let (w, h, da, _) = self.dimensions();
-        let dm = if self.num_slices().is_some() {
-            1
-        } else {
-            map(da)
-        };
-        (map(w), map(h), dm, AaMode::Single)
+        match *self {
+            Kind::D1(w, _) => Extent {
+                width: map(w),
+                height: 1,
+                depth: 1,
+            },
+            Kind::D2(w, h, _, _) => Extent {
+                width: map(w),
+                height: map(h),
+                depth: 1,
+            },
+            Kind::D3(w, h, d) => Extent {
+                width: map(w),
+                height: map(h),
+                depth: map(d),
+            },
+        }
     }
+
     /// Count the number of mipmap levels.
     pub fn num_levels(&self) -> Level {
         use std::cmp::max;
-        let (w, h, d, aa) = self.dimensions();
-        let dominant = max(max(w, h), d);
-        if aa == AaMode::Single {
-            (1..).find(|level| dominant>>level <= 1).unwrap()
-        }else {
-            1 // anti-aliased textures can't have mipmaps
-        }
-    }
-    /// Return the number of slices in a texture array type, 
-    /// or None for non-arrays.
-    pub fn num_slices(&self) -> Option<Layer> {
         match *self {
-            Kind::D1(..) | Kind::D2(..) | Kind::D3(..) | Kind::Cube(..) => None,
-            Kind::D1Array(_, a) => Some(a),
-            Kind::D2Array(_, _, a, _) => Some(a),
-            Kind::CubeArray(_, a) => Some(a),
+            Kind::D2(_, _, _, s) if s > 1 => {
+                // anti-aliased images can't have mipmaps
+                1
+            }
+            _ => {
+                let extent = self.extent();
+                let dominant = max(max(extent.width, extent.height), extent.depth);
+                (1..).find(|level| dominant>>level <= 1).unwrap()
+            }
         }
     }
+
     /// Return the number of layers in an array type.
     ///
     /// Each cube face counts as separate layer.
     pub fn num_layers(&self) -> Layer {
         match *self {
-            Kind::D1(..) | Kind::D2(..) | Kind::D3(..) => 1,
-            Kind::Cube(..) => 6,
-            Kind::D1Array(_, a) => a,
-            Kind::D2Array(_, _, a, _) => a,
-            Kind::CubeArray(_, a) => 6*a,
+            Kind::D1(_, a) |
+            Kind::D2(_, _, a, _) => a,
+            Kind::D3(..) => 1,
         }
     }
-    /// Checks whether the `Kind` is `Cube` or `CubeArray`.
-    pub fn is_cube(&self) -> bool {
+
+    /// Return the number of MSAA samples for the kind.
+    pub fn num_samples(&self) -> NumSamples {
         match *self {
-            Kind::Cube(_) | Kind::CubeArray(_, _) => true,
-            _ => false,
+            Kind::D1(..) => 1,
+            Kind::D2(_, _, _, s) => s,
+            Kind::D3(..) => 1,
         }
     }
 }
+
+/// Specifies the kind of an image view.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum ViewKind {
+    /// A single one-dimensional row of texels.
+    D1,
+    /// An array of rows of texels. Equivalent to `D2` except that texels
+    /// in different rows are not sampled, so filtering will be constrained
+    /// to a single row of texels at a time.
+    D1Array,
+    /// A traditional 2D image, with rows arranged contiguously.
+    D2,
+    /// An array of 2D images. Equivalent to `D3` except that texels in
+    /// a different depth level are not sampled.
+    D2Array,
+    /// A volume image, with each 2D layer arranged contiguously.
+    D3,
+    /// A set of 6 2D images, one for each face of a cube.
+    Cube,
+    /// An array of Cube images.
+    CubeArray,
+}
+
+bitflags!(
+    /// Image storage flags
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct StorageFlags: u32 {
+        /// Support creation of `Cube` and `CubeArray` views.
+        const CUBE_VIEW = 0b0010000;
+    }
+);
 
 bitflags!(
     /// TODO: Find out if TRANSIENT_ATTACHMENT + INPUT_ATTACHMENT
     /// are applicable on backends other than Vulkan. --AP
     /// Image usage flags
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-    pub struct Usage: u8 {
+    pub struct Usage: u32 {
         /// The image is used as a transfer source.
         const TRANSFER_SRC = 0x1;
         /// The image is used as a transfer destination.
         const TRANSFER_DST = 0x2;
-        /// The image is used as a color attachment -- that is, color input to a rendering pass.
-        const COLOR_ATTACHMENT = 0x4;
-        /// The image is used as a depth attachment.
-        const DEPTH_STENCIL_ATTACHMENT = 0x8;
-        /// The image is a [storage image](https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#descriptorsets-storageimage)
-        const STORAGE = 0x10;
         /// The image is a [sampled image](https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#descriptorsets-sampledimage)
-        const SAMPLED = 0x20;
+        const SAMPLED = 0x4;
+        /// The image is a [storage image](https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#descriptorsets-storageimage)
+        const STORAGE = 0x8;
+        /// The image is used as a color attachment -- that is, color input to a rendering pass.
+        const COLOR_ATTACHMENT = 0x10;
+        /// The image is used as a depth attachment.
+        const DEPTH_STENCIL_ATTACHMENT = 0x20;
         ///
         const TRANSIENT_ATTACHMENT = 0x40;
         ///
@@ -384,23 +402,23 @@ impl Usage {
     }
 }
 
-/// Specifies how texture coordinates outside the range `[0, 1]` are handled.
+/// Specifies how image coordinates outside the range `[0, 1]` are handled.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum WrapMode {
-    /// Tile the texture, that is, sample the coordinate modulo `1.0`, so 
-    /// addressing the texture beyond an edge will "wrap" back from the
+    /// Tile the image, that is, sample the coordinate modulo `1.0`, so
+    /// addressing the image beyond an edge will "wrap" back from the
     /// other edge.
     Tile,
-    /// Mirror the texture. Like tile, but uses abs(coord) before the modulo.
+    /// Mirror the image. Like tile, but uses abs(coord) before the modulo.
     Mirror,
-    /// Clamp the texture to the value at `0.0` or `1.0` respectively.
+    /// Clamp the image to the value at `0.0` or `1.0` respectively.
     Clamp,
     /// Use border color.
     Border,
 }
 
-/// A wrapper for the LOD level of a texture.
+/// A wrapper for the LOD level of an image.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Lod(i16);
@@ -441,13 +459,17 @@ impl Into<[f32; 4]> for PackedColor {
     }
 }
 
-/// Specifies how to sample from a texture.
+/// Specifies how to sample from an image.
 // TODO: document the details of sampling.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SamplerInfo {
-    /// Filter method to use.
-    pub filter: FilterMethod,
+    /// Minification filter method to use.
+    pub min_filter: Filter,
+    /// Magnification filter method to use.
+    pub mag_filter: Filter,
+    /// Mip filter method to use.
+    pub mip_filter: Filter,
     /// Wrapping mode for each of the U, V, and W axis (S, T, and R in OpenGL
     /// speak).
     pub wrap_mode: (WrapMode, WrapMode, WrapMode),
@@ -461,19 +483,24 @@ pub struct SamplerInfo {
     pub comparison: Option<Comparison>,
     /// Border color is used when one of the wrap modes is set to border.
     pub border: PackedColor,
+    /// Anisotropic filtering.
+    pub anisotropic: Anisotropic,
 }
 
 impl SamplerInfo {
-    /// Create a new sampler description with a given filter method and wrapping mode, using no LOD
-    /// modifications.
-    pub fn new(filter: FilterMethod, wrap: WrapMode) -> SamplerInfo {
+    /// Create a new sampler description with a given filter method for all filtering operations
+    /// and a wrapping mode, using no LOD modifications.
+    pub fn new(filter: Filter, wrap: WrapMode) -> Self {
         SamplerInfo {
-            filter: filter,
+            min_filter: filter,
+            mag_filter: filter,
+            mip_filter: filter,
             wrap_mode: (wrap, wrap, wrap),
             lod_bias: Lod(0),
             lod_range: Lod(-8000)..Lod(8000),
             comparison: None,
             border: PackedColor(0),
+            anisotropic: Anisotropic::Off,
         }
     }
 }
@@ -545,7 +572,7 @@ impl From<RenderDesc> for DepthStencilDesc {
 /// Details may be found in [the Vulkan spec](https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#resources-image-layouts)
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum ImageLayout {
+pub enum Layout {
     /// General purpose, no restrictions on usage.
     General,
     /// Must only be used as a color attachment in a framebuffer.
@@ -563,7 +590,7 @@ pub enum ImageLayout {
     TransferDstOptimal,
     /// No layout, does not support device access.  Only valid as a
     /// source layout when transforming data to a specific destination
-    /// layout or initializing data.  Does NOT guarentee that the contents 
+    /// layout or initializing data.  Does NOT guarentee that the contents
     /// of the source buffer are preserved.
     Undefined, //TODO: consider Option<> instead?
     /// Like `Undefined`, but does guarentee that the contents of the source
@@ -576,44 +603,53 @@ pub enum ImageLayout {
 bitflags!(
     /// Bitflags to describe how memory in an image or buffer can be accessed.
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-    pub struct Access: u16 {
-        /// Read state but can only be combined with `COLOR_ATTACHMENT_WRITE`.
-        const COLOR_ATTACHMENT_READ = 0x1;
-        /// Write-only state but can be combined with `COLOR_ATTACHMENT_READ`.
-        const COLOR_ATTACHMENT_WRITE = 0x2;
-        /// Read access to the buffer in a copy operation.
-        const TRANSFER_READ = 0x4;
-        /// Write access to the buffer in a copy operation.
-        const TRANSFER_WRITE = 0x8;
+    pub struct Access: u32 {
+        /// Read access to an input attachment from within a fragment shader.
+        const INPUT_ATTACHMENT_READ = 0x10;
         /// Read-only state for SRV access, or combine with `SHADER_WRITE` to have r/w access to UAV.
-        const SHADER_READ = 0x10;
+        const SHADER_READ = 0x20;
         /// Writeable state for UAV access.
         /// Combine with `SHADER_READ` to have r/w access to UAV.
-        const SHADER_WRITE = 0x20;
+        const SHADER_WRITE = 0x40;
+        /// Read state but can only be combined with `COLOR_ATTACHMENT_WRITE`.
+        const COLOR_ATTACHMENT_READ = 0x80;
+        /// Write-only state but can be combined with `COLOR_ATTACHMENT_READ`.
+        const COLOR_ATTACHMENT_WRITE = 0x100;
         /// Read access to a depth/stencil attachment in a depth or stencil operation.
-        const DEPTH_STENCIL_ATTACHMENT_READ = 0x40;
+        const DEPTH_STENCIL_ATTACHMENT_READ = 0x200;
         /// Write access to a depth/stencil attachment in a depth or stencil operation.
-        const DEPTH_STENCIL_ATTACHMENT_WRITE = 0x80;
+        const DEPTH_STENCIL_ATTACHMENT_WRITE = 0x400;
+        /// Read access to the buffer in a copy operation.
+        const TRANSFER_READ = 0x800;
+        /// Write access to the buffer in a copy operation.
+        const TRANSFER_WRITE = 0x1000;
         /// Read access for raw memory to be accessed by the host system (ie, CPU).
-        const HOST_READ = 0x100;
+        const HOST_READ = 0x2000;
         /// Write access for raw memory to be accessed by the host system.
-        const HOST_WRITE = 0x200;
+        const HOST_WRITE = 0x4000;
         /// Read access for memory to be accessed by a non-specific entity.  This may
         /// be the host system, or it may be something undefined or specified by an
         /// extension.
-        const MEMORY_READ = 0x400;
+        const MEMORY_READ = 0x8000;
         /// Write access for memory to be accessed by a non-specific entity.
-        const MEMORY_WRITE = 0x800;
-        /// Read access to an input attachment from within a fragment shader.
-        const INPUT_ATTACHMENT_READ = 0x1000;
+        const MEMORY_WRITE = 0x10000;
     }
 );
 
 /// Image state, combining access methods and the image's layout.
-pub type State = (Access, ImageLayout);
+pub type State = (Access, Layout);
 
 /// Selector of a concrete subresource in an image.
-pub type Subresource = (Level, Layer);
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Subresource {
+    /// Included aspects: color/depth/stencil
+    pub aspects: format::Aspects,
+    /// Selected mipmap level
+    pub level: Level,
+    /// Selected array level
+    pub layer: Layer,
+}
 
 /// A subset of resource layers contained within an image's level.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -637,4 +673,20 @@ pub struct SubresourceRange {
     pub levels: Range<Level>,
     /// Included array levels
     pub layers: Range<Layer>,
+}
+
+/// Image format properties.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct FormatProperties {
+    /// Maximum extent.
+    pub max_extent: Extent,
+    /// Max number of mipmap levels.
+    pub max_levels: Level,
+    /// Max number of array layers.
+    pub max_layers: Layer,
+    /// Bit mask of supported sample counts.
+    pub sample_count_mask: NumSamples,
+    /// Maximum size of the resource in bytes.
+    pub max_resource_size: usize,
 }

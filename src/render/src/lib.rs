@@ -106,7 +106,6 @@ pub use hal::format;
 pub use hal::{Backend, Frame, Primitive};
 pub use hal::queue::{Supports, Transfer, General, Graphics};
 pub use hal::{VertexCount, InstanceCount};
-pub use hal::device::Extent;
 // pub use hal::{ShaderSet, VertexShader, HullShader, DomainShader, GeometryShader, PixelShader};
 pub use encoder::Encoder;
 pub use device::Device;
@@ -252,7 +251,7 @@ impl<B: Backend, C> Context<B, C>
             .into_iter()
             .map(|raw| {
                 let stable_access = hal::image::Access::empty();
-                let stable_layout = hal::image::ImageLayout::Present;
+                let stable_layout = hal::image::Layout::Present;
                 let handle = handle::inner::Image::without_garbage(
                     raw,
                     image::Info {

@@ -9,7 +9,7 @@ use ash::version::DeviceV1_0;
 use hal::{buffer, command as com, memory, pso, query};
 use hal::{IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
 use hal::format::Aspects;
-use hal::image::{ImageLayout, SubresourceRange};
+use hal::image::{Filter, Layout, SubresourceRange};
 use {conv, native as n};
 use {Backend, RawDevice};
 
@@ -114,23 +114,14 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         &mut self,
         render_pass: &n::RenderPass,
         frame_buffer: &n::Framebuffer,
-        render_area: com::Rect,
+        render_area: pso::Rect,
         clear_values: T,
         first_subpass: com::SubpassContents,
     ) where
         T: IntoIterator,
         T::Item: Borrow<com::ClearValueRaw>,
     {
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: render_area.x as i32,
-                y: render_area.y as i32,
-            },
-            extent: vk::Extent2D {
-                width: render_area.w as u32,
-                height: render_area.h as u32,
-            },
-        };
+        let render_area = conv::map_rect(&render_area);
 
         let clear_values: SmallVec<[vk::ClearValue; 16]> =
             clear_values
@@ -285,7 +276,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn clear_color_image_raw(
         &mut self,
         image: &n::Image,
-        layout: ImageLayout,
+        layout: Layout,
         range: SubresourceRange,
         value: com::ClearColorRaw,
     ) {
@@ -308,7 +299,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn clear_depth_stencil_image_raw(
         &mut self,
         image: &n::Image,
-        layout: ImageLayout,
+        layout: Layout,
         range: SubresourceRange,
         value: com::ClearDepthStencilRaw,
     ) {
@@ -335,7 +326,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<com::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<com::Rect>,
+        U::Item: Borrow<pso::Rect>,
     {
         let clears: SmallVec<[vk::ClearAttachment; 16]> = clears
             .into_iter()
@@ -345,28 +336,28 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                         vk::ClearAttachment {
                             aspect_mask: vk::IMAGE_ASPECT_COLOR_BIT,
                             color_attachment: index as _,
-                            clear_value: vk::ClearValue::new_color(conv::map_clear_color(cv)),
+                            clear_value: vk::ClearValue { color: conv::map_clear_color(cv) },
                         }
                     }
                     com::AttachmentClear::Depth(v) => {
                         vk::ClearAttachment {
                             aspect_mask: vk::IMAGE_ASPECT_DEPTH_BIT,
                             color_attachment: 0,
-                            clear_value: vk::ClearValue::new_depth_stencil(conv::map_clear_depth(v)),
+                            clear_value: vk::ClearValue { depth: conv::map_clear_depth(v) },
                         }
                     }
                     com::AttachmentClear::Stencil(v) => {
                         vk::ClearAttachment {
                             aspect_mask: vk::IMAGE_ASPECT_STENCIL_BIT,
                             color_attachment: 0,
-                            clear_value: vk::ClearValue::new_depth_stencil(conv::map_clear_stencil(v)),
+                            clear_value: vk::ClearValue { depth: conv::map_clear_stencil(v) },
                         }
                     }
                     com::AttachmentClear::DepthStencil(cv) => {
                         vk::ClearAttachment {
                             aspect_mask: vk::IMAGE_ASPECT_DEPTH_BIT | vk::IMAGE_ASPECT_STENCIL_BIT,
                             color_attachment: 0,
-                            clear_value: vk::ClearValue::new_depth_stencil(conv::map_clear_depth_stencil(cv)),
+                            clear_value: vk::ClearValue { depth: conv::map_clear_depth_stencil(cv) },
                         }
                     }
                 }
@@ -377,20 +368,10 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         let rects: SmallVec<[vk::ClearRect; 16]> = rects
             .into_iter()
             .map(|rect| {
-                let rect = rect.borrow();
                 vk::ClearRect {
                     base_array_layer: 0,
                     layer_count: vk::VK_REMAINING_ARRAY_LAYERS,
-                    rect: vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: rect.x as _,
-                            y: rect.y as _,
-                        },
-                        extent: vk::Extent2D {
-                            width: rect.w as _,
-                            height: rect.h as _,
-                        },
-                    },
+                    rect: conv::map_rect(rect.borrow()),
                 }
             })
             .collect();
@@ -401,9 +382,9 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn resolve_image<T>(
         &mut self,
         src: &n::Image,
-        src_layout: ImageLayout,
+        src_layout: Layout,
         dst: &n::Image,
-        dst_layout: ImageLayout,
+        dst_layout: Layout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -438,10 +419,10 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn blit_image<T>(
         &mut self,
         src: &n::Image,
-        src_layout: ImageLayout,
+        src_layout: Layout,
         dst: &n::Image,
-        dst_layout: ImageLayout,
-        filter: com::BlitFilter,
+        dst_layout: Layout,
+        filter: Filter,
         regions: T,
     ) where
         T: IntoIterator,
@@ -468,8 +449,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 dst.raw,
                 conv::map_image_layout(dst_layout),
                 &regions,
-                // Vulkan and HAL share same filter
-                mem::transmute(filter),
+                conv::map_filter(filter),
             );
         }
     }
@@ -504,20 +484,12 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn set_viewports<T>(&mut self, viewports: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<com::Viewport>,
+        T::Item: Borrow<pso::Viewport>,
     {
         let viewports: SmallVec<[vk::Viewport; 16]> = viewports
             .into_iter()
             .map(|viewport| {
-                let viewport = viewport.borrow();
-                vk::Viewport {
-                    x: viewport.rect.x as f32,
-                    y: viewport.rect.y as f32,
-                    width: viewport.rect.w as f32,
-                    height: viewport.rect.h as f32,
-                    min_depth: viewport.depth.start,
-                    max_depth: viewport.depth.end,
-                }
+                conv::map_viewport(viewport.borrow())
             })
             .collect();
 
@@ -529,22 +501,12 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn set_scissors<T>(&mut self, scissors: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<com::Rect>,
+        T::Item: Borrow<pso::Rect>,
     {
         let scissors: SmallVec<[vk::Rect2D; 16]> = scissors
             .into_iter()
             .map(|scissor| {
-                let scissor = scissor.borrow();
-                vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: scissor.x as i32,
-                        y: scissor.y as i32,
-                    },
-                    extent: vk::Extent2D {
-                        width: scissor.w as u32,
-                        height: scissor.h as u32,
-                    },
-                }
+                conv::map_rect(scissor.borrow())
             })
             .collect();
 
@@ -554,7 +516,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     }
 
     fn set_stencil_reference(
-        &mut self, front: com::StencilValue, back: com::StencilValue
+        &mut self, front: pso::StencilValue, back: pso::StencilValue
     ) {
         unsafe {
             if front == back {
@@ -580,7 +542,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn set_blend_constants(&mut self, color: com::ColorValue) {
+    fn set_blend_constants(&mut self, color: pso::ColorValue) {
         unsafe {
             self.device.0.cmd_set_blend_constants(self.raw, color);
         }
@@ -691,9 +653,9 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn copy_image<T>(
         &mut self,
         src: &n::Image,
-        src_layout: ImageLayout,
+        src_layout: Layout,
         dst: &n::Image,
-        dst_layout: ImageLayout,
+        dst_layout: Layout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -704,9 +666,9 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             .map(|region| {
                 let r = region.borrow();
                 vk::ImageCopy {
-                    src_subresource: conv::map_subresource_with_layers(r.aspects, r.src_subresource, r.num_layers),
+                    src_subresource: conv::map_subresource_layers(&r.src_subresource),
                     src_offset: conv::map_offset(r.src_offset),
-                    dst_subresource: conv::map_subresource_with_layers(r.aspects, r.dst_subresource, r.num_layers),
+                    dst_subresource: conv::map_subresource_layers(&r.dst_subresource),
                     dst_offset: conv::map_offset(r.dst_offset),
                     extent: conv::map_extent(r.extent),
                 }
@@ -729,7 +691,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         &mut self,
         src: &n::Buffer,
         dst: &n::Image,
-        dst_layout: ImageLayout,
+        dst_layout: Layout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -751,7 +713,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     fn copy_image_to_buffer<T>(
         &mut self,
         src: &n::Image,
-        src_layout: ImageLayout,
+        src_layout: Layout,
         dst: &n::Buffer,
         regions: T,
     ) where

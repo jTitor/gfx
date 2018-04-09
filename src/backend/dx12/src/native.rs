@@ -79,7 +79,7 @@ pub struct RenderPass {
     pub(crate) post_barriers: Vec<BarrierDesc>,
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub struct GraphicsPipeline {
     pub(crate) raw: *mut d3d12::ID3D12PipelineState,
     pub(crate) signature: *mut d3d12::ID3D12RootSignature, // weak-ptr, owned by `PipelineLayout`
@@ -87,11 +87,12 @@ pub struct GraphicsPipeline {
     pub(crate) topology: d3d12::D3D12_PRIMITIVE_TOPOLOGY,
     pub(crate) constants: Vec<RootConstant>,
     pub(crate) vertex_strides: [UINT; MAX_VERTEX_BUFFERS],
+    pub(crate) baked_states: pso::BakedStates,
 }
 unsafe impl Send for GraphicsPipeline { }
 unsafe impl Sync for GraphicsPipeline { }
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub struct ComputePipeline {
     pub(crate) raw: *mut d3d12::ID3D12PipelineState,
     pub(crate) signature: *mut d3d12::ID3D12RootSignature, // weak-ptr, owned by `PipelineLayout`
@@ -151,12 +152,12 @@ pub struct Image {
     pub(crate) resource: *mut d3d12::ID3D12Resource,
     pub(crate) kind: image::Kind,
     pub(crate) usage: image::Usage,
+    pub(crate) storage_flags: image::StorageFlags,
     pub(crate) dxgi_format: DXGI_FORMAT,
     pub(crate) bytes_per_block: u8,
     // Dimension of a texel block (compressed formats).
     pub(crate) block_dim: (u8, u8),
     pub(crate) num_levels: image::Level,
-    pub(crate) num_layers: image::Layer,
     #[derivative(Debug="ignore")]
     pub(crate) clear_cv: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
     #[derivative(Debug="ignore")]
@@ -173,12 +174,12 @@ impl Image {
         image::SubresourceRange {
             aspects,
             levels: 0 .. self.num_levels,
-            layers: 0 .. self.num_layers,
+            layers: 0 .. self.kind.num_layers(),
         }
     }
 
     pub fn calc_subresource(&self, mip_level: UINT, layer: UINT, plane: UINT) -> UINT {
-        mip_level + (layer * self.num_levels as UINT) + (plane * self.num_levels as UINT * self.num_layers as UINT)
+        mip_level + (layer * self.num_levels as UINT) + (plane * self.num_levels as UINT * self.kind.num_layers() as UINT)
     }
 }
 

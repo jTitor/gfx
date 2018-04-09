@@ -42,18 +42,23 @@ impl Instance {
 pub struct Surface {
     pub(crate) factory: ComPtr<dxgi1_4::IDXGIFactory4>,
     pub(crate) wnd_handle: HWND,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    pub(crate) width: i::Size,
+    pub(crate) height: i::Size,
 }
 
 unsafe impl Send for Surface { }
 unsafe impl Sync for Surface { }
 
 impl hal::Surface<Backend> for Surface {
-    fn supports_queue_family(&self, _queue_family: &QueueFamily) -> bool { true }
+    fn supports_queue_family(&self, queue_family: &QueueFamily) -> bool {
+        match queue_family {
+            &QueueFamily::Present => true,
+            _ => false
+        }
+    }
+
     fn kind(&self) -> i::Kind {
-        let aa = i::AaMode::Single;
-        i::Kind::D2(self.width as i::Size, self.height as i::Size, aa)
+        i::Kind::D2(self.width, self.height, 1, 1)
     }
 
     fn capabilities_and_formats(

@@ -63,6 +63,7 @@ pub struct GraphicsPipeline {
     pub(crate) primitive_type: MTLPrimitiveType,
     pub(crate) attribute_buffer_index: u32,
     pub(crate) depth_stencil_state: Option<metal::DepthStencilState>,
+    pub(crate) baked_states: pso::BakedStates,
 }
 
 unsafe impl Send for GraphicsPipeline {}
@@ -221,11 +222,11 @@ unsafe impl Send for DescriptorSetInner {}
 #[derive(Debug)]
 pub enum DescriptorSetBinding {
     Sampler(Vec<Option<metal::SamplerState>>),
-    Image(Vec<Option<(metal::Texture, image::ImageLayout)>>),
+    Image(Vec<Option<(metal::Texture, image::Layout)>>),
     //UniformTexelBuffer,
     //StorageTexelBuffer,
     Buffer(Vec<Option<(metal::Buffer, u64)>>),
-    //InputAttachment(Vec<(metal::Texture, image::ImageLayout)>),
+    //InputAttachment(Vec<(metal::Texture, image::Layout)>),
 }
 
 #[derive(Debug)]

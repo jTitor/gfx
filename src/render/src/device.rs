@@ -9,7 +9,7 @@ use memory::{self, Allocator, Typed};
 use handle::{self, GarbageSender};
 use handle::inner::*;
 use {buffer, image, format, pso};
-use {Backend, Primitive, Extent};
+use {Backend, Primitive};
 
 pub use hal::device::{FramebufferError};
 
@@ -181,25 +181,26 @@ impl<B: Backend> Device<B> {
         where A: Allocator<B>
     {
         use image::Usage;
-        use hal::image::ImageLayout;
+        use hal::image::{Layout, Tiling};
 
         let aspects = format.aspects();
-        let image = self.raw.create_image(kind, mip_levels, format, usage)?;
+        let flags = image::StorageFlags::empty();
+        let image = self.raw.create_image(kind, mip_levels, format, Tiling::Optimal, usage, flags)?;
         let (image, memory) = allocator.allocate_image(self, usage, image);
         let origin = image::Origin::User(memory);
         let stable_access = hal::image::Access::empty();
         let stable_layout = match usage {
             _ if usage.contains(Usage::COLOR_ATTACHMENT) =>
-                ImageLayout::ColorAttachmentOptimal,
+                Layout::ColorAttachmentOptimal,
             _ if usage.contains(Usage::DEPTH_STENCIL_ATTACHMENT) =>
-                ImageLayout::DepthStencilAttachmentOptimal,
+                Layout::DepthStencilAttachmentOptimal,
             _ if usage.contains(Usage::SAMPLED) =>
-                ImageLayout::ShaderReadOnlyOptimal,
+                Layout::ShaderReadOnlyOptimal,
             _ if usage.contains(Usage::TRANSFER_SRC) =>
-                ImageLayout::TransferSrcOptimal,
+                Layout::TransferSrcOptimal,
             _ if usage.contains(Usage::TRANSFER_DST) =>
-                ImageLayout::TransferDstOptimal,
-            _ => ImageLayout::General,
+                Layout::TransferDstOptimal,
+            _ => Layout::General,
         };
         let stable_state = (stable_access, stable_layout);
         let info = image::Info { aspects, usage, kind, mip_levels, format, origin, stable_state };
@@ -232,10 +233,11 @@ impl<B: Backend> Device<B> {
     pub fn create_image_view_raw(
         &mut self,
         image: &handle::raw::Image<B>,
+        kind: image::ViewKind,
         format: format::Format,
         range: image::SubresourceRange,
     ) -> Result<handle::raw::ImageView<B>, image::ViewError> {
-        self.raw.create_image_view(image.resource(), format, format::Swizzle::NO, range)
+        self.raw.create_image_view(image.resource(), kind, format, format::Swizzle::NO, range)
             .map(|view| ImageView::new(
                 view,
                 image.clone(),
@@ -246,12 +248,13 @@ impl<B: Backend> Device<B> {
     pub fn create_image_view<F>(
         &mut self,
         image: &handle::Image<B, F>,
+        kind: image::ViewKind,
         range: image::SubresourceRange,
     ) -> Result<handle::ImageView<B, F>, image::ViewError>
     where
         F: format::AsFormat,
     {
-        self.create_image_view_raw(image.as_ref(), F::SELF, range)
+        self.create_image_view_raw(image.as_ref(), kind, F::SELF, range)
             .map(Typed::new)
     }
 
@@ -351,7 +354,7 @@ impl<B: Backend> Device<B> {
         &mut self,
         pipeline: &P,
         attachments: &[&handle::raw::ImageView<B>],
-        extent: Extent,
+        extent: image::Extent,
     ) -> Result<handle::raw::Framebuffer<B>, FramebufferError>
         where P: pso::GraphicsPipelineMeta<B>
     {

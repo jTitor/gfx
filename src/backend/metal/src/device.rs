@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::{cmp, mem, ptr, slice};
 
 use hal::{self, error, image, pass, format, mapping, memory, buffer, pso, query};
-use hal::device::{BindError, OutOfMemory, FramebufferError, ShaderError, Extent};
+use hal::device::{BindError, OutOfMemory, FramebufferError, ShaderError};
 use hal::memory::Properties;
 use hal::pool::CommandPoolCreateFlags;
 use hal::pso::{DescriptorType, DescriptorSetLayoutBinding, AttributeDesc, DepthTest, StencilTest};
@@ -18,9 +18,12 @@ use hal::queue::{QueueFamily as HalQueueFamily, QueueFamilyId, Queues};
 use hal::range::RangeArg;
 
 use cocoa::foundation::{NSRange, NSUInteger};
-use metal::{self, MTLFeatureSet, MTLLanguageVersion, MTLArgumentAccess, MTLDataType, MTLPrimitiveType, MTLPrimitiveTopologyClass};
-use metal::{MTLVertexStepFunction, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStorageMode, MTLResourceOptions, MTLTextureType};
+use metal::{self,
+    MTLFeatureSet, MTLLanguageVersion, MTLArgumentAccess, MTLDataType, MTLPrimitiveType, MTLPrimitiveTopologyClass,
+    MTLVertexStepFunction, MTLSamplerBorderColor, MTLSamplerMipFilter, MTLStorageMode, MTLResourceOptions, MTLTextureType,
+};
 use foreign_types::ForeignType;
+use objc::runtime::Class as ObjcClass;
 use objc::runtime::Object as ObjcObject;
 use spirv_cross::{msl, spirv, ErrorCode as SpirvErrorCode};
 
@@ -184,6 +187,17 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             memory_types: self.memory_types,
         };
 
+        if cfg!(debug_assertions) || cfg!(feature = "metal_default_capture_scope") {
+            unsafe {
+                if let Some(mtl_capture_manager) = ObjcClass::get("MTLCaptureManager") {
+                    let shared_capture_manager: *mut ObjcObject = msg_send![mtl_capture_manager, sharedCaptureManager];
+                    let default_capture_scope: *mut ObjcObject = msg_send![shared_capture_manager, newCaptureScopeWithDevice:device.device.as_ptr()];
+                    msg_send![shared_capture_manager, setDefaultCaptureScope:default_capture_scope];
+                    msg_send![default_capture_scope, beginScope];
+                }
+            }
+        }
+
         let mut queues = HashMap::new();
         queues.insert(id, queue_group);
 
@@ -195,6 +209,24 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 
     fn format_properties(&self, _: Option<format::Format>) -> format::Properties {
         unimplemented!()
+    }
+
+    fn image_format_properties(
+        &self, _format: format::Format, dimensions: u8, _tiling: image::Tiling,
+        _usage: image::Usage, _storage_flags: image::StorageFlags,
+    ) -> Option<image::FormatProperties> {
+        //TODO: actually query this data
+        Some(image::FormatProperties {
+            max_extent: image::Extent {
+                width: 4096,
+                height: if dimensions >= 2 { 4096 } else { 1 },
+                depth: if dimensions >= 3 { 4096 } else { 1 },
+            },
+            max_levels: 16,
+            max_layers: 2048,
+            sample_count_mask: 0x1,
+            max_resource_size: 256 << 20,
+        })
     }
 
     fn memory_properties(&self) -> hal::MemoryProperties {
@@ -735,6 +767,7 @@ impl hal::Device<Backend> for Device {
                 primitive_type,
                 attribute_buffer_index: pipeline_layout.attribute_buffer_index,
                 depth_stencil_state,
+                baked_states: pipeline_desc.baked_states.clone(),
             })
         }
     }
@@ -767,7 +800,7 @@ impl hal::Device<Backend> for Device {
     }
 
     fn create_framebuffer<I>(
-        &self, renderpass: &n::RenderPass, attachments: I, extent: Extent
+        &self, renderpass: &n::RenderPass, attachments: I, extent: image::Extent
     ) -> Result<n::FrameBuffer, FramebufferError>
     where
         I: IntoIterator,
@@ -819,25 +852,40 @@ impl hal::Device<Backend> for Device {
     fn create_sampler(&self, info: image::SamplerInfo) -> n::Sampler {
         let descriptor = metal::SamplerDescriptor::new();
 
-        use self::image::FilterMethod::*;
-        let (min_mag, mipmap) = match info.filter {
-            Scale => (MTLSamplerMinMagFilter::Nearest, MTLSamplerMipFilter::NotMipmapped),
-            Mipmap => (MTLSamplerMinMagFilter::Nearest, MTLSamplerMipFilter::Nearest),
-            Bilinear => {
-                (MTLSamplerMinMagFilter::Linear, MTLSamplerMipFilter::NotMipmapped)
-            }
-            Trilinear => (MTLSamplerMinMagFilter::Linear, MTLSamplerMipFilter::Linear),
-            Anisotropic(max) => {
-                descriptor.set_max_anisotropy(max as u64);
-                (MTLSamplerMinMagFilter::Linear, MTLSamplerMipFilter::NotMipmapped)
-            }
-        };
+        descriptor.set_min_filter(map_filter(info.min_filter));
+        descriptor.set_mag_filter(map_filter(info.min_filter));
+        descriptor.set_mip_filter(match info.mip_filter {
+            image::Filter::Nearest => MTLSamplerMipFilter::Nearest,
+            image::Filter::Linear => MTLSamplerMipFilter::Linear,
+        });
 
-        descriptor.set_min_filter(min_mag);
-        descriptor.set_mag_filter(min_mag);
-        descriptor.set_mip_filter(mipmap);
+        if let image::Anisotropic::On(aniso) = info.anisotropic {
+            descriptor.set_max_anisotropy(aniso as _);
+        }
 
-        // FIXME: more state
+        let (r, s, t) = info.wrap_mode;
+        descriptor.set_address_mode_r(map_wrap_mode(r));
+        descriptor.set_address_mode_s(map_wrap_mode(s));
+        descriptor.set_address_mode_t(map_wrap_mode(t));
+
+        descriptor.set_lod_bias(info.lod_bias.into());
+        descriptor.set_lod_min_clamp(info.lod_range.start.into());
+        descriptor.set_lod_max_clamp(info.lod_range.end.into());
+
+        if let Some(fun) = info.comparison {
+            descriptor.set_compare_function(map_compare_function(fun));
+        }
+        if [r, s, t].iter().any(|&am| am == image::WrapMode::Border) {
+            descriptor.set_border_color(match info.border.0 {
+                0x00000000 => MTLSamplerBorderColor::TransparentBlack,
+                0x000000FF => MTLSamplerBorderColor::OpaqueBlack,
+                0xFFFFFFFF => MTLSamplerBorderColor::OpaqueWhite,
+                other => {
+                    error!("Border color 0x{:X} is not supported", other);
+                    MTLSamplerBorderColor::TransparentBlack
+                }
+            });
+        }
 
         n::Sampler(self.device.new_sampler(&descriptor))
     }
@@ -1203,9 +1251,15 @@ impl hal::Device<Backend> for Device {
     }
 
     fn create_image(
-        &self, kind: image::Kind, mip_levels: image::Level, format: format::Format, usage: image::Usage)
-         -> Result<n::UnboundImage, image::CreationError>
-    {
+        &self,
+        kind: image::Kind,
+        mip_levels: image::Level,
+        format: format::Format,
+        _tiling: image::Tiling,
+        usage: image::Usage,
+        flags: image::StorageFlags,
+    ) -> Result<n::UnboundImage, image::CreationError> {
+        let is_cube = flags.contains(image::StorageFlags::CUBE_VIEW);
         let base_format = format.base_format();
         let format_desc = base_format.0.desc();
         let (mtl_format, _) = map_format(format).ok_or(image::CreationError::Format(format))?;
@@ -1213,12 +1267,56 @@ impl hal::Device<Backend> for Device {
         let descriptor = metal::TextureDescriptor::new();
 
         match kind {
-            image::Kind::D2(width, height, _aa) => {
+            image::Kind::D1(width, 1) => {
+                assert!(!is_cube);
+                descriptor.set_texture_type(MTLTextureType::D1);
+                descriptor.set_width(width as u64);
+            }
+            image::Kind::D1(width, layers) => {
+                assert!(!is_cube);
+                descriptor.set_texture_type(MTLTextureType::D1Array);
+                descriptor.set_width(width as u64);
+                descriptor.set_array_length(layers as u64);
+            }
+            image::Kind::D2(width, height, 1, 1) => {
                 descriptor.set_texture_type(MTLTextureType::D2);
                 descriptor.set_width(width as u64);
                 descriptor.set_height(height as u64);
-            },
-            _ => unimplemented!(),
+            }
+            image::Kind::D2(width, height, layers, 1) => {
+                if is_cube && layers > 6 {
+                    assert_eq!(layers % 6, 0);
+                    descriptor.set_texture_type(MTLTextureType::CubeArray);
+                    descriptor.set_array_length(layers as u64 / 6);
+                } else if is_cube {
+                    assert_eq!(layers, 6);
+                    descriptor.set_texture_type(MTLTextureType::Cube);
+                } else if layers > 1 {
+                    descriptor.set_texture_type(MTLTextureType::D2Array);
+                    descriptor.set_array_length(layers as u64);
+                } else {
+                    descriptor.set_texture_type(MTLTextureType::D2);
+                }
+                descriptor.set_width(width as u64);
+                descriptor.set_height(height as u64);
+            }
+            image::Kind::D2(width, height, 1, samples) if !is_cube => {
+                descriptor.set_texture_type(MTLTextureType::D2Multisample);
+                descriptor.set_width(width as u64);
+                descriptor.set_height(height as u64);
+                descriptor.set_sample_count(samples as u64);
+            }
+            image::Kind::D2(..) => {
+                error!("Multi-sampled array textures or cubes are not supported: {:?}", kind);
+                return Err(image::CreationError::Kind)
+            }
+            image::Kind::D3(width, height, depth) => {
+                assert!(!is_cube);
+                descriptor.set_texture_type(MTLTextureType::D3);
+                descriptor.set_width(width as u64);
+                descriptor.set_height(height as u64);
+                descriptor.set_depth(depth as u64);
+            }
         }
 
         descriptor.set_mipmap_level_count(mip_levels as u64);
@@ -1297,6 +1395,7 @@ impl hal::Device<Backend> for Device {
     fn create_image_view(
         &self,
         image: &n::Image,
+        _kind: image::ViewKind,
         format: format::Format,
         _swizzle: format::Swizzle,
         _range: image::SubresourceRange,
@@ -1360,6 +1459,9 @@ impl hal::Device<Backend> for Device {
         config: hal::SwapchainConfig,
     ) -> (Swapchain, hal::Backbuffer<Backend>) {
         self.build_swapchain(surface, config)
+    }
+
+    fn destroy_swapchain(&self, _swapchain: Swapchain) {
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {

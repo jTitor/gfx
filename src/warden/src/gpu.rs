@@ -89,7 +89,7 @@ pub struct Resources<B: hal::Backend> {
     pub images: HashMap<String, Image<B>>,
     pub image_views: HashMap<String, B::ImageView>,
     pub render_passes: HashMap<String, RenderPass<B>>,
-    pub framebuffers: HashMap<String, (B::Framebuffer, hal::device::Extent)>,
+    pub framebuffers: HashMap<String, (B::Framebuffer, i::Extent)>,
     pub shaders: HashMap<String, B::ShaderModule>,
     pub desc_set_layouts: HashMap<String, (Vec<hal::pso::DescriptorBinding>, B::DescriptorSetLayout)>,
     pub desc_pools: HashMap<String, B::DescriptorPool>,
@@ -285,8 +285,9 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                     }
                     raw::Resource::Image { kind, num_levels, format, usage, ref data } => {
                         // allocate memory
-                        let unbound = device.create_image(kind, num_levels, format, usage)
-                            .unwrap();
+                        let unbound = device.create_image(
+                            kind, num_levels, format, i::Tiling::Optimal, usage, i::StorageFlags::empty()
+                            ).unwrap();
                         let requirements = device.get_image_requirements(&unbound);
                         let memory_type = memory_types
                             .iter()
@@ -305,13 +306,13 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         // process initial data for the image
                         let stable_state = if data.is_empty() {
                             let (aspects, access, layout) = if format.is_color() {
-                                (f::Aspects::COLOR, i::Access::COLOR_ATTACHMENT_WRITE, i::ImageLayout::ColorAttachmentOptimal)
+                                (f::Aspects::COLOR, i::Access::COLOR_ATTACHMENT_WRITE, i::Layout::ColorAttachmentOptimal)
                             } else {
-                                (f::Aspects::DEPTH | f::Aspects::STENCIL, i::Access::DEPTH_STENCIL_ATTACHMENT_WRITE, i::ImageLayout::DepthStencilAttachmentOptimal)
+                                (f::Aspects::DEPTH | f::Aspects::STENCIL, i::Access::DEPTH_STENCIL_ATTACHMENT_WRITE, i::Layout::DepthStencilAttachmentOptimal)
                             };
                             if false { //TODO
                                 let image_barrier = memory::Barrier::Image {
-                                    states: (i::Access::empty(), i::ImageLayout::Undefined) .. (access, layout),
+                                    states: (i::Access::empty(), i::Layout::Undefined) .. (access, layout),
                                     target: &image,
                                     range: i::SubresourceRange {
                                         aspects,
@@ -327,16 +328,17 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             (access, layout)
                         } else {
                             // calculate required sizes
-                            let (w, h, d, aa) = kind.dimensions();
-                            assert_eq!(aa, i::AaMode::Single);
+                            let extent = kind.extent();
+                            assert_eq!(kind.num_samples(), 1);
 
                             let base_format = format.base_format();
                             let format_desc = base_format.0.desc();
                             let (block_width, block_height) = format_desc.dim;
 
                             // Width and height need to be multiple of the block dimensions.
-                            let w = align(w as _, block_width as _);
-                            let h = align(h as _, block_height as _);
+                            let w = align(extent.width as _, block_width as _);
+                            let h = align(extent.height as _, block_height as _);
+                            let d = extent.depth;
 
                             let width_bytes = (format_desc.bits as u64 * w) / (8 * block_width as u64);
                             let row_pitch = align(width_bytes, limits.min_buffer_copy_pitch_alignment);
@@ -364,10 +366,10 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                 device.release_mapping_writer(mapping);
                             }
                             // add init commands
-                            let final_state = (i::Access::SHADER_READ, i::ImageLayout::ShaderReadOnlyOptimal);
+                            let final_state = (i::Access::SHADER_READ, i::Layout::ShaderReadOnlyOptimal);
                             let pre_barrier = memory::Barrier::Image {
-                                states: (i::Access::empty(), i::ImageLayout::Undefined) ..
-                                        (i::Access::TRANSFER_WRITE, i::ImageLayout::TransferDstOptimal),
+                                states: (i::Access::empty(), i::Layout::Undefined) ..
+                                        (i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
                                 target: &image,
                                 range: COLOR_RANGE.clone(), //TODO
                             };
@@ -387,21 +389,17 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                     level: 0,
                                     layers: 0 .. 1,
                                 },
-                                image_offset: i::Offset { x: 0, y: 0, z: 0 },
-                                image_extent: hal::device::Extent {
-                                    width: w as _,
-                                    height: h as _,
-                                    depth: d as _,
-                                },
+                                image_offset: i::Offset::ZERO,
+                                image_extent: extent,
                             };
                             init_cmd.copy_buffer_to_image(
                                 &upload_buffer,
                                 &image,
-                                i::ImageLayout::TransferDstOptimal,
+                                i::Layout::TransferDstOptimal,
                                 &[copy],
                             );
                             let post_barrier = memory::Barrier::Image {
-                                states: (i::Access::TRANSFER_WRITE, i::ImageLayout::TransferDstOptimal) .. final_state,
+                                states: (i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal) .. final_state,
                                 target: &image,
                                 range: COLOR_RANGE.clone(), //TODO
                             };
@@ -531,9 +529,9 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             // Pass[2]: image & buffer views, descriptor sets, pipeline layouts
             for (name, resource) in &raw.resources {
                 match *resource {
-                    raw::Resource::ImageView { ref image, format, swizzle, ref range } => {
+                    raw::Resource::ImageView { ref image, kind, format, swizzle, ref range } => {
                         let image = &resources.images[image].handle;
-                        let view = device.create_image_view(image, format, swizzle, range.clone())
+                        let view = device.create_image_view(image, kind, format, swizzle, range.clone())
                             .unwrap();
                         resources.image_views.insert(name.clone(), view);
                     }
@@ -643,6 +641,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             input_assembler: input_assembler.clone(),
                             blender: blender.clone(),
                             depth_stencil: depth_stencil.clone(),
+                            baked_states: pso::BakedStates::default(), //TODO
                             layout: &resources.pipeline_layouts[layout],
                             subpass: hal::pass::Subpass {
                                 main_pass: &resources.render_passes[&subpass.parent].handle,
@@ -725,7 +724,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                 raw::Job::Graphics { ref framebuffer, ref pass, ref clear_values } => {
                     let (ref fb, extent) = resources.framebuffers[framebuffer];
                     let rp = &resources.render_passes[&pass.0];
-                    let rect = c::Rect {
+                    let rect = pso::Rect {
                         x: 0,
                         y: 0,
                         w: extent.width as _,
@@ -733,7 +732,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                     };
                     let mut encoder = command_buf.begin_render_pass_inline(&rp.handle, fb, rect, clear_values);
                     encoder.set_scissors(Some(rect));
-                    encoder.set_viewports(Some(c::Viewport {
+                    encoder.set_viewports(Some(pso::Viewport {
                         rect,
                         depth: 0.0 .. 1.0,
                     }));
@@ -950,8 +949,8 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             .expect(&format!("Unable to find image to fetch: {}", name));
         let limits = &self.limits;
 
-        let (width, height, depth, aa) = image.kind.dimensions();
-        assert_eq!(aa, i::AaMode::Single);
+        let i::Extent { width, height, depth } = image.kind.extent();
+        assert_eq!(image.kind.num_samples(), 1);
 
         // TODO:
         let base_format = image.format.base_format();
@@ -983,7 +982,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         let copy_submit = {
             let mut cmd_buffer = command_pool.acquire_command_buffer(false);
             let pre_barrier = memory::Barrier::Image {
-                states: image.stable_state .. (i::Access::TRANSFER_READ, i::ImageLayout::TransferSrcOptimal),
+                states: image.stable_state .. (i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
                 target: &image.handle,
                 range: COLOR_RANGE.clone(), //TODO
             };
@@ -1003,7 +1002,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                     layers: 0 .. 1,
                 },
                 image_offset: i::Offset { x: 0, y: 0, z: 0 },
-                image_extent: hal::device::Extent {
+                image_extent: i::Extent {
                     width: width as _,
                     height: height as _,
                     depth: depth as _,
@@ -1011,13 +1010,13 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             };
             cmd_buffer.copy_image_to_buffer(
                 &image.handle,
-                i::ImageLayout::TransferSrcOptimal,
+                i::Layout::TransferSrcOptimal,
                 &down_buffer,
                 &[copy],
             );
 
             let post_barrier = memory::Barrier::Image {
-                states: (i::Access::TRANSFER_READ, i::ImageLayout::TransferSrcOptimal) .. image.stable_state,
+                states: (i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal) .. image.stable_state,
                 target: &image.handle,
                 range: COLOR_RANGE.clone(), //TODO
             };

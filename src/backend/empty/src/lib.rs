@@ -65,6 +65,13 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         unimplemented!()
     }
 
+    fn image_format_properties(
+        &self, _: format::Format, _dim: u8, _: image:: Tiling,
+        _: image::Usage, _: image::StorageFlags,
+    ) -> Option<image::FormatProperties> {
+        unimplemented!()
+    }
+
     fn memory_properties(&self) -> hal::MemoryProperties {
         unimplemented!()
     }
@@ -142,7 +149,7 @@ impl hal::Device<Backend> for Device {
     }
 
     fn create_framebuffer<I>(
-        &self, _: &(), _: I, _: device::Extent
+        &self, _: &(), _: I, _: image::Extent
     ) -> Result<(), device::FramebufferError>
     where
         I: IntoIterator,
@@ -174,9 +181,15 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
-    fn create_image(&self, _: image::Kind, _: image::Level, _: format::Format, _: image::Usage)
-         -> Result<(), image::CreationError>
-    {
+    fn create_image(
+        &self,
+        _: image::Kind,
+        _: image::Level,
+        _: format::Format,
+        _: image::Tiling,
+        _: image::Usage,
+        _: image::StorageFlags,
+    ) -> Result<(), image::CreationError> {
         unimplemented!()
     }
 
@@ -191,6 +204,7 @@ impl hal::Device<Backend> for Device {
     fn create_image_view(
         &self,
         _: &(),
+        _: image::ViewKind,
         _: format::Format,
         _: format::Swizzle,
         _: image::SubresourceRange,
@@ -342,6 +356,10 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
+    fn destroy_swapchain(&self, _: Swapchain) {
+        unimplemented!()
+    }
+
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
         unimplemented!()
     }
@@ -416,7 +434,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn clear_color_image_raw(
         &mut self,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: image::SubresourceRange,
         _: command::ClearColorRaw,
     ) {
@@ -426,7 +444,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn clear_depth_stencil_image_raw(
         &mut self,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: image::SubresourceRange,
         _: command::ClearDepthStencilRaw,
     ) {
@@ -438,7 +456,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<command::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<command::Rect>,
+        U::Item: Borrow<pso::Rect>,
     {
         unimplemented!()
     }
@@ -446,9 +464,9 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn resolve_image<T>(
         &mut self,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: T,
     ) where
         T: IntoIterator,
@@ -460,10 +478,10 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn blit_image<T>(
         &mut self,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: &(),
-        _: image::ImageLayout,
-        _: command::BlitFilter,
+        _: image::Layout,
+        _: image::Filter,
         _: T,
     ) where
         T: IntoIterator,
@@ -483,7 +501,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn set_viewports<T>(&mut self, _: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<command::Viewport>,
+        T::Item: Borrow<pso::Viewport>,
     {
         unimplemented!()
     }
@@ -491,18 +509,18 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn set_scissors<T>(&mut self, _: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<command::Rect>,
+        T::Item: Borrow<pso::Rect>,
     {
         unimplemented!()
     }
 
 
-    fn set_stencil_reference(&mut self, _: command::StencilValue, _: command::StencilValue) {
+    fn set_stencil_reference(&mut self, _: pso::StencilValue, _: pso::StencilValue) {
         unimplemented!()
     }
 
 
-    fn set_blend_constants(&mut self, _: command::ColorValue) {
+    fn set_blend_constants(&mut self, _: pso::ColorValue) {
         unimplemented!()
     }
 
@@ -511,7 +529,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         &mut self,
         _: &(),
         _: &(),
-        _: command::Rect,
+        _: pso::Rect,
         _: T,
         _: command::SubpassContents,
     ) where
@@ -572,9 +590,9 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn copy_image<T>(
         &mut self,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: T,
     ) where
         T: IntoIterator,
@@ -587,7 +605,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         &mut self,
         _: &(),
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: T,
     ) where
         T: IntoIterator,
@@ -599,7 +617,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn copy_image_to_buffer<T>(
         &mut self,
         _: &(),
-        _: image::ImageLayout,
+        _: image::Layout,
         _: &(),
         _: T,
     ) where
