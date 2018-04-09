@@ -5,7 +5,6 @@ use std::ops::Range;
 use Backend;
 use {image, pso};
 use buffer::IndexBufferView;
-use device::Extent;
 use query::{Query, QueryControl, QueryId};
 use queue::capability::{Graphics, GraphicsOrCompute, Supports};
 use super::{
@@ -15,44 +14,13 @@ use super::{
 };
 
 
-/// A simple struct describing a rect with integer coordinates.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Rect {
-    /// X position.
-    pub x: u16,
-    /// Y position.
-    pub y: u16,
-    /// Width.
-    pub w: u16,
-    /// Height.
-    pub h: u16,
-}
-
-/// A viewport, generally equating to a window on a display.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Viewport {
-    /// The viewport boundaries.
-    pub rect: Rect,
-    /// The viewport depth limits.
-    pub depth: Range<f32>,
-}
-
-/// A single RGBA float color.
-pub type ColorValue = [f32; 4];
-/// A single depth value from a depth buffer.
-pub type DepthValue = f32;
-/// A single value from a stencil buffer.
-pub type StencilValue = u32;
-
 /// A universal clear color supporting integer formats
 /// as well as the standard floating-point.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ClearColor {
     /// Standard floating-point `vec4` color
-    Float(ColorValue),
+    Float(pso::ColorValue),
     /// Integer vector to clear `ivec4` targets.
     Int([i32; 4]),
     /// Unsigned int vector to clear `uvec4` targets.
@@ -112,7 +80,7 @@ impl From<ClearColor> for ClearColorRaw {
 /// Depth-stencil target clear values.
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ClearDepthStencil(pub DepthValue, pub StencilValue);
+pub struct ClearDepthStencil(pub pso::DepthValue, pub pso::StencilValue);
 
 /// General clear values for attachments (color or depth-stencil).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
@@ -133,24 +101,12 @@ pub enum AttachmentClear {
     /// First tuple element denotes the index of the color attachment.
     Color(usize, ClearColor),
     /// Clear depth component of the attachment.
-    Depth(DepthValue),
+    Depth(pso::DepthValue),
     /// Clear stencil component of the attachment.
-    Stencil(StencilValue),
+    Stencil(pso::StencilValue),
     /// Clear depth-stencil component of the attachment.
     DepthStencil(ClearDepthStencil),
 }
-
-/// Filtering mode for image blit operations.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum BlitFilter {
-    /// Pick nearest texel.
-    Nearest = 0,
-    /// Take a weighted average of 2x2 texel group.
-    Linear = 1,
-}
-
 
 /// Parameters for an image resolve operation,
 /// where a multi-sampled image is copied into a single-sampled
@@ -167,7 +123,7 @@ pub struct ImageResolve {
     /// Destination image offset.
     pub dst_offset: image::Offset,
     /// Image extent.
-    pub extent: Extent,
+    pub extent: image::Extent,
 }
 
 /// Parameters for an image blit operation, where a portion of one image
@@ -191,7 +147,7 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
         &mut self,
         render_pass: &B::RenderPass,
         frame_buffer: &B::Framebuffer,
-        render_area: Rect,
+        render_area: pso::Rect,
         clear_values: T,
     ) -> RenderPassInlineEncoder<B, L>
     where
@@ -205,7 +161,7 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn clear_color_image(
         &mut self,
         image: &B::Image,
-        layout: image::ImageLayout,
+        layout: image::Layout,
         range: image::SubresourceRange,
         value: ClearColor,
     ) {
@@ -216,7 +172,7 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn clear_depth_stencil_image(
         &mut self,
         image: &B::Image,
-        layout: image::ImageLayout,
+        layout: image::Layout,
         range: image::SubresourceRange,
         value: ClearDepthStencil,
     ) {
@@ -255,7 +211,7 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn set_viewports<T>(&mut self, viewports: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<Viewport>,
+        T::Item: Borrow<pso::Viewport>,
     {
         self.raw.set_viewports(viewports)
     }
@@ -264,18 +220,18 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn set_scissors<T>(&mut self, scissors: T)
     where
         T: IntoIterator,
-        T::Item: Borrow<Rect>,
+        T::Item: Borrow<pso::Rect>,
     {
         self.raw.set_scissors(scissors)
     }
 
     /// Identical to the `RawCommandBuffer` method of the same name.
-    pub fn set_stencil_reference(&mut self, front: StencilValue, back: StencilValue) {
+    pub fn set_stencil_reference(&mut self, front: pso::StencilValue, back: pso::StencilValue) {
         self.raw.set_stencil_reference(front, back)
     }
 
     /// Identical to the `RawCommandBuffer` method of the same name.
-    pub fn set_blend_constants(&mut self, cv: ColorValue) {
+    pub fn set_blend_constants(&mut self, cv: pso::ColorValue) {
         self.raw.set_blend_constants(cv)
     }
 
@@ -288,9 +244,9 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn resolve_image<T>(
         &mut self,
         src: &B::Image,
-        src_layout: image::ImageLayout,
+        src_layout: image::Layout,
         dst: &B::Image,
-        dst_layout: image::ImageLayout,
+        dst_layout: image::Layout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -303,10 +259,10 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn blit_image<T>(
         &mut self,
         src: &B::Image,
-        src_layout: image::ImageLayout,
+        src_layout: image::Layout,
         dst: &B::Image,
-        dst_layout: image::ImageLayout,
-        filter: BlitFilter,
+        dst_layout: image::Layout,
+        filter: image::Filter,
         regions: T,
     ) where
         T: IntoIterator,
@@ -322,7 +278,7 @@ impl<'a, B: Backend, C: Supports<Graphics>, S: Shot> CommandBuffer<'a, B, C, S, 
         &mut self,
         render_pass: &B::RenderPass,
         frame_buffer: &B::Framebuffer,
-        render_area: Rect,
+        render_area: pso::Rect,
         clear_values: T,
     ) -> RenderPassSecondaryEncoder<B>
     where

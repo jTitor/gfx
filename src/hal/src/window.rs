@@ -51,7 +51,7 @@
 
 use Backend;
 use image;
-use format::{self, Format};
+use format::Format;
 use queue::CommandQueue;
 
 use std::any::Any;
@@ -65,9 +65,18 @@ use std::ops::Range;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Extent2D {
     /// Width
-    pub width: u32,
+    pub width: image::Size,
     /// Height
-    pub height: u32,
+    pub height: image::Size,
+}
+
+impl From<image::Extent> for Extent2D {
+    fn from(ex: image::Extent) -> Self {
+        Extent2D {
+            width: ex.width,
+            height: ex.height,
+        }
+    }
 }
 
 /// Describes information about what a `Surface`'s properties are.
@@ -111,7 +120,7 @@ pub trait Surface<B: Backend>: Any + Send + Sync {
     /// ```no_run
     ///
     /// ```
-    fn supports_queue_family(&self, &B::QueueFamily) -> bool;
+    fn supports_queue_family(&self, family: &B::QueueFamily) -> bool;
 
     /// Query surface capabilities and formats for this physical device.
     ///
@@ -120,7 +129,7 @@ pub trait Surface<B: Backend>: Any + Send + Sync {
     /// Returns a tuple of surface capabilities and formats.
     /// If formats is `None` than the surface has no preferred format and the
     /// application may use any desired format.
-    fn capabilities_and_formats(&self, &B::PhysicalDevice) -> (SurfaceCapabilities, Option<Vec<Format>>);
+    fn capabilities_and_formats(&self, physical_device: &B::PhysicalDevice) -> (SurfaceCapabilities, Option<Vec<Format>>);
 }
 
 /// Handle to a backbuffer of the swapchain.
@@ -191,6 +200,8 @@ pub struct SwapchainConfig {
     pub depth_stencil_format: Option<Format>,
     /// Number of images in the swapchain.
     pub image_count: u32,
+    /// Image usage of the backbuffer images.
+    pub image_usage: image::Usage,
 }
 
 impl SwapchainConfig {
@@ -206,6 +217,7 @@ impl SwapchainConfig {
             color_format: Format::Bgra8Unorm, // TODO: try to find best default format
             depth_stencil_format: None,
             image_count: 2,
+            image_usage: image::Usage::empty(),
         }
     }
 
@@ -230,7 +242,7 @@ impl SwapchainConfig {
     /// ```no_run
     ///
     /// ```
-    pub fn with_depth_stencil(mut self, dsf: format::Format) -> Self {
+    pub fn with_depth_stencil(mut self, dsf: Format) -> Self {
         self.depth_stencil_format = Some(dsf);
         self
     }
@@ -246,6 +258,18 @@ impl SwapchainConfig {
     /// ```
     pub fn with_image_count(mut self, count: u32) -> Self {
         self.image_count = count;
+        self
+    }
+
+    /// Specify the usage of backbuffer images.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    ///
+    /// ```
+    pub fn with_image_usage(mut self, usage: image::Usage) -> Self {
+        self.image_usage = usage;
         self
     }
 

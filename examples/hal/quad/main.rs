@@ -17,7 +17,7 @@ extern crate gfx_backend_gl as back;
 extern crate winit;
 extern crate image;
 
-use hal::{buffer, command, device as d, format as f, image as i, memory as m, pass, pso, pool};
+use hal::{buffer, command, format as f, image as i, memory as m, pass, pso, pool};
 use hal::{Device, Instance, PhysicalDevice, Surface, Swapchain};
 use hal::{
     DescriptorPool, FrameSync, Primitive,
@@ -139,7 +139,8 @@ fn main() {
 
     println!("Surface format: {:?}", surface_format);
     let swap_config = SwapchainConfig::new()
-        .with_color(surface_format);
+        .with_color(surface_format)
+        .with_image_usage(i::Usage::COLOR_ATTACHMENT);
     let (mut swap_chain, backbuffer) = device.create_swapchain(&mut surface, swap_config);
 
     // Setup renderpass and pipeline
@@ -171,11 +172,11 @@ fn main() {
             format: Some(surface_format),
             ops: pass::AttachmentOps::new(pass::AttachmentLoadOp::Clear, pass::AttachmentStoreOp::Store),
             stencil_ops: pass::AttachmentOps::DONT_CARE,
-            layouts: i::ImageLayout::Undefined .. i::ImageLayout::Present,
+            layouts: i::Layout::Undefined .. i::Layout::Present,
         };
 
         let subpass = pass::SubpassDesc {
-            colors: &[(0, i::ImageLayout::ColorAttachmentOptimal)],
+            colors: &[(0, i::Layout::ColorAttachmentOptimal)],
             depth_stencil: None,
             inputs: &[],
             preserves: &[],
@@ -325,11 +326,13 @@ fn main() {
     // Framebuffer and render target creation
     let (frame_images, framebuffers) = match backbuffer {
         Backbuffer::Images(images) => {
-            let extent = d::Extent { width: pixel_width as _, height: pixel_height as _, depth: 1 };
+            let extent = i::Extent { width: pixel_width as _, height: pixel_height as _, depth: 1 };
             let pairs = images
                 .into_iter()
                 .map(|image| {
-                    let rtv = device.create_image_view(&image, surface_format, Swizzle::NO, COLOR_RANGE.clone()).unwrap();
+                    let rtv = device.create_image_view(
+                        &image, i::ViewKind::D2, surface_format, Swizzle::NO, COLOR_RANGE.clone()
+                        ).unwrap();
                     (image, rtv)
                 })
                 .collect::<Vec<_>>();
@@ -382,16 +385,15 @@ fn main() {
 
     let img = image::load(Cursor::new(&img_data[..]), image::PNG).unwrap().to_rgba();
     let (width, height) = img.dimensions();
-    //Setup image specification
-    let kind = i::Kind::D2(width as i::Size, height as i::Size, i::AaMode::Single);
     //The image is unpacked as 32-bit RGBA, so
     //each pixel is 4 bytes...
-    let image_stride = 4usize;
     //...but we may need to ensure the memory allocated
     //is aligned too, so the final allocation may be larger than
     //needed.
     //Ask the limit info for the smallest alignment requirement.
+    let kind = i::Kind::D2(width as i::Size, height as i::Size, 1, 1);
     let row_alignment_mask = limits.min_buffer_copy_pitch_alignment as u32 - 1;
+    let image_stride = 4usize;
     //Now round the data length of a row to that alignment.
     let row_pitch = (width * image_stride as u32 + row_alignment_mask) & !row_alignment_mask;
     //That gives us the actual buffer size.
@@ -419,7 +421,11 @@ fn main() {
         device.release_mapping_writer(data);
     }
 
-    let image_unbound = device.create_image(kind, 1, ColorFormat::SELF, i::Usage::TRANSFER_DST | i::Usage::SAMPLED).unwrap(); // TODO: usage
+    let image_unbound = device.create_image(
+        kind, 1, ColorFormat::SELF, i::Tiling::Optimal,
+        i::Usage::TRANSFER_DST | i::Usage::SAMPLED,
+        i::StorageFlags::empty(),
+        ).unwrap(); // TODO: usage
     let image_req = device.get_image_requirements(&image_unbound);
 
     let device_type = memory_types
@@ -434,11 +440,13 @@ fn main() {
     let image_memory = device.allocate_memory(device_type, image_req.size).unwrap();
 
     let image_logo = device.bind_image_memory(&image_memory, 0, image_unbound).unwrap();
-    let image_srv = device.create_image_view(&image_logo, ColorFormat::SELF, Swizzle::NO, COLOR_RANGE.clone()).unwrap();
+    let image_srv = device.create_image_view(
+        &image_logo, i::ViewKind::D2, ColorFormat::SELF, Swizzle::NO, COLOR_RANGE.clone()
+        ).unwrap();
 
     let sampler = device.create_sampler(
         i::SamplerInfo::new(
-            i::FilterMethod::Bilinear,
+            i::Filter::Linear,
             i::WrapMode::Clamp,
         )
     );
@@ -450,7 +458,7 @@ fn main() {
             binding: 0,
             array_offset: 0,
             descriptors: Some(
-                pso::Descriptor::Image(&image_srv, i::ImageLayout::Undefined)
+                pso::Descriptor::Image(&image_srv, i::Layout::Undefined)
             ),
         },
         pso::DescriptorSetWrite {
@@ -464,8 +472,8 @@ fn main() {
     ]);
 
     // Rendering setup
-    let viewport = command::Viewport {
-        rect: command::Rect {
+    let viewport = pso::Viewport {
+        rect: pso::Rect {
             x: 0, y: 0,
             w: pixel_width, h: pixel_height,
         },
@@ -481,8 +489,8 @@ fn main() {
             let mut cmd_buffer = command_pool.acquire_command_buffer(false);
 
             let image_barrier = m::Barrier::Image {
-                states: (i::Access::empty(), i::ImageLayout::Undefined) ..
-                        (i::Access::TRANSFER_WRITE, i::ImageLayout::TransferDstOptimal),
+                states: (i::Access::empty(), i::Layout::Undefined) ..
+                        (i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
                 target: &image_logo,
                 range: COLOR_RANGE.clone(),
             };
@@ -495,7 +503,7 @@ fn main() {
             cmd_buffer.copy_buffer_to_image(
                 &image_upload_buffer,
                 &image_logo,
-                i::ImageLayout::TransferDstOptimal,
+                i::Layout::TransferDstOptimal,
                 &[command::BufferImageCopy {
                     buffer_offset: 0,
                     buffer_width: row_pitch / (image_stride as u32),
@@ -506,12 +514,12 @@ fn main() {
                         layers: 0 .. 1,
                     },
                     image_offset: i::Offset { x: 0, y: 0, z: 0 },
-                    image_extent: d::Extent { width, height, depth: 1 },
+                    image_extent: i::Extent { width, height, depth: 1 },
                 }]);
 
             let image_barrier = m::Barrier::Image {
-                states: (i::Access::TRANSFER_WRITE, i::ImageLayout::TransferDstOptimal) ..
-                        (i::Access::SHADER_READ, i::ImageLayout::ShaderReadOnlyOptimal),
+                states: (i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal) ..
+                        (i::Access::SHADER_READ, i::Layout::ShaderReadOnlyOptimal),
                 target: &image_logo,
                 range: COLOR_RANGE.clone(),
             };
@@ -616,10 +624,11 @@ fn main() {
     for framebuffer in framebuffers {
         device.destroy_framebuffer(framebuffer);
     }
-    for (image, rtv) in frame_images {
+    for (_, rtv) in frame_images {
         device.destroy_image_view(rtv);
-        device.destroy_image(image);
     }
+
+    device.destroy_swapchain(swap_chain);
 }
 
 #[cfg(not(any(feature = "vulkan", feature = "dx12", feature = "metal", feature = "gl")))]

@@ -3,8 +3,7 @@ use std::borrow::Borrow;
 use std::ops::Range;
 
 use Backend;
-use {buffer, format, image};
-use device::Extent;
+use {buffer, image};
 use memory::{Barrier, Dependencies};
 use pso::PipelineStage;
 use queue::capability::{Supports, Transfer};
@@ -30,20 +29,16 @@ pub struct BufferCopy {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ImageCopy {
-    /// The aspect mask of what to copy: color, depth and/or stencil information.
-    pub aspects: format::Aspects,
     /// The image subresource to copy from.
-    pub src_subresource: image::Subresource,
+    pub src_subresource: image::SubresourceLayers,
     /// The source offset.
     pub src_offset: image::Offset,
-    /// he image subresource to copy to.
-    pub dst_subresource: image::Subresource,
+    /// The image subresource to copy to.
+    pub dst_subresource: image::SubresourceLayers,
     /// The destination offset.
     pub dst_offset: image::Offset,
     /// The extent of the region to copy.
-    pub extent: Extent,
-    /// The number of layers to copy.
-    pub num_layers: image::Layer,
+    pub extent: image::Extent,
 }
 
 /// Bundles together all the parameters needed to copy a buffer
@@ -57,12 +52,12 @@ pub struct BufferImageCopy {
     pub buffer_width: u32,
     /// Height of a buffer 'image slice' in texels.
     pub buffer_height: u32,
-    /// The number of layers to copy.
+    /// The image subresource.
     pub image_layers: image::SubresourceLayers,
     /// The offset of the portion of the image to copy.
     pub image_offset: image::Offset,
     /// Size of the portion of the image to copy.
-    pub image_extent: Extent,
+    pub image_extent: image::Extent,
 }
 
 
@@ -118,9 +113,9 @@ impl<'a, B: Backend, C: Supports<Transfer>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn copy_image<T>(
         &mut self,
         src: &B::Image,
-        src_layout: image::ImageLayout,
+        src_layout: image::Layout,
         dst: &B::Image,
-        dst_layout: image::ImageLayout,
+        dst_layout: image::Layout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -134,7 +129,7 @@ impl<'a, B: Backend, C: Supports<Transfer>, S: Shot, L: Level> CommandBuffer<'a,
         &mut self,
         src: &B::Buffer,
         dst: &B::Image,
-        dst_layout: image::ImageLayout,
+        dst_layout: image::Layout,
         regions: T,
     ) where
         T: IntoIterator,
@@ -147,7 +142,7 @@ impl<'a, B: Backend, C: Supports<Transfer>, S: Shot, L: Level> CommandBuffer<'a,
     pub fn copy_image_to_buffer<T>(
         &mut self,
         src: &B::Image,
-        src_layout: image::ImageLayout,
+        src_layout: image::Layout,
         dst: &B::Buffer,
         regions: T,
     ) where

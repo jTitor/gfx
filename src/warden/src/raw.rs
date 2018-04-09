@@ -61,6 +61,7 @@ pub enum Resource {
     },
     ImageView {
         image: String,
+        kind: hal::image::ViewKind,
         format: hal::format::Format,
         #[serde(default)]
         swizzle: hal::format::Swizzle,
@@ -109,7 +110,7 @@ pub enum Resource {
     Framebuffer {
         pass: String,
         views: HashMap<String, String>,
-        extent: hal::device::Extent,
+        extent: hal::image::Extent,
     },
 }
 
@@ -158,8 +159,8 @@ pub enum DrawCommand {
         base_vertex: hal::VertexOffset,
         instances: Range<hal::InstanceCount>,
     },
-    SetViewports(Vec<hal::command::Viewport>),
-    SetScissors(Vec<hal::command::Rect>),
+    SetViewports(Vec<hal::pso::Viewport>),
+    SetScissors(Vec<hal::pso::Rect>),
 }
 
 #[derive(Debug, Deserialize)]

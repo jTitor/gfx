@@ -278,6 +278,7 @@ impl d::Device<B> for Device {
         let descs = descs.into_iter().collect::<Vec<_>>();
         debug!("create_graphics_pipelines {:?}", descs.iter().map(Borrow::borrow).collect::<Vec<_>>());
         const NUM_STAGES: usize = 5;
+        const MAX_DYNAMIC_STATES: usize = 10;
 
         // Store pipeline parameters to avoid stack usage
         let mut info_stages                = Vec::with_capacity(descs.len());
@@ -294,8 +295,10 @@ impl d::Device<B> for Device {
         let mut color_attachments          = Vec::with_capacity(descs.len());
         let mut info_specializations       = Vec::with_capacity(descs.len() * NUM_STAGES);
         let mut specialization_data        = Vec::with_capacity(descs.len() * NUM_STAGES);
+        let mut dynamic_states             = Vec::with_capacity(descs.len() * MAX_DYNAMIC_STATES);
+        let mut viewports                  = Vec::with_capacity(descs.len());
+        let mut scissors                   = Vec::with_capacity(descs.len());
 
-        let dynamic_states = [vk::DynamicState::Viewport, vk::DynamicState::Scissor];
         let mut c_strings = Vec::new(); // hold the C strings temporarily
         let mut make_stage = |stage, source: &pso::EntryPoint<'a, B>| {
             let string = CString::new(source.entry).unwrap();
@@ -425,7 +428,7 @@ impl d::Device<B> for Device {
                 depth_bias_constant_factor: desc.rasterizer.depth_bias.map_or(0.0, |off| off.const_factor),
                 depth_bias_clamp: desc.rasterizer.depth_bias.map_or(0.0, |off| off.clamp),
                 depth_bias_slope_factor: desc.rasterizer.depth_bias.map_or(0.0, |off| off.slope_factor),
-                line_width: line_width,
+                line_width,
             });
 
             let is_tessellated = desc.shaders.hull.is_some() && desc.shaders.domain.is_some();
@@ -438,14 +441,34 @@ impl d::Device<B> for Device {
                 });
             }
 
+            let dynamic_state_base = dynamic_states.len();
+
             info_viewport_states.push(vk::PipelineViewportStateCreateInfo {
                 s_type: vk::StructureType::PipelineViewportStateCreateInfo,
                 p_next: ptr::null(),
                 flags: vk::PipelineViewportStateCreateFlags::empty(),
-                scissor_count: 1, // TODO:
-                p_scissors: ptr::null(), // dynamic
-                viewport_count: 1, // TODO:
-                p_viewports: ptr::null(), // dynamic
+                scissor_count: 1, // TODO
+                p_scissors: match desc.baked_states.scissor {
+                    Some(ref rect) => {
+                        scissors.push(conv::map_rect(rect));
+                        scissors.last().unwrap()
+                    },
+                    None => {
+                        dynamic_states.push(vk::DynamicState::Scissor);
+                        ptr::null()
+                    },
+                },
+                viewport_count: 1, // TODO
+                p_viewports:  match desc.baked_states.viewport {
+                    Some(ref vp) => {
+                        viewports.push(conv::map_viewport(vp));
+                        viewports.last().unwrap()
+                    },
+                    None => {
+                        dynamic_states.push(vk::DynamicState::Viewport);
+                        ptr::null()
+                    },
+                },
             });
 
             info_multisample_states.push(vk::PipelineMultisampleStateCreateInfo {
@@ -526,15 +549,23 @@ impl d::Device<B> for Device {
                 logic_op: vk::LogicOp::Clear,
                 attachment_count: color_attachments.last().unwrap().len() as _,
                 p_attachments: color_attachments.last().unwrap().as_ptr(), // TODO:
-                blend_constants: [0.0; 4], // TODO:
+                blend_constants: match desc.baked_states.blend_color {
+                    Some(value) => value,
+                    None => {
+                        dynamic_states.push(vk::DynamicState::BlendConstants);
+                        [0.0; 4]
+                    },
+                },
             });
 
             info_dynamic_states.push(vk::PipelineDynamicStateCreateInfo {
                 s_type: vk::StructureType::PipelineDynamicStateCreateInfo,
                 p_next: ptr::null(),
                 flags: vk::PipelineDynamicStateCreateFlags::empty(),
-                dynamic_state_count: dynamic_states.len() as _,
-                p_dynamic_states: dynamic_states.as_ptr(),
+                dynamic_state_count: (dynamic_states.len() - dynamic_state_base) as _,
+                p_dynamic_states: unsafe {
+                    dynamic_states.as_ptr().offset(dynamic_state_base as _)
+                },
             });
 
             let (base_handle, base_index) = match desc.parent {
@@ -720,7 +751,7 @@ impl d::Device<B> for Device {
         &self,
         renderpass: &n::RenderPass,
         attachments: T,
-        extent: d::Extent,
+        extent: image::Extent,
     ) -> Result<n::Framebuffer, d::FramebufferError>
     where
         T: IntoIterator,
@@ -778,25 +809,24 @@ impl d::Device<B> for Device {
     fn create_sampler(&self, sampler_info: image::SamplerInfo) -> n::Sampler {
         use hal::pso::Comparison;
 
-        let (min_filter, mag_filter, mipmap_mode) = conv::map_filter(sampler_info.filter);
-        let (anisotropy_enable, max_anisotropy) = match sampler_info.filter {
-            image::FilterMethod::Anisotropic(aniso) => {
+        let (anisotropy_enable, max_anisotropy) = match sampler_info.anisotropic {
+            image::Anisotropic::Off => (vk::VK_FALSE, 1.0),
+            image::Anisotropic::On(aniso) => {
                 if self.raw.1.contains(Features::SAMPLER_ANISOTROPY) {
                     (vk::VK_TRUE, aniso as f32)
                 } else {
                     warn!("Anisotropy({}) was requested on a device with disabled feature", aniso);
-                    (vk::VK_FALSE, 0.0)
+                    (vk::VK_FALSE, 1.0)
                 }
-            }
-            _ => (vk::VK_FALSE, 0.0)
+            },
         };
         let info = vk::SamplerCreateInfo {
             s_type: vk::StructureType::SamplerCreateInfo,
             p_next: ptr::null(),
             flags: vk::SamplerCreateFlags::empty(),
-            mag_filter,
-            min_filter,
-            mipmap_mode,
+            mag_filter: conv::map_filter(sampler_info.mag_filter),
+            min_filter: conv::map_filter(sampler_info.min_filter),
+            mipmap_mode: conv::map_mip_filter(sampler_info.mip_filter),
             address_mode_u: conv::map_wrap(sampler_info.wrap_mode.0),
             address_mode_v: conv::map_wrap(sampler_info.wrap_mode.1),
             address_mode_w: conv::map_wrap(sampler_info.wrap_mode.2),
@@ -889,65 +919,26 @@ impl d::Device<B> for Device {
         Ok(n::BufferView { raw: view })
     }
 
-    fn create_image(&self, kind: image::Kind, mip_levels: image::Level, format: format::Format, usage: image::Usage)
-         -> Result<UnboundImage, image::CreationError>
-    {
-        use hal::image::Kind::*;
-
-        let flags = match kind {
-            Cube(_) => vk::IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
-            CubeArray(_, _) => vk::IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
-            _ => vk::ImageCreateFlags::empty(),
+    fn create_image(
+        &self,
+        kind: image::Kind,
+        mip_levels: image::Level,
+        format: format::Format,
+        tiling: image::Tiling,
+        usage: image::Usage,
+        storage_flags: image::StorageFlags,
+    ) -> Result<UnboundImage, image::CreationError> {
+        let flags = conv::map_image_flags(storage_flags);
+        let extent = conv::map_extent(kind.extent());
+        let array_layers = kind.num_layers();
+        let samples = match kind.num_samples() {
+            1 => vk::SAMPLE_COUNT_1_BIT,
+            _ => unimplemented!()
         };
-
-        let (image_type, extent, array_layers, aa_mode) = match kind {
-            D1(width) => (
-                vk::ImageType::Type1d,
-                vk::Extent3D { width: width as u32, height: 1, depth: 1 },
-                1,
-                image::AaMode::Single,
-            ),
-            D1Array(width, layers) => (
-                vk::ImageType::Type1d,
-                vk::Extent3D { width: width as u32, height: 1, depth: 1 },
-                layers,
-                image::AaMode::Single,
-            ),
-            D2(width, height, aa_mode) => (
-                vk::ImageType::Type2d,
-                vk::Extent3D { width: width as u32, height: height as u32, depth: 1 },
-                1,
-                aa_mode,
-            ),
-            D2Array(width, height, layers, aa_mode) => (
-                vk::ImageType::Type2d,
-                vk::Extent3D { width: width as u32, height: height as u32, depth: 1 },
-                layers,
-                aa_mode,
-            ),
-            D3(width, height, depth) => (
-                vk::ImageType::Type3d,
-                vk::Extent3D { width: width as u32, height: height as u32, depth: depth as u32 },
-                1,
-                image::AaMode::Single,
-            ),
-            Cube(size) => (
-                vk::ImageType::Type2d,
-                vk::Extent3D { width: size as u32, height: size as u32, depth: 1 },
-                6,
-                image::AaMode::Single,
-            ),
-            CubeArray(size, layers) => (
-                vk::ImageType::Type2d,
-                vk::Extent3D { width: size as u32, height: size as u32, depth: 1 },
-                6 * layers,
-                image::AaMode::Single,
-            ),
-        };
-
-        let samples = match aa_mode {
-            image::AaMode::Single => vk::SAMPLE_COUNT_1_BIT,
-            _ => unimplemented!(),
+        let image_type = match kind {
+            image::Kind::D1(..) => vk::ImageType::Type1d,
+            image::Kind::D2(..) => vk::ImageType::Type2d,
+            image::Kind::D3(..) => vk::ImageType::Type3d,
         };
 
         let info = vk::ImageCreateInfo {
@@ -960,7 +951,7 @@ impl d::Device<B> for Device {
             mip_levels: mip_levels as u32,
             array_layers: array_layers as u32,
             samples,
-            tiling: vk::ImageTiling::Optimal, // TODO: read back?
+            tiling: conv::map_tiling(tiling),
             usage: conv::map_image_usage(usage),
             sharing_mode: vk::SharingMode::Exclusive, // TODO:
             queue_family_index_count: 0,
@@ -970,10 +961,9 @@ impl d::Device<B> for Device {
 
         let raw = unsafe {
             self.raw.0.create_image(&info, None)
-                .expect("Error on image creation") // TODO: error handling
-        };
+        }.expect("Error on image creation"); // TODO: error handling
 
-        Ok(UnboundImage(n::Image{ raw, extent }))
+        Ok(UnboundImage(n::Image{ raw, ty: image_type, flags, extent }))
     }
 
     fn get_image_requirements(&self, image: &UnboundImage) -> Requirements {
@@ -999,16 +989,21 @@ impl d::Device<B> for Device {
     fn create_image_view(
         &self,
         image: &n::Image,
+        kind: image::ViewKind,
         format: format::Format,
         swizzle: format::Swizzle,
         range: image::SubresourceRange,
     ) -> Result<n::ImageView, image::ViewError> {
+        let is_cube = image.flags.intersects(vk::IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
         let info = vk::ImageViewCreateInfo {
             s_type: vk::StructureType::ImageViewCreateInfo,
             p_next: ptr::null(),
-            flags: vk::ImageViewCreateFlags::empty(), // TODO
+            flags: vk::ImageViewCreateFlags::empty(),
             image: image.raw,
-            view_type: vk::ImageViewType::Type2d, // TODO
+            view_type: match conv::map_view_kind(kind, image.ty, is_cube) {
+                Some(ty) => ty,
+                None => return Err(image::ViewError::BadKind),
+            },
             format: conv::map_format(format),
             components: conv::map_swizzle(swizzle),
             subresource_range: conv::map_subresource_range(&range),
@@ -1423,7 +1418,7 @@ impl d::Device<B> for Device {
                 height: surface.height,
             },
             image_array_layers: 1,
-            image_usage: vk::IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk::IMAGE_USAGE_TRANSFER_DST_BIT,
+            image_usage: conv::map_image_usage(config.image_usage),
             image_sharing_mode: vk::SharingMode::Exclusive,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
@@ -1451,6 +1446,8 @@ impl d::Device<B> for Device {
             .map(|image| {
                 n::Image {
                     raw: image,
+                    ty: vk::ImageType::Type2d,
+                    flags: vk::ImageCreateFlags::empty(),
                     extent: vk::Extent3D {
                         width: surface.width,
                         height: surface.height,
@@ -1461,6 +1458,10 @@ impl d::Device<B> for Device {
             .collect();
 
         (swapchain, Backbuffer::Images(images))
+    }
+
+    fn destroy_swapchain(&self, swapchain: w::Swapchain) {
+        unsafe { swapchain.functor.destroy_swapchain_khr(swapchain.raw, None); }
     }
 
     fn destroy_query_pool(&self, pool: n::QueryPool) {
@@ -1495,8 +1496,8 @@ impl d::Device<B> for Device {
         unsafe { self.raw.0.destroy_buffer(buffer.raw, None); }
     }
 
-    fn destroy_buffer_view(&self, _view: n::BufferView) {
-        unimplemented!()
+    fn destroy_buffer_view(&self, view: n::BufferView) {
+        unsafe { self.raw.0.destroy_buffer_view(view.raw, None); }
     }
 
     fn destroy_image(&self, image: n::Image) {
