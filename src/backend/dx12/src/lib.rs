@@ -1,3 +1,8 @@
+//Since winapi::shared and winapi::um aren't
+//imported into winapi when #[cfg(not(windows))],
+//add a flag to not build anything when not under windows
+#![cfg(windows)]
+
 #[macro_use]
 extern crate bitflags;
 #[macro_use]
@@ -12,26 +17,30 @@ extern crate winapi;
 extern crate winit;
 extern crate wio;
 
+#[path = "../../auxil/range_alloc.rs"]
+mod range_alloc;
 mod command;
 mod conv;
+mod descriptors_cpu;
 mod device;
-mod format;
-mod free_list;
+mod internal;
 mod native;
 mod pool;
 mod root_constants;
 mod window;
 
-use hal::{error, format as f, image, memory, Features, Limits, QueueType};
-use hal::queue::{QueueFamily as HalQueueFamily, QueueFamilyId, Queues};
+use hal::{error, format as f, image, memory, Features, FrameImage, Limits, QueueType};
+use hal::queue::{QueueFamilyId, Queues};
+use descriptors_cpu::DescriptorCpuPool;
 
+use winapi::Interface;
 use winapi::shared::{dxgi, dxgi1_2, dxgi1_3, dxgi1_4, winerror};
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::um::{d3d12, d3d12sdklayers, d3dcommon, handleapi, synchapi, winbase, winnt};
 use wio::com::ComPtr;
 
 use std::{mem, ptr};
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::os::windows::ffi::OsStringExt;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
@@ -175,6 +184,7 @@ pub struct PhysicalDevice {
     adapter: ComPtr<dxgi1_2::IDXGIAdapter2>,
     features: hal::Features,
     limits: hal::Limits,
+    format_properties: Arc<[f::Properties; f::NUM_FORMATS]>,
     private_caps: Capabilities,
     heap_properties: &'static [HeapProperties; NUM_HEAP_PROPERTIES],
     memory_properties: hal::MemoryProperties,
@@ -188,7 +198,7 @@ unsafe impl Sync for PhysicalDevice { }
 
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, families: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>
+        &self, families: &[(&QueueFamily, &[hal::QueuePriority])]
     ) -> Result<hal::Gpu<Backend>, error::DeviceCreationError> {
         let lock = self.is_open.try_lock();
         let mut open_guard = match lock {
@@ -203,7 +213,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                 d3d12::D3D12CreateDevice(
                     self.adapter.as_raw() as *mut _,
                     d3dcommon::D3D_FEATURE_LEVEL_11_0, // Minimum required feature level
-                    &d3d12::IID_ID3D12Device,
+                    &d3d12::ID3D12Device::uuidof(),
                     &mut device_raw as *mut *mut _ as *mut *mut _,
                 )
             };
@@ -227,7 +237,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             let hr = unsafe {
                 device_raw.CreateCommandQueue(
                     &queue_desc,
-                    &d3d12::IID_ID3D12CommandQueue,
+                    &d3d12::ID3D12CommandQueue::uuidof(),
                     &mut queue as *mut *mut _ as *mut *mut _,
                 )
             };
@@ -247,7 +257,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 
         let queue_groups = families
             .into_iter()
-            .map(|(&family, priorities)| {
+            .map(|&(&family, priorities)| {
                 let mut group = hal::backend::RawQueueGroup::new(family);
 
                 let create_idle_event = || unsafe {
@@ -285,7 +295,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                             let hr = unsafe {
                                 device.raw.CreateCommandQueue(
                                     &queue_desc,
-                                    &d3d12::IID_ID3D12CommandQueue,
+                                    &d3d12::ID3D12CommandQueue::uuidof(),
                                     &mut queue as *mut *mut _ as *mut *mut _,
                                 )
                             };
@@ -305,7 +315,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                     }
                 }
 
-                (family.id(), group)
+                group
             })
             .collect();
 
@@ -319,52 +329,98 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 
     fn format_properties(&self, fmt: Option<f::Format>) -> f::Properties {
         let idx = fmt.map(|fmt| fmt as usize).unwrap_or(0);
-        format::query_properties()[idx]
+        self.format_properties[idx]
     }
 
     fn image_format_properties(
-        &self, _format: f::Format, dimensions: u8, tiling: image::Tiling,
+        &self, format: f::Format, dimensions: u8, tiling: image::Tiling,
         usage: image::Usage, storage_flags: image::StorageFlags,
     ) -> Option<image::FormatProperties> {
-        let is_optimal = tiling == image::Tiling::Optimal;
-        Some(image::FormatProperties {
-            max_extent: match dimensions {
-                1 if is_optimal => image::Extent {
-                    width: d3d12::D3D12_REQ_TEXTURE1D_U_DIMENSION,
-                    height: 1,
-                    depth: 1,
+        conv::map_format(format)?; //filter out unknown formats
+
+        let supported_usage = {
+            use hal::image::Usage as U;
+            let format_props = &self.format_properties[format as usize];
+            let props = match tiling {
+                image::Tiling::Optimal => format_props.optimal_tiling,
+                image::Tiling::Linear => format_props.linear_tiling,
+            };
+            let mut flags = U::empty();
+            // Note: these checks would have been nicer if we had explicit BLIT usage
+            if props.contains(f::ImageFeature::BLIT_SRC) {
+                flags |= U::TRANSFER_SRC;
+            }
+            if props.contains(f::ImageFeature::BLIT_DST) {
+                flags |= U::TRANSFER_DST;
+            }
+            if props.contains(f::ImageFeature::SAMPLED) {
+                flags |= U::SAMPLED;
+            }
+            if props.contains(f::ImageFeature::STORAGE) {
+                flags |= U::STORAGE;
+            }
+            if props.contains(f::ImageFeature::COLOR_ATTACHMENT) {
+                flags |= U::COLOR_ATTACHMENT;
+            }
+            if props.contains(f::ImageFeature::DEPTH_STENCIL_ATTACHMENT) {
+                flags |= U::DEPTH_STENCIL_ATTACHMENT;
+            }
+            flags
+        };
+        if !supported_usage.contains(usage) {
+            return None;
+        }
+
+        let max_resource_size = (d3d12::D3D12_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION_A_TERM as usize) << 20;
+        Some(match tiling {
+            image::Tiling::Optimal => image::FormatProperties {
+                max_extent: match dimensions {
+                    1 => image::Extent {
+                        width: d3d12::D3D12_REQ_TEXTURE1D_U_DIMENSION,
+                        height: 1,
+                        depth: 1,
+                    },
+                    2 => image::Extent {
+                        width: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+                        height: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+                        depth: 1,
+                    },
+                    3 => image::Extent {
+                        width: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                        height: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                        depth: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                    },
+                    _ => return None,
                 },
-                2 => image::Extent {
-                    width: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
-                    height: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
-                    depth: 1,
-                },
-                3 if is_optimal => image::Extent {
-                    width: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
-                    height: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
-                    depth: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
-                },
-                _ => return None,
-            },
-            max_levels: if is_optimal { d3d12::D3D12_REQ_MIP_LEVELS as _ } else { 1 },
-            max_layers: if is_optimal {
-                match dimensions {
+                max_levels: d3d12::D3D12_REQ_MIP_LEVELS as _,
+                max_layers: match dimensions {
                     1 => d3d12::D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION as _,
                     2 => d3d12::D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION as _,
                     _ => return None,
-                }
-            } else {
-                1
+                },
+                sample_count_mask: if dimensions == 2 && !storage_flags.contains(image::StorageFlags::CUBE_VIEW) &&
+                    (usage.contains(image::Usage::COLOR_ATTACHMENT) | usage.contains(image::Usage::DEPTH_STENCIL_ATTACHMENT))
+                {
+                    0x3F //TODO: use D3D12_FEATURE_DATA_FORMAT_SUPPORT
+                } else {
+                    0x1
+                },
+                max_resource_size,
             },
-            sample_count_mask: if dimensions == 2 && is_optimal &&
-                !storage_flags.contains(image::StorageFlags::CUBE_VIEW) &&
-                (usage.contains(image::Usage::COLOR_ATTACHMENT) | usage.contains(image::Usage::DEPTH_STENCIL_ATTACHMENT))
-            {
-                0x3F //TODO: use D3D12_FEATURE_DATA_FORMAT_SUPPORT
-            } else {
-                0x1
+            image::Tiling::Linear => image::FormatProperties {
+                max_extent: match dimensions {
+                    2 => image::Extent {
+                        width: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+                        height: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+                        depth: 1,
+                    },
+                    _ => return None,
+                },
+                max_levels: 1,
+                max_layers: 1,
+                sample_count_mask: 0x1,
+                max_resource_size,
             },
-            max_resource_size: (d3d12::D3D12_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION_A_TERM as usize) << 20,
         })
     }
 
@@ -415,17 +471,19 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
         }
     }
 
-    fn present<IS, IW>(&mut self, swapchains: IS, _wait_semaphores: IW)
+    fn present<IS, S, IW>(&mut self, swapchains: IS, _wait_semaphores: IW) -> Result<(), ()>
     where
-        IS: IntoIterator,
-        IS::Item: BorrowMut<window::Swapchain>,
+        IS: IntoIterator<Item = (S, FrameImage)>,
+        S: Borrow<window::Swapchain>,
         IW: IntoIterator,
         IW::Item: Borrow<native::Semaphore>,
     {
         // TODO: semaphores
-        for swapchain in swapchains {
+        for (swapchain, _) in swapchains {
             unsafe { swapchain.borrow().inner.Present(1, 0); }
         }
+
+        Ok(())
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
@@ -459,22 +517,28 @@ struct CmdSignatures {
     dispatch: ComPtr<d3d12::ID3D12CommandSignature>,
 }
 
+// Shared objects between command buffers, owned by the device.
+struct Shared {
+    pub signatures: CmdSignatures,
+    pub service_pipes: internal::ServicePipes,
+}
+
 pub struct Device {
     raw: ComPtr<d3d12::ID3D12Device>,
     private_caps: Capabilities,
+    format_properties: Arc<[f::Properties; f::NUM_FORMATS]>,
     heap_properties: &'static [HeapProperties],
     // CPU only pools
-    rtv_pool: Mutex<native::DescriptorCpuPool>,
-    dsv_pool: Mutex<native::DescriptorCpuPool>,
-    srv_pool: Mutex<native::DescriptorCpuPool>,
-    uav_pool: Mutex<native::DescriptorCpuPool>,
-    sampler_pool: Mutex<native::DescriptorCpuPool>,
-    descriptor_update_pools: Mutex<Vec<native::DescriptorCpuPool>>,
+    rtv_pool: Mutex<DescriptorCpuPool>,
+    dsv_pool: Mutex<DescriptorCpuPool>,
+    srv_uav_pool: Mutex<DescriptorCpuPool>,
+    sampler_pool: Mutex<DescriptorCpuPool>,
+    descriptor_update_pools: Mutex<Vec<descriptors_cpu::HeapLinear>>,
     // CPU/GPU descriptor heaps
     heap_srv_cbv_uav: Mutex<native::DescriptorHeap>,
     heap_sampler: Mutex<native::DescriptorHeap>,
     events: Mutex<Vec<winnt::HANDLE>>,
-    signatures: CmdSignatures,
+    shared: Arc<Shared>,
     // Present queue exposed by the `Present` queue family.
     // Required for swapchain creation. Only a single queue supports presentation.
     present_queue: ComPtr<d3d12::ID3D12CommandQueue>,
@@ -494,70 +558,10 @@ impl Device {
         present_queue: ComPtr<d3d12::ID3D12CommandQueue>,
     ) -> Self {
         // Allocate descriptor heaps
-        let max_rtvs = 256; // TODO
-        let rtv_pool = native::DescriptorCpuPool {
-            heap: Self::create_descriptor_heap_impl(
-                &mut device,
-                d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                false,
-                max_rtvs,
-            ),
-            offset: 0,
-            size: 0,
-            max_size: max_rtvs as _,
-        };
-
-        let max_dsvs = 64; // TODO
-        let dsv_pool = native::DescriptorCpuPool {
-            heap: Self::create_descriptor_heap_impl(
-                &mut device,
-                d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                false,
-                max_dsvs,
-            ),
-            offset: 0,
-            size: 0,
-            max_size: max_dsvs as _,
-        };
-
-        let max_srvs = 0x1000; // TODO
-        let srv_pool = native::DescriptorCpuPool {
-            heap: Self::create_descriptor_heap_impl(
-                &mut device,
-                d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                false,
-                max_srvs,
-            ),
-            offset: 0,
-            size: 0,
-            max_size: max_srvs as _,
-        };
-
-        let max_uavs = 0x1000; // TODO
-        let uav_pool = native::DescriptorCpuPool {
-            heap: Self::create_descriptor_heap_impl(
-                &mut device,
-                d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                false,
-                max_uavs,
-            ),
-            offset: 0,
-            size: 0,
-            max_size: max_uavs as _,
-        };
-
-        let max_samplers = 2048; // D3D12 doesn't allow more samplers for one heap.
-        let sampler_pool = native::DescriptorCpuPool {
-            heap: Self::create_descriptor_heap_impl(
-                &mut device,
-                d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                false,
-                max_samplers,
-            ),
-            offset: 0,
-            size: 0,
-            max_size: max_samplers as _,
-        };
+        let rtv_pool = DescriptorCpuPool::new(&device, d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        let dsv_pool = DescriptorCpuPool::new(&device, d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let srv_uav_pool = DescriptorCpuPool::new(&device, d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let sampler_pool = DescriptorCpuPool::new(&device, d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
         let heap_srv_cbv_uav = Self::create_descriptor_heap_impl(
             &mut device,
@@ -570,7 +574,7 @@ impl Device {
             &mut device,
             d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
             true,
-            max_samplers,
+            2_048,
         );
 
         let draw_signature = Self::create_command_signature(
@@ -588,24 +592,31 @@ impl Device {
             device::CommandSignature::Dispatch,
         );
 
+        let signatures = CmdSignatures {
+            draw: draw_signature,
+            draw_indexed: draw_indexed_signature,
+            dispatch: dispatch_signature,
+        };
+        let service_pipes = internal::ServicePipes::new(device.clone());
+        let shared = Shared {
+            signatures,
+            service_pipes,
+        };
+
         Device {
             raw: device,
             private_caps: physical_device.private_caps,
+            format_properties: physical_device.format_properties.clone(),
             heap_properties: physical_device.heap_properties,
             rtv_pool: Mutex::new(rtv_pool),
             dsv_pool: Mutex::new(dsv_pool),
-            srv_pool: Mutex::new(srv_pool),
-            uav_pool: Mutex::new(uav_pool),
+            srv_uav_pool: Mutex::new(srv_uav_pool),
             sampler_pool: Mutex::new(sampler_pool),
             descriptor_update_pools: Mutex::new(Vec::new()),
             heap_srv_cbv_uav: Mutex::new(heap_srv_cbv_uav),
             heap_sampler: Mutex::new(heap_sampler),
             events: Mutex::new(Vec::new()),
-            signatures: CmdSignatures {
-                draw: draw_signature,
-                draw_indexed: draw_indexed_signature,
-                dispatch: dispatch_signature,
-            },
+            shared: Arc::new(shared),
             present_queue,
             queues: Vec::new(),
             open: physical_device.is_open.clone(),
@@ -614,6 +625,13 @@ impl Device {
 
     fn append_queue(&mut self, queue: CommandQueue) {
         self.queues.push(queue);
+    }
+
+    /// Get the native d3d12 device.
+    ///
+    /// Required for FFI with libraries like RenderDoc.
+    pub unsafe fn as_raw(&self) -> *mut d3d12::ID3D12Device {
+        self.raw.as_raw()
     }
 }
 
@@ -644,7 +662,7 @@ impl Instance {
             let mut debug_controller: *mut d3d12sdklayers::ID3D12Debug = ptr::null_mut();
             let hr = unsafe {
                 d3d12::D3D12GetDebugInterface(
-                    &d3d12sdklayers::IID_ID3D12Debug,
+                    &d3d12sdklayers::ID3D12Debug::uuidof(),
                     &mut debug_controller as *mut *mut _ as *mut *mut _)
             };
 
@@ -660,7 +678,7 @@ impl Instance {
         let hr = unsafe {
             dxgi1_3::CreateDXGIFactory2(
                 dxgi1_3::DXGI_CREATE_FACTORY_DEBUG,
-                &dxgi1_4::IID_IDXGIFactory4,
+                &dxgi1_4::IDXGIFactory4::uuidof(),
                 &mut dxgi_factory as *mut *mut _ as *mut *mut _)
         };
 
@@ -709,7 +727,7 @@ impl hal::Instance for Instance {
                     d3d12::D3D12CreateDevice(
                         adapter.as_raw() as *mut _,
                         d3dcommon::D3D_FEATURE_LEVEL_11_0,
-                        &d3d12::IID_ID3D12Device,
+                        &d3d12::ID3D12Device::uuidof(),
                         &mut device as *mut *mut _ as *mut *mut _,
                     )
                 };
@@ -735,22 +753,118 @@ impl hal::Instance for Instance {
                 name: device_name,
                 vendor: desc.VendorId as usize,
                 device: desc.DeviceId as usize,
-                software_rendering: false, // TODO: check for WARP adapter (software rasterizer)?
+                software_rendering: (desc.Flags & dxgi::DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
             };
 
             let mut features: d3d12::D3D12_FEATURE_DATA_D3D12_OPTIONS = unsafe { mem::zeroed() };
             assert_eq!(winerror::S_OK, unsafe {
-                device.CheckFeatureSupport(d3d12::D3D12_FEATURE_D3D12_OPTIONS,
+                device.CheckFeatureSupport(
+                    d3d12::D3D12_FEATURE_D3D12_OPTIONS,
                     &mut features as *mut _ as *mut _,
-                    mem::size_of::<d3d12::D3D12_FEATURE_DATA_D3D12_OPTIONS>() as _)
+                    mem::size_of::<d3d12::D3D12_FEATURE_DATA_D3D12_OPTIONS>() as _,
+                )
             });
 
             let mut features_architecture: d3d12::D3D12_FEATURE_DATA_ARCHITECTURE = unsafe { mem::zeroed() };
             assert_eq!(winerror::S_OK, unsafe {
-                device.CheckFeatureSupport(d3d12::D3D12_FEATURE_ARCHITECTURE,
+                device.CheckFeatureSupport(
+                    d3d12::D3D12_FEATURE_ARCHITECTURE,
                     &mut features_architecture as *mut _ as *mut _,
-                    mem::size_of::<d3d12::D3D12_FEATURE_DATA_ARCHITECTURE>() as _)
+                    mem::size_of::<d3d12::D3D12_FEATURE_DATA_ARCHITECTURE>() as _,
+                )
             });
+
+            let depth_bounds_test_supported = {
+                let mut features2: d3d12::D3D12_FEATURE_DATA_D3D12_OPTIONS2 = unsafe { mem::zeroed() };
+                let hr = unsafe {
+                    device.CheckFeatureSupport(
+                        d3d12::D3D12_FEATURE_D3D12_OPTIONS2,
+                        &mut features2 as *mut _ as *mut _,
+                        mem::size_of::<d3d12::D3D12_FEATURE_DATA_D3D12_OPTIONS2>() as _,
+                    )
+                };
+                if hr == winerror::S_OK  {
+                    features2.DepthBoundsTestSupported != 0
+                } else {
+                    false
+                }
+            };
+
+            let mut format_properties = [f::Properties::default(); f::NUM_FORMATS];
+            for (i, props) in &mut format_properties.iter_mut().enumerate().skip(1) {
+                let format: f::Format = unsafe { mem::transmute(i as u32) };
+                let mut data = d3d12::D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: match conv::map_format(format) {
+                        Some(format) => format,
+                        None => continue,
+                    },
+                    Support1: unsafe { mem::zeroed() },
+                    Support2: unsafe { mem::zeroed() },
+                };
+                assert_eq!(winerror::S_OK, unsafe {
+                    device.CheckFeatureSupport(
+                        d3d12::D3D12_FEATURE_FORMAT_SUPPORT,
+                        &mut data as *mut _ as *mut _,
+                        mem::size_of::<d3d12::D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as _,
+                    )
+                });
+                let can_buffer = 0 != data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_BUFFER;
+                let can_image = 0 != data.Support1 & (
+                    d3d12::D3D12_FORMAT_SUPPORT1_TEXTURE1D |
+                    d3d12::D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                    d3d12::D3D12_FORMAT_SUPPORT1_TEXTURE3D |
+                    d3d12::D3D12_FORMAT_SUPPORT1_TEXTURECUBE
+                );
+                let can_linear = can_image && !format.surface_desc().is_compressed();
+                if can_image {
+                    props.optimal_tiling |= f::ImageFeature::SAMPLED | f::ImageFeature::BLIT_SRC;
+                }
+                if can_linear {
+                    props.linear_tiling |= f::ImageFeature::SAMPLED | f::ImageFeature::BLIT_SRC;
+                }
+                if data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER != 0 {
+                    props.buffer_features |= f::BufferFeature::VERTEX;
+                }
+                if data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE != 0 {
+                    props.optimal_tiling |= f::ImageFeature::SAMPLED_LINEAR;
+                }
+                if data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_RENDER_TARGET != 0 {
+                    props.optimal_tiling |= f::ImageFeature::COLOR_ATTACHMENT | f::ImageFeature::BLIT_DST;
+                    if can_linear {
+                        props.linear_tiling |= f::ImageFeature::COLOR_ATTACHMENT | f::ImageFeature::BLIT_DST;
+                    }
+                }
+                if data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_BLENDABLE != 0 {
+                    props.optimal_tiling |= f::ImageFeature::COLOR_ATTACHMENT_BLEND;
+                }
+                if data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL != 0 {
+                    props.optimal_tiling |= f::ImageFeature::DEPTH_STENCIL_ATTACHMENT;
+                }
+                if data.Support1 & d3d12::D3D12_FORMAT_SUPPORT1_SHADER_LOAD != 0 {
+                    //TODO: check d3d12::D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD ?
+                    if can_buffer {
+                        props.buffer_features |= f::BufferFeature::UNIFORM_TEXEL;
+                    }
+                }
+                if data.Support2 & d3d12::D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD != 0 {
+                    //TODO: other atomic flags?
+                    if can_buffer {
+                        props.buffer_features |= f::BufferFeature::STORAGE_TEXEL_ATOMIC;
+                    }
+                    if can_image {
+                        props.optimal_tiling |= f::ImageFeature::STORAGE_ATOMIC;
+                    }
+                }
+                if data.Support2 & d3d12::D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE != 0 {
+                    if can_buffer {
+                        props.buffer_features |= f::BufferFeature::STORAGE_TEXEL;
+                    }
+                    if can_image {
+                        props.optimal_tiling |= f::ImageFeature::STORAGE;
+                    }
+                }
+                //TODO: blits, linear tiling
+            }
 
             let heterogeneous_resource_heaps = features.ResourceHeapTier != d3d12::D3D12_RESOURCE_HEAP_TIER_1;
 
@@ -860,7 +974,7 @@ impl hal::Instance for Instance {
                     unsafe {
                         assert_eq!(winerror::S_OK, self.factory.EnumAdapterByLuid(
                             adapter_id,
-                            &dxgi1_4::IID_IDXGIAdapter3,
+                            &dxgi1_4::IDXGIAdapter3::uuidof(),
                             &mut adapter as *mut *mut _ as *mut *mut _,
                         ));
                         ComPtr::from_raw(adapter)
@@ -892,13 +1006,16 @@ impl hal::Instance for Instance {
                 features:
                     // TODO: add more features, based on
                     // https://msdn.microsoft.com/de-de/library/windows/desktop/mt186615(v=vs.85).aspx
+                    Features::ROBUST_BUFFER_ACCESS |
                     Features::IMAGE_CUBE_ARRAY |
                     Features::GEOMETRY_SHADER |
                     Features::TESSELLATION_SHADER |
+                    Features::NON_FILL_POLYGON_MODE |
                     //logic_op: false, // Optional on feature level 11_0
                     Features::MULTI_DRAW_INDIRECT |
                     Features::FORMAT_BC |
-                    Features::INSTANCE_RATE,
+                    Features::INSTANCE_RATE |
+                    if depth_bounds_test_supported { Features::DEPTH_BOUNDS } else { Features::empty() },
                 limits: Limits { // TODO
                     max_texture_size: 0,
                     max_patch_size: 0,
@@ -913,10 +1030,24 @@ impl hal::Instance for Instance {
                         1, //TODO
                         1, //TODO
                     ],
+                    max_vertex_input_attributes: d3d12::D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT as _,
+                    max_vertex_input_bindings: 31, //TODO
+                    max_vertex_input_attribute_offset: 255, // TODO
+                    max_vertex_input_binding_stride: d3d12::D3D12_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES as _,
+                    max_vertex_output_components: 16, // TODO
                     min_buffer_copy_offset_alignment: d3d12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as _,
                     min_buffer_copy_pitch_alignment: d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as _,
+                    min_texel_buffer_offset_alignment: 1, // TODO
                     min_uniform_buffer_offset_alignment: 256, // Required alignment for CBVs
+                    min_storage_buffer_offset_alignment: 1, // TODO
+                    // TODO: query supported sample count for all framebuffer formats and increase the limit
+                    //       if possible.
+                    framebuffer_color_samples_count: 0b101,
+                    framebuffer_depth_samples_count: 0b101,
+                    framebuffer_stencil_samples_count: 0b101,
+                    non_coherent_atom_size: 1, //TODO: confirm
                 },
+                format_properties: Arc::new(format_properties),
                 private_caps: Capabilities {
                     heterogeneous_resource_heaps,
                     memory_architecture,
@@ -979,4 +1110,11 @@ impl hal::Backend for Backend {
     type Fence = native::Fence;
     type Semaphore = native::Semaphore;
     type QueryPool = native::QueryPool;
+}
+
+fn validate_line_width(width: f32) {
+    // Note from the Vulkan spec:
+    // > If the wide lines feature is not enabled, lineWidth must be 1.0
+    // Simply assert and no-op because DX12 never exposes `Features::LINE_WIDTH`
+    assert_eq!(width, 1.0);
 }

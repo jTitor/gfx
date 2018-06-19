@@ -22,7 +22,7 @@ pub struct Query<'a, B: Backend> {
 bitflags!(
     /// Query control flags.
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-    pub struct QueryControl: u8 {
+    pub struct QueryControl: u32 {
         /// Occlusion queries **must** return the exact sampler number.
         ///
         /// Requires `precise_occlusion_query` device feature.
@@ -31,6 +31,7 @@ bitflags!(
 );
 
 /// Type of queries in a query pool.
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 pub enum QueryType {
     /// Occlusion query. Count the number of drawn samples between
     /// the start and end of the query command.

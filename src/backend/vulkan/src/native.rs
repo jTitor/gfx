@@ -90,10 +90,12 @@ pub struct ShaderModule {
 pub struct DescriptorPool {
     pub(crate) raw: vk::DescriptorPool,
     pub(crate) device: Arc<RawDevice>,
+    /// This vec only exists to re-use allocations when `DescriptorSet`s are freed.
+    pub(crate) set_free_vec: Vec<vk::DescriptorSet>,
 }
 
 impl pso::DescriptorPool<Backend> for DescriptorPool {
-    fn allocate_sets<I>(&mut self, layout_iter: I) -> Vec<DescriptorSet>
+    fn allocate_sets<I>(&mut self, layout_iter: I) -> Vec<Result<DescriptorSet, pso::AllocationError>>
     where
         I: IntoIterator,
         I::Item: Borrow<DescriptorSetLayout>,
@@ -117,15 +119,33 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
 
         let descriptor_sets = unsafe {
             self.device.0.allocate_descriptor_sets(&info)
-        }.expect("Error on descriptor sets creation"); // TODO
+        };
 
-        descriptor_sets
-            .into_iter()
-            .zip(layout_bindinds.into_iter())
-            .map(|(raw, bindings)| {
-                DescriptorSet { raw, bindings }
-            })
-            .collect()
+        match descriptor_sets {
+            Ok(sets) => {
+                sets.into_iter()
+                    .zip(layout_bindinds.into_iter())
+                    .map(|(raw, bindings)| {
+                        Ok(DescriptorSet { raw, bindings })
+                    })
+                    .collect()
+            }
+            Err(err) => vec![Err(match err {
+                vk::Result::ErrorOutOfHostMemory => pso::AllocationError::OutOfHostMemory,
+                vk::Result::ErrorOutOfDeviceMemory => pso::AllocationError::OutOfDeviceMemory,
+                // TODO: Uncomment when ash updates to include VK_ERROR_OUT_OF_POOL_MEMORY(_KHR)
+                // vk::Result::ErrorOutOfPoolMemory => pso::AllocationError::OutOfPoolMemory,
+                _ => pso::AllocationError::FragmentedPool,
+            })]
+        }
+    }
+
+    fn free_sets(&mut self, descriptor_sets: &[DescriptorSet]) {
+        self.set_free_vec.clear();
+        self.set_free_vec.extend(descriptor_sets.iter().map(|d| d.raw));
+        unsafe {
+            self.device.0.free_descriptor_sets(self.raw, &self.set_free_vec);
+        }
     }
 
     fn reset(&mut self) {

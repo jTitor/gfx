@@ -24,7 +24,10 @@ mod render_pass;
 mod transfer;
 
 pub use self::graphics::*;
-pub use self::raw::{ClearValueRaw, ClearColorRaw, ClearDepthStencilRaw, RawCommandBuffer, CommandBufferFlags, Level as RawLevel};
+pub use self::raw::{
+    ClearValueRaw, ClearColorRaw, ClearDepthStencilRaw, DescriptorSetOffset,
+    RawCommandBuffer, CommandBufferFlags, Level as RawLevel, CommandBufferInheritanceInfo,
+};
 pub use self::render_pass::*;
 pub use self::transfer::*;
 
@@ -87,7 +90,8 @@ unsafe impl<'a, B: Backend, C, L: Level> Submittable<'a, B, C, L> for &'a Submit
 }
 
 /// A convenience alias for not typing out the full signature of a secondary command buffer.
-pub type SecondaryCommandBuffer<'a, B, C, S = OneShot> = CommandBuffer<'a, B, C, S, Secondary>;
+#[allow(type_alias_bounds)]
+pub type SecondaryCommandBuffer<'a, B: Backend, C, S: Shot = OneShot> = CommandBuffer<'a, B, C, S, Secondary>;
 
 /// A strongly-typed command buffer that will only implement methods that are valid for the operations
 /// it supports.
@@ -103,6 +107,16 @@ impl<'a, B: Backend, C, S: Shot, L: Level> CommandBuffer<'a, B, C, S, L> {
             raw: raw,
             _marker: PhantomData,
         }
+    }
+
+    /// Get a reference to the raw command buffer
+    pub fn as_raw(&self) -> &B::CommandBuffer {
+        &*self.raw
+    }
+
+    /// Get a mutable reference to the raw command buffer
+    pub fn as_raw_mut(&mut self) -> &mut B::CommandBuffer {
+        self.raw
     }
 
     /// Finish recording commands to the command buffers.

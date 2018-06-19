@@ -3,7 +3,7 @@ use ash::extensions as ext;
 use ash::version::DeviceV1_0;
 use smallvec::SmallVec;
 
-use hal::{buffer, device as d, format, image, mapping, pass, pso, query, queue};
+use hal::{buffer, device as d, format, image, mapping, pass, pso, query, queue, window};
 use hal::{Backbuffer, Features, MemoryTypeId, SwapchainConfig};
 use hal::error::HostExecutionError;
 use hal::memory::Requirements;
@@ -12,7 +12,6 @@ use hal::range::RangeArg;
 
 use std::{mem, ptr};
 use std::borrow::Borrow;
-use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ops::Range;
 use std::sync::Arc;
@@ -298,6 +297,7 @@ impl d::Device<B> for Device {
         let mut dynamic_states             = Vec::with_capacity(descs.len() * MAX_DYNAMIC_STATES);
         let mut viewports                  = Vec::with_capacity(descs.len());
         let mut scissors                   = Vec::with_capacity(descs.len());
+        let mut sample_masks               = Vec::with_capacity(descs.len());
 
         let mut c_strings = Vec::new(); // hold the C strings temporarily
         let mut make_stage = |stage, source: &pso::EntryPoint<'a, B>| {
@@ -362,9 +362,9 @@ impl d::Device<B> for Device {
 
             {
                 let mut vertex_bindings = Vec::new();
-                for (i, vbuf) in desc.vertex_buffers.iter().enumerate() {
+                for vbuf in &desc.vertex_buffers {
                     vertex_bindings.push(vk::VertexInputBindingDescription {
-                        binding: i as u32,
+                        binding: vbuf.binding,
                         stride: vbuf.stride as u32,
                         input_rate: if vbuf.rate == 0 {
                             vk::VertexInputRate::Vertex
@@ -421,8 +421,8 @@ impl d::Device<B> for Device {
                     vk::VK_FALSE
                 },
                 rasterizer_discard_enable: if desc.shaders.fragment.is_none() { vk::VK_TRUE } else { vk::VK_FALSE },
-                polygon_mode: polygon_mode,
-                cull_mode: desc.rasterizer.cull_face.map(conv::map_cull_face).unwrap_or(vk::CULL_MODE_NONE),
+                polygon_mode,
+                cull_mode: conv::map_cull_face(desc.rasterizer.cull_face),
                 front_face: conv::map_front_face(desc.rasterizer.front_face),
                 depth_bias_enable: if desc.rasterizer.depth_bias.is_some() { vk::VK_TRUE } else { vk::VK_FALSE },
                 depth_bias_constant_factor: desc.rasterizer.depth_bias.map_or(0.0, |off| off.const_factor),
@@ -471,19 +471,41 @@ impl d::Device<B> for Device {
                 },
             });
 
-            info_multisample_states.push(vk::PipelineMultisampleStateCreateInfo {
-                s_type: vk::StructureType::PipelineMultisampleStateCreateInfo,
-                p_next: ptr::null(),
-                flags: vk::PipelineMultisampleStateCreateFlags::empty(),
-                rasterization_samples: vk::SAMPLE_COUNT_1_BIT, // TODO
-                sample_shading_enable: vk::VK_FALSE, // TODO
-                min_sample_shading: 0.0,  // TODO
-                p_sample_mask: ptr::null(), // TODO
-                alpha_to_coverage_enable: vk::VK_FALSE, // TODO
-                alpha_to_one_enable: vk::VK_FALSE, // TODO
-            });
+            let multisampling_state = match desc.multisampling {
+                Some(ref ms) => {
+                    let sample_mask = [
+                        (ms.sample_mask & 0xFFFFFFFF) as u32,
+                        ((ms.sample_mask >> 32) & 0xFFFFFFFF) as u32,
+                    ];
+                    sample_masks.push(sample_mask);
 
-            let depth_stencil = desc.depth_stencil.unwrap_or_default();
+                    vk::PipelineMultisampleStateCreateInfo {
+                        s_type: vk::StructureType::PipelineMultisampleStateCreateInfo,
+                        p_next: ptr::null(),
+                        flags: vk::PipelineMultisampleStateCreateFlags::empty(),
+                        rasterization_samples: vk::SampleCountFlags::from_flags_truncate(ms.rasterization_samples as _),
+                        sample_shading_enable: ms.sample_shading.is_some() as _,
+                        min_sample_shading: ms.sample_shading.unwrap_or(0.0),
+                        p_sample_mask: sample_masks.last().unwrap().as_ptr(),
+                        alpha_to_coverage_enable: ms.alpha_coverage as _,
+                        alpha_to_one_enable: ms.alpha_to_one as _,
+                    }
+                },
+                None => vk::PipelineMultisampleStateCreateInfo {
+                    s_type: vk::StructureType::PipelineMultisampleStateCreateInfo,
+                    p_next: ptr::null(),
+                    flags: vk::PipelineMultisampleStateCreateFlags::empty(),
+                    rasterization_samples: vk::SAMPLE_COUNT_1_BIT,
+                    sample_shading_enable: vk::VK_FALSE,
+                    min_sample_shading: 0.0,
+                    p_sample_mask: ptr::null(),
+                    alpha_to_coverage_enable: vk::VK_FALSE,
+                    alpha_to_one_enable: vk::VK_FALSE,
+                },
+            };
+            info_multisample_states.push(multisampling_state);
+
+            let depth_stencil = desc.depth_stencil;
             let (depth_test_enable, depth_write_enable, depth_compare_op) = match depth_stencil.depth {
                 pso::DepthTest::On { fun, write } => (vk::VK_TRUE, write as _, conv::map_comparison(fun)),
                 pso::DepthTest::Off => (vk::VK_FALSE, vk::VK_FALSE, vk::CompareOp::Never),
@@ -495,6 +517,13 @@ impl d::Device<B> for Device {
                     conv::map_stencil_side(back),
                 ),
                 pso::StencilTest::Off => unsafe { mem::zeroed() },
+            };
+            let (min_depth_bounds, max_depth_bounds) = match desc.baked_states.depth_bounds {
+                Some(ref range) => (range.start, range.end),
+                None => {
+                    dynamic_states.push(vk::DynamicState::DepthBounds);
+                    (0.0, 1.0)
+                }
             };
 
             info_depth_stencil_states.push(vk::PipelineDepthStencilStateCreateInfo {
@@ -508,8 +537,8 @@ impl d::Device<B> for Device {
                 stencil_test_enable,
                 front,
                 back,
-                min_depth_bounds: 0.0,
-                max_depth_bounds: 1.0,
+                min_depth_bounds,
+                max_depth_bounds,
             });
 
             // Build blend states for color attachments
@@ -931,10 +960,7 @@ impl d::Device<B> for Device {
         let flags = conv::map_image_flags(storage_flags);
         let extent = conv::map_extent(kind.extent());
         let array_layers = kind.num_layers();
-        let samples = match kind.num_samples() {
-            1 => vk::SAMPLE_COUNT_1_BIT,
-            _ => unimplemented!()
-        };
+        let samples = kind.num_samples() as u32;
         let image_type = match kind {
             image::Kind::D1(..) => vk::ImageType::Type1d,
             image::Kind::D2(..) => vk::ImageType::Type2d,
@@ -950,7 +976,7 @@ impl d::Device<B> for Device {
             extent: extent.clone(),
             mip_levels: mip_levels as u32,
             array_layers: array_layers as u32,
-            samples,
+            samples: vk::SampleCountFlags::from_flags_truncate(samples),
             tiling: conv::map_tiling(tiling),
             usage: conv::map_image_usage(usage),
             sharing_mode: vk::SharingMode::Exclusive, // TODO:
@@ -973,6 +999,20 @@ impl d::Device<B> for Device {
             size: req.size,
             alignment: req.alignment,
             type_mask: req.memory_type_bits as _,
+        }
+    }
+
+    fn get_image_subresource_footprint(
+        &self, image: &n::Image, subresource: image::Subresource
+    ) -> image::SubresourceFootprint {
+        let sub = conv::map_subresource(&subresource);
+        let layout = self.raw.0.get_image_subresource_layout(image.raw, sub);
+
+        image::SubresourceFootprint {
+            slice: layout.offset .. layout.offset + layout.size,
+            row_pitch: layout.row_pitch,
+            array_pitch: layout.array_pitch,
+            depth_pitch: layout.depth_pitch,
         }
     }
 
@@ -1050,16 +1090,25 @@ impl d::Device<B> for Device {
         n::DescriptorPool {
             raw: pool,
             device: self.raw.clone(),
+            set_free_vec: Vec::new(),
         }
     }
 
-    fn create_descriptor_set_layout<T>(
-        &self, binding_iter: T
-    )-> n::DescriptorSetLayout
+    fn create_descriptor_set_layout<I, J>(
+        &self, binding_iter: I, immutable_sampler_iter: J
+    ) -> n::DescriptorSetLayout
     where
-        T: IntoIterator,
-        T::Item: Borrow<pso::DescriptorSetLayoutBinding>,
+        I: IntoIterator,
+        I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
+        J: IntoIterator,
+        J::Item: Borrow<n::Sampler>,
     {
+        let immutable_samplers = immutable_sampler_iter
+            .into_iter()
+            .map(|is| is.borrow().0)
+            .collect::<Vec<_>>();
+        let mut sampler_offset = 0;
+
         let bindings = Arc::new(binding_iter
             .into_iter()
             .map(|b| b.borrow().clone())
@@ -1072,7 +1121,13 @@ impl d::Device<B> for Device {
                 descriptor_type: conv::map_descriptor_type(b.ty),
                 descriptor_count: b.count as _,
                 stage_flags: conv::map_stage_flags(b.stage_flags),
-                p_immutable_samplers: ptr::null(), // TODO
+                p_immutable_samplers: if b.immutable_samplers {
+                    let slice = &immutable_samplers[sampler_offset..];
+                    sampler_offset += b.count;
+                    slice.as_ptr()
+                } else {
+                    ptr::null()
+                },
             }
         }).collect::<Vec<_>>();
 
@@ -1160,7 +1215,8 @@ impl d::Device<B> for Device {
                             },
                         });
                     }
-                    pso::Descriptor::TexelBuffer(view) => {
+                    pso::Descriptor::UniformTexelBuffer(view) |
+                    pso::Descriptor::StorageTexelBuffer(view) => {
                         texel_buffer_views.push(view.raw);
                     }
                 }
@@ -1395,15 +1451,22 @@ impl d::Device<B> for Device {
         &self,
         surface: &mut w::Surface,
         config: SwapchainConfig,
+        provided_old_swapchain: Option<w::Swapchain>,
+        extent: &window::Extent2D,
     ) -> (w::Swapchain, Backbuffer<B>) {
         let functor = ext::Swapchain::new(&surface.raw.instance.0, &self.raw.0)
             .expect("Unable to query swapchain function");
 
-        // TODO: check for better ones if available
-        let present_mode = vk::PresentModeKHR::Fifo; // required to be supported
-
         // TODO: handle depth stencil
         let format = config.color_format;
+
+        let old_swapchain = match provided_old_swapchain {
+            Some(osc) => osc.raw,
+            None => vk::SwapchainKHR::null(),
+        };
+
+        surface.width = extent.width;
+        surface.height = extent.height;
 
         let info = vk::SwapchainCreateInfoKHR {
             s_type: vk::StructureType::SwapchainCreateInfoKhr,
@@ -1424,9 +1487,9 @@ impl d::Device<B> for Device {
             p_queue_family_indices: ptr::null(),
             pre_transform: vk::SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
             composite_alpha: vk::COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            present_mode: present_mode,
+            present_mode: unsafe { mem::transmute(config.present_mode) },
             clipped: 1,
-            old_swapchain: vk::SwapchainKHR::null(),
+            old_swapchain,
         };
 
         let swapchain_raw = unsafe { functor.create_swapchain_khr(&info, None) }
@@ -1438,7 +1501,6 @@ impl d::Device<B> for Device {
         let swapchain = w::Swapchain {
             raw: swapchain_raw,
             functor,
-            frame_queue: VecDeque::new(),
         };
 
         let images = backbuffer_images

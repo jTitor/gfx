@@ -1,18 +1,21 @@
-use {Backend};
+use Backend;
+use internal::Channel;
+use window::SwapchainInner;
 
-use std::collections::{Bound, BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
-use std::ops::Range;
-use std::os::raw::{c_void, c_long, c_int};
-use std::ptr;
+use std::collections::HashMap;
+use std::ops::{Deref, Range};
+use std::os::raw::{c_void, c_long};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 
-use hal::{self, image, pass, pso};
+use hal::{self, image, pso};
+use hal::backend::FastHashMap;
+use hal::format::{Aspects, Format, FormatDesc};
 
-use cocoa::foundation::{NSRange, NSUInteger};
-use foreign_types::ForeignType;
-use metal::{self, MTLPrimitiveType};
-use objc;
+use cocoa::foundation::{NSUInteger};
+use metal;
 use spirv_cross::{msl, spirv};
+
+use range_alloc::RangeAllocator;
 
 
 /// Shader module can be compiled in advance if it's resource bindings do not
@@ -21,7 +24,7 @@ use spirv_cross::{msl, spirv};
 pub enum ShaderModule {
     Compiled {
         library: metal::Library,
-        entry_point_map: HashMap<String, spirv::EntryPoint>,
+        entry_point_map: FastHashMap<String, spirv::EntryPoint>,
     },
     Raw(Vec<u8>),
 }
@@ -31,20 +34,35 @@ unsafe impl Sync for ShaderModule {}
 
 #[derive(Debug)]
 pub struct RenderPass {
-    pub(crate) desc: metal::RenderPassDescriptor,
-    pub(crate) attachments: Vec<pass::Attachment>,
-    pub(crate) num_colors: usize,
+    pub(crate) attachments: Vec<hal::pass::Attachment>,
 }
 
 unsafe impl Send for RenderPass {}
 unsafe impl Sync for RenderPass {}
 
+#[derive(Clone, Debug)]
+pub struct ColorAttachment {
+    pub mtl_format: metal::MTLPixelFormat,
+    pub channel: Channel,
+    pub frame: Option<Frame>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FramebufferInner {
+    pub extent: image::Extent,
+    pub aspects: Aspects,
+    pub colors: Vec<ColorAttachment>,
+    pub depth_stencil: Option<metal::MTLPixelFormat>,
+}
+
 #[derive(Debug)]
-pub struct FrameBuffer(pub(crate) metal::RenderPassDescriptor);
+pub struct Framebuffer {
+    pub(crate) descriptor: metal::RenderPassDescriptor,
+    pub(crate) inner: FramebufferInner,
+}
 
-unsafe impl Send for FrameBuffer {}
-unsafe impl Sync for FrameBuffer {}
-
+unsafe impl Send for Framebuffer {}
+unsafe impl Sync for Framebuffer {}
 
 #[derive(Debug)]
 pub struct PipelineLayout {
@@ -53,6 +71,60 @@ pub struct PipelineLayout {
     pub(crate) res_overrides: HashMap<msl::ResourceBindingLocation, msl::ResourceBinding>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RasterizerState {
+    //TODO: more states
+    pub depth_clip: metal::MTLDepthClipMode,
+    pub depth_bias: pso::DepthBias,
+}
+
+impl Default for RasterizerState {
+    fn default() -> Self {
+        RasterizerState {
+            depth_clip: metal::MTLDepthClipMode::Clip,
+            depth_bias: Default::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StencilState<T> {
+    pub front_reference: T,
+    pub back_reference: T,
+    pub front_read_mask: T,
+    pub back_read_mask: T,
+    pub front_write_mask: T,
+    pub back_write_mask: T,
+}
+
+#[derive(Clone, Debug)]
+pub struct DepthStencilState {
+    pub depth_stencil_desc: Option<pso::DepthStencilDesc>,
+    pub depth_stencil_desc_raw: Option<metal::DepthStencilDescriptor>,
+    pub depth_stencil_static: Option<metal::DepthStencilState>,
+    pub stencil: StencilState<pso::State<pso::StencilValue>>,
+}
+
+impl Default for DepthStencilState {
+    fn default() -> Self {
+        DepthStencilState {
+            depth_stencil_desc: None,
+            depth_stencil_desc_raw: None,
+            depth_stencil_static: None,
+            stencil: StencilState::<pso::State<pso::StencilValue>> {
+                front_reference: pso::State::Static(0),
+                back_reference: pso::State::Static(0),
+                front_read_mask: pso::State::Static(!0),
+                back_read_mask: pso::State::Static(!0),
+                front_write_mask: pso::State::Static(!0),
+                back_write_mask: pso::State::Static(!0),
+            }
+        }
+    }
+}
+
+pub type VertexBufferMap = FastHashMap<(pso::BufferIndex, pso::ElemOffset), pso::VertexBufferDesc>;
+
 #[derive(Debug)]
 pub struct GraphicsPipeline {
     // we hold the compiled libraries here for now
@@ -60,10 +132,18 @@ pub struct GraphicsPipeline {
     pub(crate) vs_lib: metal::Library,
     pub(crate) fs_lib: Option<metal::Library>,
     pub(crate) raw: metal::RenderPipelineState,
-    pub(crate) primitive_type: MTLPrimitiveType,
+    pub(crate) primitive_type: metal::MTLPrimitiveType,
     pub(crate) attribute_buffer_index: u32,
-    pub(crate) depth_stencil_state: Option<metal::DepthStencilState>,
+    pub(crate) rasterizer_state: Option<RasterizerState>,
+    pub(crate) depth_stencil_state: DepthStencilState,
     pub(crate) baked_states: pso::BakedStates,
+    /// The mapping of additional vertex buffer bindings over the original ones.
+    /// This is needed because Vulkan allows attribute offsets to exceed the strides,
+    /// while Metal does not. Thus, we register extra vertex buffer bindings with
+    /// adjusted offsets to cover this use case.
+    pub(crate) vertex_buffer_map: VertexBufferMap,
+    /// Tracked attachment formats for figuring (roughly) renderpass compatibility.
+    pub(crate) attachment_formats: Vec<Option<Format>>,
 }
 
 unsafe impl Send for GraphicsPipeline {}
@@ -79,20 +159,90 @@ pub struct ComputePipeline {
 unsafe impl Send for ComputePipeline {}
 unsafe impl Sync for ComputePipeline {}
 
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub swapchain: Arc<RwLock<SwapchainInner>>,
+    pub index: hal::FrameImage,
+}
+
+#[derive(Clone, Debug)]
+pub enum ImageRoot {
+    Texture(metal::Texture),
+    Frame(Frame),
+}
+
+pub enum ImageRootRef<'a> {
+    Texture(&'a metal::TextureRef),
+    Frame {
+        swapchain: RwLockReadGuard<'a, SwapchainInner>,
+        index: hal::FrameImage,
+    },
+}
+
+impl<'a> Deref for ImageRootRef<'a> {
+    type Target = metal::TextureRef;
+    fn deref(&self) -> &Self::Target {
+        match *self {
+            ImageRootRef::Texture(tex) => tex,
+            ImageRootRef::Frame { ref swapchain, index } => &swapchain[index],
+        }
+    }
+}
+
+impl ImageRoot {
+    pub fn resolve(&self) -> ImageRootRef {
+        match *self {
+            ImageRoot::Texture(ref tex) => ImageRootRef::Texture(tex),
+            ImageRoot::Frame(ref frame) => ImageRootRef::Frame {
+                swapchain: frame.swapchain.read().unwrap(),
+                index: frame.index,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Image {
-    pub(crate) raw: metal::Texture,
-    pub(crate) format_desc: hal::format::FormatDesc,
+    pub(crate) root: ImageRoot,
+    pub(crate) extent: image::Extent,
+    pub(crate) num_layers: Option<image::Layer>,
+    pub(crate) format_desc: FormatDesc,
+    pub(crate) shader_channel: Channel,
+    pub(crate) mtl_format: metal::MTLPixelFormat,
+    pub(crate) mtl_type: metal::MTLTextureType,
+}
+
+impl Image {
+    pub(crate) fn pitches_impl(
+        extent: image::Extent, format_desc: FormatDesc
+    ) -> [hal::buffer::Offset; 3] {
+        let bytes_per_texel = format_desc.bits as image::Size >> 3;
+        let row_pitch = extent.width * bytes_per_texel;
+        let depth_pitch = extent.height * row_pitch;
+        let array_pitch = extent.depth * depth_pitch;
+        [row_pitch as _, depth_pitch as _, array_pitch as _]
+    }
+    pub(crate) fn pitches(&self, level: image::Level) -> [hal::buffer::Offset; 3] {
+        Self::pitches_impl(self.extent.at_level(level), self.format_desc)
+    }
 }
 
 unsafe impl Send for Image {}
 unsafe impl Sync for Image {}
 
 #[derive(Debug)]
-pub struct BufferView {}
+pub struct BufferView {
+    pub(crate) raw: metal::Texture,
+}
+
+unsafe impl Send for BufferView {}
+unsafe impl Sync for BufferView {}
 
 #[derive(Debug)]
-pub struct ImageView(pub(crate) metal::Texture);
+pub struct ImageView {
+    pub(crate) root: ImageRoot,
+    pub(crate) mtl_format: metal::MTLPixelFormat,
+}
 
 unsafe impl Send for ImageView {}
 unsafe impl Sync for ImageView {}
@@ -112,8 +262,8 @@ unsafe impl Sync for Semaphore {}
 #[derive(Debug)]
 pub struct Buffer {
     pub(crate) raw: metal::Buffer,
-    pub(crate) allocations: Option<Arc<Mutex<MemoryAllocations>>>,
-    pub(crate) offset: u64,
+    pub(crate) range: Range<u64>,
+    pub(crate) res_options: metal::MTLResourceOptions,
 }
 
 unsafe impl Send for Buffer {}
@@ -125,8 +275,7 @@ pub enum DescriptorPool {
     Emulated,
     ArgumentBuffer {
         buffer: metal::Buffer,
-        total_size: NSUInteger,
-        offset: NSUInteger,
+        range_allocator: RangeAllocator<NSUInteger>,
     }
 }
 //TODO: re-evaluate Send/Sync here
@@ -134,66 +283,138 @@ unsafe impl Send for DescriptorPool {}
 unsafe impl Sync for DescriptorPool {}
 
 impl hal::DescriptorPool<Backend> for DescriptorPool {
-    fn allocate_set(&mut self, layout: &DescriptorSetLayout) -> DescriptorSet {
+    fn allocate_set(&mut self, layout: &DescriptorSetLayout) -> Result<DescriptorSet, pso::AllocationError> {
         match *self {
             DescriptorPool::Emulated => {
-                let layout_bindings = match layout {
-                    &DescriptorSetLayout::Emulated(ref bindings) => bindings,
-                    _ => panic!("Incompatible descriptor set layout type"),
+                let (layout_bindings, immutable_samplers) = match layout {
+                    &DescriptorSetLayout::Emulated(ref bindings, ref samplers) => (bindings, samplers),
+                    _ => return Err(pso::AllocationError::IncompatibleLayout),
                 };
+                let mut sampler_offset = 0;
 
-                let bindings = layout_bindings.iter().map(|layout| {
+                // Assume some reasonable starting capacity
+                let mut bindings = Vec::with_capacity(layout_bindings.len());
+
+                for layout in layout_bindings.iter() {
                     let binding = match layout.ty {
                         pso::DescriptorType::Sampler => {
-                            DescriptorSetBinding::Sampler(vec![None; layout.count])
+                            DescriptorSetBinding::Sampler(if layout.immutable_samplers {
+                                let slice = &immutable_samplers[sampler_offset.. sampler_offset + layout.count];
+                                sampler_offset += layout.count;
+                                slice
+                                    .iter()
+                                    .map(|s| Some(s.clone()))
+                                    .collect()
+                            } else {
+                                vec![None; layout.count]
+                            })
+                        }
+                        pso::DescriptorType::CombinedImageSampler => {
+                            DescriptorSetBinding::Combined(if layout.immutable_samplers {
+                                let slice = &immutable_samplers[sampler_offset.. sampler_offset + layout.count];
+                                sampler_offset += layout.count;
+                                slice
+                                    .iter()
+                                    .map(|s| (None, Some(s.clone())))
+                                    .collect()
+                            } else {
+                                vec![(None, None); layout.count]
+                            })
                         }
                         pso::DescriptorType::SampledImage |
-                        pso::DescriptorType::StorageImage => {
+                        pso::DescriptorType::StorageImage |
+                        pso::DescriptorType::UniformTexelBuffer |
+                        pso::DescriptorType::StorageTexelBuffer |
+                        pso::DescriptorType::InputAttachment => {
                             DescriptorSetBinding::Image(vec![None; layout.count])
                         }
                         pso::DescriptorType::UniformBuffer |
                         pso::DescriptorType::StorageBuffer => {
-                            DescriptorSetBinding::Buffer(vec![None; layout.count])
+                            DescriptorSetBinding::Buffer(vec![BufferBinding { base: None, dynamic: false }; layout.count])
                         }
-                        _ => unimplemented!()
+                        pso::DescriptorType::UniformBufferDynamic |
+                        pso::DescriptorType::StorageBufferDynamic => {
+                            DescriptorSetBinding::Buffer(vec![BufferBinding { base: None, dynamic: true }; layout.count])
+                        }
                     };
-                    (layout.binding, binding)
-                }).collect();
+
+                    let layout_binding = layout.binding as usize;
+
+                    if bindings.len() <= layout_binding {
+                        bindings.resize(layout_binding + 1, None);
+                    }
+
+                    bindings[layout_binding] = Some(binding);
+                }
+
+                // The set may be held onto for a long time, so attempt to shrink to avoid large overallocations
+                bindings.shrink_to_fit();
 
                 let inner = DescriptorSetInner {
                     layout: layout_bindings.to_vec(),
                     bindings,
                 };
-                DescriptorSet::Emulated(Arc::new(Mutex::new(inner)))
+                Ok(DescriptorSet::Emulated(Arc::new(Mutex::new(inner))))
             }
-            DescriptorPool::ArgumentBuffer { ref buffer, total_size, ref mut offset } => {
+            DescriptorPool::ArgumentBuffer { ref buffer, ref mut range_allocator, } => {
                 let (encoder, stage_flags) = match layout {
                     &DescriptorSetLayout::ArgumentBuffer(ref encoder, stages) => (encoder, stages),
-                    _ => panic!("Incompatible descriptor set layout type"),
+                    _ => return Err(pso::AllocationError::IncompatibleLayout),
                 };
-
-                let cur_offset = *offset;
-                *offset += encoder.encoded_length();
-                assert!(*offset <= total_size);
-
-                DescriptorSet::ArgumentBuffer {
-                    buffer: buffer.clone(),
-                    offset: cur_offset,
-                    encoder: encoder.clone(),
-                    stage_flags,
-                }
+                range_allocator.allocate_range(encoder.encoded_length()).map(|range| {
+                    DescriptorSet::ArgumentBuffer {
+                        buffer: buffer.clone(),
+                        offset: range.start,
+                        encoder: encoder.clone(),
+                        stage_flags,
+                    }
+                }).ok_or(pso::AllocationError::OutOfPoolMemory)
             }
         }
     }
 
+    fn free_sets(&mut self, descriptor_sets: &[DescriptorSet]) {
+        match self {
+            DescriptorPool::Emulated => {
+                return; // Does nothing!  No metal allocation happened here.
+            },
+            DescriptorPool::ArgumentBuffer {
+                ref mut range_allocator,
+                ..
+            } => {
+                for descriptor_set in descriptor_sets {
+                    match descriptor_set {
+                        DescriptorSet::Emulated(..) => panic!("Tried to free a DescriptorSet not given out by this DescriptorPool!"),
+                        DescriptorSet::ArgumentBuffer {
+                            offset,
+                            encoder,
+                            ..
+                        } => {
+                            let handle_range = (*offset)..offset + encoder.encoded_length();
+                            range_allocator.free_range(handle_range);
+                        },
+                    }
+                }
+            },
+        }
+    }
+
     fn reset(&mut self) {
-        unimplemented!()
+        match self {
+            DescriptorPool::Emulated => {/* No action necessary */}
+            DescriptorPool::ArgumentBuffer {
+                range_allocator,
+                ..
+            } => {
+                range_allocator.reset();
+            }
+        }
     }
 }
 
 #[derive(Debug)]
 pub enum DescriptorSetLayout {
-    Emulated(Vec<pso::DescriptorSetLayoutBinding>),
+    Emulated(Vec<pso::DescriptorSetLayoutBinding>, Vec<metal::SamplerState>),
     ArgumentBuffer(metal::ArgumentEncoder, pso::ShaderStageFlags),
 }
 unsafe impl Send for DescriptorSetLayout {}
@@ -215,17 +436,23 @@ unsafe impl Sync for DescriptorSet {}
 #[derive(Debug)]
 pub struct DescriptorSetInner {
     pub(crate) layout: Vec<pso::DescriptorSetLayoutBinding>, // TODO: maybe don't clone?
-    pub(crate) bindings: HashMap<pso::DescriptorBinding, DescriptorSetBinding>,
+    // The index of `bindings` is `pso::DescriptorBinding`
+    pub(crate) bindings: Vec<Option<DescriptorSetBinding>>,
 }
 unsafe impl Send for DescriptorSetInner {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+pub struct BufferBinding {
+    pub base: Option<(metal::Buffer, u64)>,
+    pub dynamic: bool,
+}
+
+#[derive(Clone, Debug)]
 pub enum DescriptorSetBinding {
     Sampler(Vec<Option<metal::SamplerState>>),
-    Image(Vec<Option<(metal::Texture, image::Layout)>>),
-    //UniformTexelBuffer,
-    //StorageTexelBuffer,
-    Buffer(Vec<Option<(metal::Buffer, u64)>>),
+    Image(Vec<Option<(ImageRoot, image::Layout)>>),
+    Combined(Vec<(Option<(ImageRoot, image::Layout)>, Option<metal::SamplerState>)>),
+    Buffer(Vec<BufferBinding>),
     //InputAttachment(Vec<(metal::Texture, image::Layout)>),
 }
 
@@ -233,8 +460,6 @@ pub enum DescriptorSetBinding {
 pub struct Memory {
     pub(crate) heap: MemoryHeap,
     pub(crate) size: u64,
-    pub(crate) allocations: Arc<Mutex<MemoryAllocations>>,
-    pub(crate) mapping: Mutex<Option<MemoryMapping>>,
 }
 
 impl Memory {
@@ -242,12 +467,11 @@ impl Memory {
         Memory {
             heap,
             size,
-            allocations: Arc::new(Mutex::new(MemoryAllocations {
-                starts: BTreeMap::new(),
-                ends: BTreeMap::new(),
-            })),
-            mapping: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn resolve<R: hal::range::RangeArg<u64>>(&self, range: &R) -> Range<u64> {
+        *range.start().unwrap_or(&0) .. *range.end().unwrap_or(&self.size)
     }
 }
 
@@ -255,89 +479,39 @@ unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
 
 #[derive(Debug)]
-pub(crate) struct MemoryMapping {
-    pub(crate) range: Range<u64>,
-    pub(crate) buffer: metal::Buffer,
-    pub(crate) location: NSUInteger,
-    pub(crate) length: NSUInteger,
-}
-
-#[derive(Debug)]
-pub(crate) struct MemoryAllocations {
-    starts: BTreeMap<u64, (u64, metal::Buffer)>,
-    ends: BTreeMap<u64, (u64, metal::Buffer)>,
-}
-
-impl MemoryAllocations {
-    pub(crate) fn find(&self, range: Range<u64>) -> Vec<(Range<u64>, metal::Buffer)> {
-        // Get all unique buffers that intersects specified range
-        let mut buffers = Vec::new();
-        buffers.extend(self.starts.range(range.clone()).map(|(&start, &(end, ref b))| (start .. end, b.clone())));
-        let range = (Bound::Excluded(range.start), Bound::Included(range.end));
-        buffers.extend(self.ends.range(range).map(|(&end, &(start, ref b))| (start .. end, b.clone())));
-        buffers.sort_unstable_by_key(|&(_, ref b)| b.as_ptr());
-        buffers.dedup_by_key(|&mut (_, ref b)| b.as_ptr());
-        buffers
-    }
-
-    pub(crate) fn insert(&mut self, range: Range<u64>, buffer: metal::Buffer) {
-        self.starts.insert(range.start, (range.end, buffer.clone()));
-        self.ends.insert(range.end, (range.start, buffer));
-    }
-
-    pub(crate) fn remove(&mut self, range: Range<u64>) {
-        self.starts.remove(&range.start);
-        self.ends.remove(&range.end);
-    }
-}
-
-#[derive(Debug)]
 pub(crate) enum MemoryHeap {
-    Emulated { memory_type: usize },
+    Private,
+    Public(hal::MemoryTypeId, metal::Buffer),
     Native(metal::Heap),
 }
 
 #[derive(Debug)]
 pub struct UnboundBuffer {
     pub(crate) size: u64,
+    pub(crate) usage: hal::buffer::Usage,
 }
-
 unsafe impl Send for UnboundBuffer {}
 unsafe impl Sync for UnboundBuffer {}
 
 #[derive(Debug)]
 pub struct UnboundImage {
     pub(crate) texture_desc: metal::TextureDescriptor,
-    pub(crate) format_desc: hal::format::FormatDesc,
+    pub(crate) format: hal::format::Format,
+    pub(crate) extent: image::Extent,
+    pub(crate) num_layers: Option<image::Layer>,
+    pub(crate) mip_sizes: Vec<u64>,
+    pub(crate) host_visible: bool,
 }
 unsafe impl Send for UnboundImage {}
 unsafe impl Sync for UnboundImage {}
 
 #[derive(Debug)]
-pub struct Fence(pub Arc<Mutex<bool>>);
-
-
-pub unsafe fn objc_err_description(object: *mut objc::runtime::Object) -> String {
-    let description: *mut objc::runtime::Object = msg_send![object, localizedDescription];
-    let utf16_len: NSUInteger = msg_send![description, length];
-    let utf8_bytes: NSUInteger = msg_send![description, lengthOfBytesUsingEncoding: 4 as NSUInteger];
-    let mut bytes = Vec::with_capacity(utf8_bytes as usize);
-    bytes.set_len(utf8_bytes as usize);
-    let success: objc::runtime::BOOL = msg_send![description,
-        getBytes: bytes.as_mut_ptr()
-        maxLength: utf8_bytes
-        usedLength: ptr::null_mut::<NSUInteger>()
-        encoding: 4 as NSUInteger
-        options: 0 as c_int
-        range: NSRange  { location: 0, length: utf16_len }
-        remainingRange: ptr::null_mut::<NSRange>()
-    ];
-    if success == objc::runtime::YES {
-        String::from_utf8_unchecked(bytes)
-    } else {
-        panic!("failed to get object description")
-    }
+pub struct FenceInner {
+    pub(crate) mutex: Mutex<bool>,
+    pub(crate) condvar: Condvar,
 }
+
+pub type Fence = Arc<FenceInner>;
 
 extern "C" {
     #[allow(dead_code)]

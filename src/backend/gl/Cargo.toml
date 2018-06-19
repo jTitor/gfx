@@ -5,7 +5,7 @@ description = "OpenGL backend for gfx-rs"
 homepage = "https://github.com/gfx-rs/gfx"
 repository = "https://github.com/gfx-rs/gfx"
 keywords = ["graphics", "gamedev"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 authors = ["The Gfx-rs Developers"]
 readme = "README.md"
 documentation = "https://docs.rs/gfx-backend-gl"
@@ -24,5 +24,5 @@ gfx_gl = "0.5"
 gfx-hal = { path = "../../hal", version = "0.1" }
 smallvec = "0.6"
 #jtitor: point this at custom fork that has RI implemented
-glutin = { git = "https://github.com/jTitor/glutin" version = "*", optional = true }
-spirv_cross = "0.7"
+glutin = { git = "https://github.com/jTitor/glutin", version = "*", optional = true }
+spirv_cross = "0.8"

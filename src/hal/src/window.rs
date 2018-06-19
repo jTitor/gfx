@@ -37,7 +37,7 @@
 //! let frame = swapchain.acquire_frame(FrameSync::Semaphore(&acquisition_semaphore));
 //! // render the scene..
 //! // `render_semaphore` will be signalled once rendering has been finished
-//! swapchain.present(&mut present_queue, &[render_semaphore]);
+//! swapchain.present(&mut present_queue, 0, &[render_semaphore]);
 //! # }
 //! ```
 //!
@@ -55,7 +55,7 @@ use format::Format;
 use queue::CommandQueue;
 
 use std::any::Any;
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::ops::Range;
 
 /// An extent describes the size of a rectangle, such as
@@ -89,7 +89,7 @@ pub struct SurfaceCapabilities {
     ///
     /// - `image_count.start` must be at least 1.
     /// - `image_count.end` must be larger of equal to `image_count.start`.
-    pub image_count: Range<u32>,
+    pub image_count: Range<FrameImage>,
 
     /// Current extent of the surface.
     ///
@@ -104,7 +104,7 @@ pub struct SurfaceCapabilities {
     /// Maximum number of layers supported for presentable images.
     ///
     /// Must be at least 1.
-    pub max_image_layers: u32,
+    pub max_image_layers: image::Layer,
 }
 
 /// A `Surface` abstracts the surface of a native window, which will be presented
@@ -122,41 +122,25 @@ pub trait Surface<B: Backend>: Any + Send + Sync {
     /// ```
     fn supports_queue_family(&self, family: &B::QueueFamily) -> bool;
 
-    /// Query surface capabilities and formats for this physical device.
+    /// Query surface capabilities, formats, and present modes for this physical device.
     ///
     /// Use this function for configuring swapchain creation.
     ///
     /// Returns a tuple of surface capabilities and formats.
     /// If formats is `None` than the surface has no preferred format and the
     /// application may use any desired format.
-    fn capabilities_and_formats(&self, physical_device: &B::PhysicalDevice) -> (SurfaceCapabilities, Option<Vec<Format>>);
+    fn compatibility(
+        &self, physical_device: &B::PhysicalDevice
+    ) -> (SurfaceCapabilities, Option<Vec<Format>>, Vec<PresentMode>);
 }
 
-/// Handle to a backbuffer of the swapchain.
+/// Index of an image in the swapchain.
 ///
 /// The swapchain is a series of one or more images, usually
 /// with one being drawn on while the other is displayed by
 /// the GPU (aka double-buffering). A `Frame` refers to a
 /// particular image in the swapchain.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Frame(pub(crate) usize);
-
-impl Frame {
-    /// Retrieve frame id.
-    ///
-    /// The can be used to access the currently used backbuffer image
-    /// in `Backbuffer::Images`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    ///
-    /// ```
-    pub fn id(&self) -> usize {
-        self.0
-    }
-}
+pub type FrameImage = u32;
 
 /// Synchronization primitives which will be signalled once a frame got retrieved.
 ///
@@ -171,6 +155,20 @@ pub enum FrameSync<'a, B: Backend> {
     ///
     /// Will be signaled once the frame backbuffer is available.
     Fence(&'a B::Fence),
+}
+
+/// Specifies the mode regulating how a swapchain presents frames.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub enum PresentMode {
+    /// Don't ever wait for v-sync.
+    Immediate = 0,
+    /// Wait for v-sync, overwrite the last rendered frame.
+    Mailbox = 1,
+    /// Present frames in the same order they are rendered.
+    Fifo = 2,
+    /// Don't wait for the next v-sync if we just missed it.
+    Relaxed = 3,
 }
 
 /// Contains all the data necessary to create a new `Swapchain`:
@@ -194,12 +192,14 @@ pub enum FrameSync<'a, B: Backend> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct SwapchainConfig {
+    /// Presentation mode.
+    pub present_mode: PresentMode,
     /// Color format of the backbuffer images.
     pub color_format: Format,
     /// Depth stencil format of the backbuffer images (optional).
     pub depth_stencil_format: Option<Format>,
     /// Number of images in the swapchain.
-    pub image_count: u32,
+    pub image_count: FrameImage,
     /// Image usage of the backbuffer images.
     pub image_usage: image::Usage,
 }
@@ -214,11 +214,24 @@ impl SwapchainConfig {
     /// ```
     pub fn new() -> Self {
         SwapchainConfig {
+            present_mode: PresentMode::Fifo,
             color_format: Format::Bgra8Unorm, // TODO: try to find best default format
             depth_stencil_format: None,
             image_count: 2,
             image_usage: image::Usage::empty(),
         }
+    }
+
+    /// Specify the presentation mode.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    ///
+    /// ```
+    pub fn with_mode(mut self, mode: PresentMode) -> Self {
+        self.present_mode = mode;
+        self
     }
 
     /// Specify the color format for the backbuffer images.
@@ -290,6 +303,8 @@ pub enum Backbuffer<B: Backend> {
 pub trait Swapchain<B: Backend>: Any + Send + Sync {
     /// Acquire a new frame for rendering. This needs to be called before presenting.
     ///
+    /// Will fail if the swapchain needs recreation.
+    ///
     /// # Synchronization
     ///
     /// The acquired image will not be immediately available when the function returns.
@@ -302,9 +317,9 @@ pub trait Swapchain<B: Backend>: Any + Send + Sync {
     /// ```no_run
     ///
     /// ```
-    fn acquire_frame(&mut self, sync: FrameSync<B>) -> Frame;
+    fn acquire_frame(&mut self, sync: FrameSync<B>) -> Result<FrameImage, ()>;
 
-    /// Present one acquired frame in FIFO order.
+    /// Present one acquired frame.
     ///
     /// # Safety
     ///
@@ -317,16 +332,17 @@ pub trait Swapchain<B: Backend>: Any + Send + Sync {
     ///
     /// ```
     fn present<'a, C, IW>(
-        &'a mut self,
+        &'a self,
         present_queue: &mut CommandQueue<B, C>,
+        frame_index: FrameImage,
         wait_semaphores: IW,
-    )
+    ) -> Result<(), ()>
     where
-        &'a mut Self: BorrowMut<B::Swapchain>,
+        &'a Self: Borrow<B::Swapchain>,
         Self: Sized + 'a,
         IW: IntoIterator,
         IW::Item: Borrow<B::Semaphore>,
     {
-        present_queue.present(Some(self), wait_semaphores)
+        present_queue.present(Some((self, frame_index)), wait_semaphores)
     }
 }

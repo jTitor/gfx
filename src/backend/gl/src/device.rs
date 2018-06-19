@@ -1,6 +1,5 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::iter::repeat;
 use std::ops::Range;
 use std::{ptr, mem, slice};
@@ -9,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use gl;
 use gl::types::{GLint, GLenum, GLfloat};
 
-use hal::{self as c, device as d, error, image as i, memory, pass, pso, buffer, mapping, query};
+use hal::{self as c, device as d, error, image as i, memory, pass, pso, buffer, mapping, query, window};
+use hal::backend::FastHashMap;
 use hal::format::{ChannelType, Format, Swizzle};
 use hal::pool::CommandPoolCreateFlags;
 use hal::queue::QueueFamilyId;
@@ -213,6 +213,39 @@ impl Device {
             })
     }
 
+    fn specialize_ast(
+        &self,
+        ast: &mut spirv::Ast<glsl::Target>,
+        specializations: &[pso::Specialization],
+    ) -> Result<(), d::ShaderError> {
+        let spec_constants = ast
+            .get_specialization_constants()
+            .map_err(gen_unexpected_error)?;
+
+        for spec_constant in spec_constants {
+            if let Some(constant) = specializations
+                .iter()
+                .find(|c| c.id == spec_constant.constant_id)
+            {
+                // Override specialization constant values
+                unsafe {
+                    let value = match constant.value {
+                        pso::Constant::Bool(v) => v as u64,
+                        pso::Constant::U32(v) => v as u64,
+                        pso::Constant::U64(v) => v,
+                        pso::Constant::I32(v) => *(&v as *const _ as *const u64),
+                        pso::Constant::I64(v) => *(&v as *const _ as *const u64),
+                        pso::Constant::F32(v) => *(&v as *const _ as *const u64),
+                        pso::Constant::F64(v) => *(&v as *const _ as *const u64),
+                    };
+                    ast.set_scalar_constant(spec_constant.id, value).map_err(gen_unexpected_error)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn translate_spirv(
         &self,
         ast: &mut spirv::Ast<glsl::Target>,
@@ -259,6 +292,7 @@ impl Device {
             n::ShaderModule::Raw(raw) => raw,
             n::ShaderModule::Spirv(ref spirv) => {
                 let mut ast = self.parse_spirv(spirv).unwrap();
+                self.specialize_ast(&mut ast, point.specialization).unwrap();
                 let glsl = self.translate_spirv(&mut ast).unwrap();
                 info!("Generated:\n{:?}", glsl);
                 match self.create_shader_module_from_source(glsl.as_bytes(), stage).unwrap() {
@@ -291,7 +325,7 @@ impl d::Device<B> for Device {
         let limits = self.share.limits.into();
         let memory = if flags.contains(CommandPoolCreateFlags::RESET_INDIVIDUAL) {
             BufferMemory::Individual {
-                storage: HashMap::new(),
+                storage: FastHashMap::default(),
                 next_buffer_id: 0,
             }
         } else {
@@ -436,12 +470,20 @@ impl d::Device<B> for Device {
             _ => None
         };
 
+        let mut vertex_buffers = Vec::new();
+        for vb in &desc.vertex_buffers {
+            while vertex_buffers.len() <= vb.binding as usize {
+                vertex_buffers.push(None);
+            }
+            vertex_buffers[vb.binding as usize] = Some(*vb);
+        }
+
         Ok(n::GraphicsPipeline {
             program,
             primitive: conv::primitive_to_gl_primitive(desc.input_assembler.primitive),
             patch_size,
             blend_targets: desc.blender.targets.clone(),
-            vertex_buffers: desc.vertex_buffers.clone(),
+            vertex_buffers,
             attributes: desc.attributes
                 .iter()
                 .map(|&a| {
@@ -871,6 +913,12 @@ impl d::Device<B> for Device {
         unbound.requirements
     }
 
+    fn get_image_subresource_footprint(
+        &self, _image: &n::Image, _sub: i::Subresource
+    ) -> i::SubresourceFootprint {
+        unimplemented!()
+    }
+
     fn bind_image_memory(
         &self, _memory: &n::Memory, _offset: u64, unbound: UnboundImage
     ) -> Result<n::Image, d::BindError> {
@@ -925,10 +973,12 @@ impl d::Device<B> for Device {
         n::DescriptorPool { }
     }
 
-    fn create_descriptor_set_layout<I>(&self, _: I) -> n::DescriptorSetLayout
+    fn create_descriptor_set_layout<I, J>(&self, _: I, _: J) -> n::DescriptorSetLayout
     where
         I: IntoIterator,
         I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
+        J: IntoIterator,
+        J::Item: Borrow<n::FatSampler>,
     {
         n::DescriptorSetLayout
     }
@@ -941,7 +991,7 @@ impl d::Device<B> for Device {
     {
         for _write in writes {
             //unimplemented!() // not panicing because of Warden
-            error!("TODO: implement `write_descriptor_sets`");
+            warn!("TODO: implement `write_descriptor_sets`");
         }
     }
 
@@ -1012,7 +1062,7 @@ impl d::Device<B> for Device {
     }
 
     fn free_memory(&self, _memory: n::Memory) {
-        // nothing to do
+        // Nothing to do
     }
 
     fn create_query_pool(&self, _ty: query::QueryType, _count: u32) -> () {
@@ -1028,20 +1078,28 @@ impl d::Device<B> for Device {
     }
 
     fn destroy_render_pass(&self, _: n::RenderPass) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn destroy_pipeline_layout(&self, _: n::PipelineLayout) {
-        unimplemented!()
+        // Nothing to do
     }
-    fn destroy_graphics_pipeline(&self, _: n::GraphicsPipeline) {
-        unimplemented!()
+
+    fn destroy_graphics_pipeline(&self, pipeline: n::GraphicsPipeline) {
+        unsafe {
+            self.share.context.DeleteProgram(pipeline.program);
+        }
     }
-    fn destroy_compute_pipeline(&self, _: n::ComputePipeline) {
-        unimplemented!()
+
+    fn destroy_compute_pipeline(&self, pipeline: n::ComputePipeline) {
+        unsafe {
+            self.share.context.DeleteProgram(pipeline.program);
+        }
     }
-    fn destroy_framebuffer(&self, _: n::FrameBuffer) {
-        unimplemented!()
+
+    fn destroy_framebuffer(&self, frame_buffer: n::FrameBuffer) {
+        let gl = &self.share.context;
+        unsafe { gl.DeleteFramebuffers(1, &frame_buffer); }
     }
 
     fn destroy_buffer(&self, buffer: n::Buffer) {
@@ -1050,24 +1108,35 @@ impl d::Device<B> for Device {
         }
     }
     fn destroy_buffer_view(&self, _: n::BufferView) {
-        unimplemented!()
+        // Nothing to do
     }
-    fn destroy_image(&self, _: n::Image) {
-        unimplemented!()
+
+    fn destroy_image(&self, image: n::Image) {
+        let gl = &self.share.context;
+        match image.kind {
+            n::ImageKind::Surface(rb) => unsafe { gl.DeleteRenderbuffers(1, &rb) },
+            n::ImageKind::Texture(t) => unsafe { gl.DeleteTextures(1, &t) },
+        }
     }
-    fn destroy_image_view(&self, _: n::ImageView) {
-        unimplemented!()
+
+    fn destroy_image_view(&self, _image_view: n::ImageView) {
+        // Nothing to do
     }
-    fn destroy_sampler(&self, _: n::FatSampler) {
-        unimplemented!()
+
+    fn destroy_sampler(&self, sampler: n::FatSampler) {
+        let gl = &self.share.context;
+        match sampler {
+            n::FatSampler::Sampler(s) => unsafe { gl.DeleteSamplers(1, &s) },
+            _ => (),
+        }
     }
 
     fn destroy_descriptor_pool(&self, _: n::DescriptorPool) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn destroy_descriptor_set_layout(&self, _: n::DescriptorSetLayout) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn destroy_fence(&self, fence: n::Fence) {
@@ -1077,19 +1146,21 @@ impl d::Device<B> for Device {
     }
 
     fn destroy_semaphore(&self, _: n::Semaphore) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn create_swapchain(
         &self,
         surface: &mut Surface,
         config: c::SwapchainConfig,
+        _old_swapchain: Option<Swapchain>,
+        _extent: &window::Extent2D,
     ) -> (Swapchain, c::Backbuffer<B>) {
         self.create_swapchain_impl(surface, config)
     }
 
     fn destroy_swapchain(&self, _swapchain: Swapchain) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {

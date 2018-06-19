@@ -15,7 +15,7 @@ use std::borrow::Borrow;
 use std::error::Error;
 use std::ops::Range;
 
-use {buffer, format, image, mapping, pass, pso, query};
+use {buffer, format, image, mapping, pass, pso, query, window};
 use {Backend, MemoryTypeId};
 
 use error::HostExecutionError;
@@ -155,7 +155,9 @@ pub trait Device<B: Backend>: Any + Send + Sync {
         max_buffers: usize,
     ) -> CommandPool<B, C> {
         let raw = self.create_command_pool(group.family(), flags);
-        CommandPool::new(raw, max_buffers)
+        let mut pool = unsafe { CommandPool::new(raw) };
+        pool.reserve(max_buffers);
+        pool
     }
 
     /// Destroys a command pool.
@@ -319,6 +321,11 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     fn get_image_requirements(&self, image: &B::UnboundImage) -> Requirements;
 
     ///
+    fn get_image_subresource_footprint(
+        &self, image: &B::Image, subresource: image::Subresource
+    ) -> image::SubresourceFootprint;
+
+    ///
     fn bind_image_memory(
         &self, &B::Memory, offset: u64, B::UnboundImage
     ) -> Result<B::Image, BindError>;
@@ -361,10 +368,14 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     fn destroy_descriptor_pool(&self, pool: B::DescriptorPool);
 
     /// Create a descriptor set layout.
-    fn create_descriptor_set_layout<I>(&self, bindings: I) -> B::DescriptorSetLayout
+    fn create_descriptor_set_layout<I, J>(
+        &self, bindings: I, immutable_samplers: J
+    ) -> B::DescriptorSetLayout
     where
         I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetLayoutBinding>;
+        I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
+        J: IntoIterator,
+        J::Item: Borrow<B::Sampler>;
 
     ///
     fn destroy_descriptor_set_layout(&self, layout: B::DescriptorSetLayout);
@@ -548,7 +559,8 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     fn destroy_query_pool(&self, pool: B::QueryPool);
 
-    /// Create a new swapchain from a surface and a queue family.
+    /// Create a new swapchain from a surface and a queue family, optionally providing the old
+    /// swapchain to aid in resource reuse and rendering continuity.
     ///
     /// *Note*: The number of exposed images in the back buffer might differ
     /// from number of internally used buffers.
@@ -571,17 +583,20 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     /// # let mut surface: empty::Surface = return;
     /// # let device: empty::Device = return;
+    /// # let extent = gfx_hal::window::Extent2D {width: 0, height: 0} ;
     /// let swapchain_config = SwapchainConfig::new().with_color(Format::Rgba8Srgb);
-    /// device.create_swapchain(&mut surface, swapchain_config);
+    /// device.create_swapchain(&mut surface, swapchain_config, None, &extent);
     /// # }
     /// ```
     fn create_swapchain(
         &self,
         surface: &mut B::Surface,
         config: SwapchainConfig,
+        old_swapchain: Option<B::Swapchain>,
+        extent: &window::Extent2D,
     ) -> (B::Swapchain, Backbuffer<B>);
 
-    /// 
+    ///
     fn destroy_swapchain(
         &self,
         swapchain: B::Swapchain);

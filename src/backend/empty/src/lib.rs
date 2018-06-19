@@ -3,11 +3,11 @@
 
 extern crate gfx_hal as hal;
 
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::ops::Range;
 use hal::{
     buffer, command, device, error, format, image, mapping,
-    memory, pass, pool, pso, query, queue,
+    memory, pass, pool, pso, query, queue, window
 };
 use hal::range::RangeArg;
 
@@ -56,7 +56,7 @@ impl hal::Backend for Backend {
 pub struct PhysicalDevice;
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, _: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>
+        &self, _: &[(&QueueFamily, &[hal::QueuePriority])]
     ) -> Result<hal::Gpu<Backend>, error::DeviceCreationError> {
         unimplemented!()
     }
@@ -96,10 +96,10 @@ impl queue::RawCommandQueue<Backend> for RawCommandQueue {
         unimplemented!()
     }
 
-    fn present<IS, IW>(&mut self, _: IS, _: IW)
+    fn present<IS, S, IW>(&mut self, _: IS, _: IW) -> Result<(), ()>
     where
-        IS: IntoIterator,
-        IS::Item: BorrowMut<Swapchain>,
+        IS: IntoIterator<Item = (S, hal::FrameImage)>,
+        S: Borrow<Swapchain>,
         IW: IntoIterator,
         IW::Item: Borrow<()>,
     {
@@ -197,6 +197,10 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
+    fn get_image_subresource_footprint(&self, _: &(), _: image::Subresource) -> image::SubresourceFootprint {
+        unimplemented!()
+    }
+
     fn bind_image_memory(&self, _: &(), _: u64, _: ()) -> Result<(), device::BindError> {
         unimplemented!()
     }
@@ -220,10 +224,12 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
-    fn create_descriptor_set_layout<I>(&self, _: I) -> ()
+    fn create_descriptor_set_layout<I, J>(&self, _: I, _: J) -> ()
     where
         I: IntoIterator,
         I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
+        J: IntoIterator,
+        J::Item: Borrow<()>
     {
         unimplemented!()
     }
@@ -352,6 +358,8 @@ impl hal::Device<Backend> for Device {
         &self,
         _: &mut Surface,
         _: hal::SwapchainConfig,
+        _: Option<Swapchain>,
+        _: &window::Extent2D,
     ) -> (Swapchain, hal::Backbuffer<Backend>) {
         unimplemented!()
     }
@@ -399,7 +407,7 @@ impl pool::RawCommandPool<Backend> for RawCommandPool {
 #[derive(Clone)]
 pub struct RawCommandBuffer;
 impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
-    fn begin(&mut self, _: command::CommandBufferFlags) {
+    fn begin(&mut self, _: command::CommandBufferFlags, _: command::CommandBufferInheritanceInfo<Backend>) {
         unimplemented!()
     }
 
@@ -423,7 +431,10 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn fill_buffer(&mut self, _: &(), _: Range<buffer::Offset>, _: u32) {
+    fn fill_buffer<R>(&mut self, _: &(), _: R, _: u32)
+    where
+        R: RangeArg<buffer::Offset>,
+    {
         unimplemented!()
     }
 
@@ -431,23 +442,17 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn clear_color_image_raw(
+    fn clear_image<T>(
         &mut self,
         _: &(),
         _: image::Layout,
-        _: image::SubresourceRange,
         _: command::ClearColorRaw,
-    ) {
-        unimplemented!()
-    }
-
-    fn clear_depth_stencil_image_raw(
-        &mut self,
-        _: &(),
-        _: image::Layout,
-        _: image::SubresourceRange,
         _: command::ClearDepthStencilRaw,
-    ) {
+        _: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<image::SubresourceRange>,
+    {
         unimplemented!()
     }
 
@@ -456,7 +461,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<command::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<pso::Rect>,
+        U::Item: Borrow<pso::ClearRect>,
     {
         unimplemented!()
     }
@@ -494,11 +499,11 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn bind_vertex_buffers(&mut self, _: pso::VertexBufferSet<Backend>) {
+    fn bind_vertex_buffers(&mut self, _: u32, _: pso::VertexBufferSet<Backend>) {
         unimplemented!()
     }
 
-    fn set_viewports<T>(&mut self, _: T)
+    fn set_viewports<T>(&mut self, _: u32, _: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Viewport>,
@@ -506,7 +511,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn set_scissors<T>(&mut self, _: T)
+    fn set_scissors<T>(&mut self, _: u32, _: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Rect>,
@@ -514,18 +519,35 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-
-    fn set_stencil_reference(&mut self, _: pso::StencilValue, _: pso::StencilValue) {
+    fn set_stencil_reference(&mut self, _: pso::Face, _: pso::StencilValue) {
         unimplemented!()
     }
 
+    fn set_stencil_read_mask(&mut self, _: pso::Face, _: pso::StencilValue) {
+        unimplemented!()
+    }
+
+    fn set_stencil_write_mask(&mut self, _: pso::Face, _: pso::StencilValue) {
+        unimplemented!()
+    }
 
     fn set_blend_constants(&mut self, _: pso::ColorValue) {
         unimplemented!()
     }
 
+    fn set_depth_bounds(&mut self, _: Range<f32>) {
+        unimplemented!()
+    }
 
-    fn begin_render_pass_raw<T>(
+    fn set_line_width(&mut self, _: f32) {
+        unimplemented!()
+    }
+
+    fn set_depth_bias(&mut self, _: pso::DepthBias) {
+        unimplemented!()
+    }
+
+    fn begin_render_pass<T>(
         &mut self,
         _: &(),
         _: &(),
@@ -551,10 +573,12 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn bind_graphics_descriptor_sets<I>(&mut self, _: &(), _: usize, _: I)
+    fn bind_graphics_descriptor_sets<I, J>(&mut self, _: &(), _: usize, _: I, _: J)
     where
         I: IntoIterator,
         I::Item: Borrow<()>,
+        J: IntoIterator,
+        J::Item: Borrow<command::DescriptorSetOffset>,
     {
         unimplemented!()
     }
@@ -563,10 +587,12 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn bind_compute_descriptor_sets<I>(&mut self, _: &(), _: usize, _: I)
+    fn bind_compute_descriptor_sets<I, J>(&mut self, _: &(), _: usize, _: I, _: J)
     where
         I: IntoIterator,
         I::Item: Borrow<()>,
+        J: IntoIterator,
+        J::Item: Borrow<command::DescriptorSetOffset>,
     {
         unimplemented!()
     }
@@ -643,7 +669,13 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn draw_indirect(&mut self, _: &(), _: buffer::Offset, _: u32, _: u32) {
+    fn draw_indirect(
+        &mut self,
+        _: &(),
+        _: buffer::Offset,
+        _: hal::DrawCount,
+        _: u32,
+    ) {
         unimplemented!()
     }
 
@@ -651,7 +683,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         &mut self,
         _: &(),
         _: buffer::Offset,
-        _: u32,
+        _: hal::DrawCount,
         _: u32,
     ) {
         unimplemented!()
@@ -723,6 +755,10 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
 #[derive(Debug)]
 pub struct DescriptorPool;
 impl pso::DescriptorPool<Backend> for DescriptorPool {
+    fn free_sets(&mut self, _descriptor_sets: &[()]) {
+        unimplemented!()
+    }
+
     fn reset(&mut self) {
         unimplemented!()
     }
@@ -735,9 +771,9 @@ impl hal::Surface<Backend> for Surface {
         unimplemented!()
     }
 
-    fn capabilities_and_formats(
+    fn compatibility(
         &self, _: &PhysicalDevice,
-    ) -> (hal::SurfaceCapabilities, Option<Vec<format::Format>>) {
+    ) -> (hal::SurfaceCapabilities, Option<Vec<format::Format>>, Vec<hal::PresentMode>) {
         unimplemented!()
     }
 
@@ -749,7 +785,7 @@ impl hal::Surface<Backend> for Surface {
 /// Dummy swapchain.
 pub struct Swapchain;
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_frame(&mut self, _: hal::FrameSync<Backend>) -> hal::Frame {
+    fn acquire_frame(&mut self, _: hal::FrameSync<Backend>) -> Result<hal::FrameImage, ()> {
         unimplemented!()
     }
 }

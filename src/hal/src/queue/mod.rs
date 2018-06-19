@@ -11,10 +11,11 @@ pub mod family;
 pub mod submission;
 
 use std::any::Any;
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 
 use error::HostExecutionError;
+use window::FrameImage;
 use Backend;
 
 pub use self::capability::{
@@ -61,11 +62,11 @@ pub trait RawCommandQueue<B: Backend>: Any + Send + Sync {
     /// list more than once.
     ///
     /// Unsafe for the same reasons as `submit_raw()`.
-    fn present<IS, IW>(&mut self, swapchains: IS, wait_semaphores: IW)
+    fn present<IS, S, IW>(&mut self, swapchains: IS, wait_semaphores: IW) -> Result<(), ()>
     where
         Self: Sized,
-        IS: IntoIterator,
-        IS::Item: BorrowMut<B::Swapchain>,
+        IS: IntoIterator<Item = (S, FrameImage)>,
+        S: Borrow<B::Swapchain>,
         IW: IntoIterator,
         IW::Item: Borrow<B::Semaphore>;
 
@@ -77,14 +78,29 @@ pub trait RawCommandQueue<B: Backend>: Any + Send + Sync {
 pub struct CommandQueue<B: Backend, C>(B::CommandQueue, PhantomData<C>);
 
 impl<B: Backend, C> CommandQueue<B, C> {
+    /// Create typed command queue from raw.
+    /// 
+    /// # Safety
+    /// 
+    /// `<C as Capability>::supported_by(queue_type)` must return true
+    /// for `queue_type` being the type this `raw` queue.
+    pub unsafe fn new(raw: B::CommandQueue) -> Self {
+        CommandQueue(raw, PhantomData)
+    }
+
     /// Get a reference to the raw command queue
     pub fn as_raw(&self) -> &B::CommandQueue {
         &self.0
     }
 
     /// Get a mutable reference to the raw command queue
-    pub fn as_mut(&mut self) -> &mut B::CommandQueue {
+    pub fn as_raw_mut(&mut self) -> &mut B::CommandQueue {
         &mut self.0
+    }
+
+    /// Downgrade a typed command queue to untyped one.
+    pub fn into_raw(self) -> B::CommandQueue {
+        self.0
     }
 
     /// Submits the submission command buffers to the queue for execution.
@@ -103,10 +119,10 @@ impl<B: Backend, C> CommandQueue<B, C> {
     /// Presents the result of the queue to the given swapchains, after waiting on all the
     /// semaphores given in `wait_semaphores`. A given swapchain must not appear in this
     /// list more than once.
-    pub fn present<IS, IW>(&mut self, swapchains: IS, wait_semaphores: IW)
+    pub fn present<IS, S, IW>(&mut self, swapchains: IS, wait_semaphores: IW) -> Result<(), ()>
     where
-        IS: IntoIterator,
-        IS::Item: BorrowMut<B::Swapchain>,
+        IS: IntoIterator<Item = (S, FrameImage)>,
+        S: Borrow<B::Swapchain>,
         IW: IntoIterator,
         IW::Item: Borrow<B::Semaphore>
     {
@@ -116,5 +132,15 @@ impl<B: Backend, C> CommandQueue<B, C> {
     /// Wait for the queue to idle.
     pub fn wait_idle(&self) -> Result<(), HostExecutionError> {
         self.0.wait_idle()
+    }
+
+    /// Downgrade a command queue to a lesser capability type.
+    pub fn downgrade<D>(&mut self) -> &mut CommandQueue<B, D>
+    where
+        C: Supports<D>,
+    {
+        unsafe {
+            ::std::mem::transmute(self)
+        }
     }
 }

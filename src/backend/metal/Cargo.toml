@@ -5,7 +5,7 @@ description = "Metal API backend for gfx-rs"
 homepage = "https://github.com/gfx-rs/gfx"
 repository = "https://github.com/gfx-rs/gfx"
 keywords = ["graphics", "gamedev"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 authors = ["The Gfx-rs Developers"]
 readme = "README.md"
 documentation = "https://docs.rs/gfx-backend-metal"
@@ -13,21 +13,25 @@ workspace = "../../.."
 
 [features]
 default = ["winit"]
-metal_default_capture_scope=[]
+auto-capture = []
 
 [lib]
 name = "gfx_backend_metal"
 
 [dependencies]
+derivative = "1"
 gfx-hal = { path = "../../hal", version = "0.1" }
+bitflags = "1.0"
 log = "0.4"
-winit = { version = "0.11", optional = true }
-metal-rs = "0.6.5"
+winit = { git = "https://github.com/jTitor/winit", version = "^0.15.1", optional = true }
+metal-rs = "0.10.1"
 foreign-types = "0.3"
 objc = "0.2"
 block = "0.1"
-cocoa = "0.13"
-core-foundation = "0.4.6"
-core-graphics = "0.12"
-io-surface = "0.8"
-spirv_cross = "0.7"
+cocoa = "0.15"
+core-foundation = "0.6"
+core-graphics = "0.14"
+io-surface = "0.10"
+smallvec = "0.6"
+spirv_cross = "0.9.2"
+fxhash = "0.2.1"

@@ -7,6 +7,7 @@ use std::fmt;
 use std::ops::Range;
 
 use format;
+use buffer::Offset as RawOffset;
 use pso::Comparison;
 
 
@@ -22,7 +23,7 @@ pub type Level = u8;
 pub const MAX_LEVEL: Level = 15;
 
 /// Describes the size of an image, which may be up to three dimensional.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Extent {
     /// Image width
@@ -31,6 +32,17 @@ pub struct Extent {
     pub height: Size,
     /// Image depth.
     pub depth: Size,
+}
+
+impl Extent {
+    /// Get the extent at a particular mipmap level.
+    pub fn at_level(&self, level: Level) -> Self {
+        Extent {
+            width: 1.max(self.width >> level),
+            height: 1.max(self.height >> level),
+            depth: 1.max(self.depth >> level),
+        }
+    }
 }
 
 ///
@@ -46,8 +58,18 @@ pub struct Offset {
 }
 
 impl Offset {
-    /// Zero offset shortcut
+    /// Zero offset shortcut.
     pub const ZERO: Self = Offset { x: 0, y: 0, z: 0 };
+
+    /// Convert the offset into 2-sided bounds given the extent.
+    pub fn into_bounds(self, extent: &Extent) -> Range<Offset> {
+        let end = Offset {
+            x: self.x + extent.width as i32,
+            y: self.y + extent.height as i32,
+            z: self.z + extent.depth as i32,
+        };
+        self .. end
+    }
 }
 
 /// Image tiling modes.
@@ -306,7 +328,7 @@ impl Kind {
             _ => {
                 let extent = self.extent();
                 let dominant = max(max(extent.width, extent.height), extent.depth);
-                (1..).find(|level| dominant>>level <= 1).unwrap()
+                (1..).find(|level| dominant>>level == 0).unwrap()
             }
         }
     }
@@ -689,4 +711,18 @@ pub struct FormatProperties {
     pub sample_count_mask: NumSamples,
     /// Maximum size of the resource in bytes.
     pub max_resource_size: usize,
+}
+
+/// Footprint of a subresource in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SubresourceFootprint {
+    /// Byte slice occupied by the subresource.
+    pub slice: Range<RawOffset>,
+    /// Byte distance between rows.
+    pub row_pitch: RawOffset,
+    /// Byte distance between array layers.
+    pub array_pitch: RawOffset,
+    /// Byte distance between depth slices.
+    pub depth_pitch: RawOffset,
 }

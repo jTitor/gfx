@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::ptr;
 use std::sync::Arc;
 use std::os::raw::c_void;
@@ -295,7 +294,9 @@ impl hal::Surface<Backend> for Surface {
         hal::image::Kind::D2(self.width, self.height, 1, self.samples)
     }
 
-    fn capabilities_and_formats(&self, physical_device: &PhysicalDevice) -> (hal::SurfaceCapabilities, Option<Vec<Format>>) {
+    fn compatibility(
+        &self, physical_device: &PhysicalDevice
+    ) -> (hal::SurfaceCapabilities, Option<Vec<Format>>, Vec<hal::PresentMode>) {
         // Capabilities
         let caps =
             self.raw.functor.get_physical_device_surface_capabilities_khr(
@@ -332,7 +333,7 @@ impl hal::Surface<Backend> for Surface {
             image_count: caps.min_image_count..max_images,
             current_extent,
             extents: min_extent..max_extent,
-            max_image_layers: caps.max_image_array_layers,
+            max_image_layers: caps.max_image_array_layers as _,
         };
 
         // Swapchain formats
@@ -349,14 +350,24 @@ impl hal::Surface<Backend> for Surface {
             vk::Format::Undefined => None,
             _ => {
                 Some(formats
-                    .iter()
+                    .into_iter()
                     .filter_map(|sf| conv::map_vk_format(sf.format))
                     .collect()
                 )
             }
         };
 
-        (capabilities, formats)
+        let present_modes =
+            self.raw.functor.get_physical_device_surface_present_modes_khr(
+                physical_device.handle,
+                self.raw.handle,
+            ).expect("Unable to query present modes");
+        let present_modes = present_modes
+            .into_iter()
+            .map(conv::map_vk_present_mode)
+            .collect();
+
+        (capabilities, formats, present_modes)
     }
 
     fn supports_queue_family(&self, queue_family: &QueueFamily) -> bool {
@@ -371,13 +382,11 @@ impl hal::Surface<Backend> for Surface {
 pub struct Swapchain {
     pub(crate) raw: vk::SwapchainKHR,
     pub(crate) functor: ext::Swapchain,
-    // Queued up frames for presentation
-    pub(crate) frame_queue: VecDeque<usize>,
 }
 
 
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_frame(&mut self, sync: hal::FrameSync<Backend>) -> hal::Frame {
+    fn acquire_frame(&mut self, sync: hal::FrameSync<Backend>) -> Result<hal::FrameImage, ()> {
         let (semaphore, fence) = match sync {
             hal::FrameSync::Semaphore(semaphore) => (semaphore.0, vk::Fence::null()),
             hal::FrameSync::Fence(fence) => (vk::Semaphore::null(), fence.0),
@@ -386,9 +395,12 @@ impl hal::Swapchain<Backend> for Swapchain {
         let index = unsafe {
             // will block if no image is available
             self.functor.acquire_next_image_khr(self.raw, !0, semaphore, fence)
-        }.expect("Unable to acquire a swapchain image");
+        };
 
-        self.frame_queue.push_back(index as usize);
-        hal::Frame::new(index as usize)
+        match index {
+            Ok(i) => Ok(i),
+            Err(vk::Result::SuboptimalKhr) | Err(vk::Result::ErrorOutOfDateKhr) => Err(()),
+            _ => panic!("Failed to acquire image."),
+        }
     }
 }

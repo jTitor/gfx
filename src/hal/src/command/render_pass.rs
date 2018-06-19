@@ -3,11 +3,11 @@ use std::ops::{Range, Deref, DerefMut};
 use std::marker::PhantomData;
 
 use {buffer, pso};
-use {Backend, IndexCount, InstanceCount, VertexCount, VertexOffset};
+use {Backend, DrawCount, IndexCount, InstanceCount, VertexCount, VertexOffset};
 use queue::{Supports, Graphics};
 use super::{
-    AttachmentClear, ClearValue, CommandBuffer, RawCommandBuffer,
-    Shot, Level, Primary, Secondary, Submittable, Submit
+    AttachmentClear, ClearValue, ClearValueRaw, CommandBuffer, RawCommandBuffer,
+    Shot, Level, Primary, Secondary, Submittable, Submit, DescriptorSetOffset,
 };
 
 /// Specifies how commands for the following renderpasses will be recorded.
@@ -35,7 +35,7 @@ impl<'a, B: Backend> RenderSubpassCommon<'a, B> {
         T: IntoIterator,
         T::Item: Borrow<AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<pso::Rect>,
+        U::Item: Borrow<pso::ClearRect>,
     {
         self.0.clear_attachments(clears, rects)
     }
@@ -49,12 +49,13 @@ impl<'a, B: Backend> RenderSubpassCommon<'a, B> {
     pub fn draw_indexed(&mut self, indices: Range<IndexCount>, base_vertex: VertexOffset, instances: Range<InstanceCount>) {
         self.0.draw_indexed(indices, base_vertex, instances)
     }
+
     ///
-    pub fn draw_indirect(&mut self, buffer: &B::Buffer, offset: buffer::Offset, draw_count: u32, stride: u32) {
+    pub fn draw_indirect(&mut self, buffer: &B::Buffer, offset: buffer::Offset, draw_count: DrawCount, stride: u32) {
         self.0.draw_indirect(buffer, offset, draw_count, stride)
     }
     ///
-    pub fn draw_indexed_indirect(&mut self, buffer: &B::Buffer, offset: buffer::Offset, draw_count: u32, stride: u32) {
+    pub fn draw_indexed_indirect(&mut self, buffer: &B::Buffer, offset: buffer::Offset, draw_count: DrawCount, stride: u32) {
         self.0.draw_indexed_indirect(buffer, offset, draw_count, stride)
     }
 
@@ -64,8 +65,8 @@ impl<'a, B: Backend> RenderSubpassCommon<'a, B> {
     }
 
     ///
-    pub fn bind_vertex_buffers(&mut self, vbs: pso::VertexBufferSet<B>) {
-        self.0.bind_vertex_buffers(vbs);
+    pub fn bind_vertex_buffers(&mut self, first_binding: u32, vbs: pso::VertexBufferSet<B>) {
+        self.0.bind_vertex_buffers(first_binding, vbs);
     }
 
     ///
@@ -74,39 +75,52 @@ impl<'a, B: Backend> RenderSubpassCommon<'a, B> {
     }
 
     ///
-    pub fn bind_graphics_descriptor_sets<T>(
+    pub fn bind_graphics_descriptor_sets<I, J>(
         &mut self,
         layout: &B::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<B::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<B::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<DescriptorSetOffset>,
     {
-        self.0.bind_graphics_descriptor_sets(layout, first_set, sets)
+        self.0.bind_graphics_descriptor_sets(layout, first_set, sets, offsets)
     }
 
     ///
-    pub fn set_viewports<T>(&mut self, viewports: T)
+    pub fn set_viewports<T>(&mut self, first_viewport: u32, viewports: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Viewport>,
     {
-        self.0.set_viewports(viewports)
+        self.0.set_viewports(first_viewport, viewports)
     }
 
     ///
-    pub fn set_scissors<T>(&mut self, scissors: T)
+    pub fn set_scissors<T>(&mut self, first_scissor: u32, scissors: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Rect>,
     {
-        self.0.set_scissors(scissors)
+        self.0.set_scissors(first_scissor, scissors)
     }
 
     ///
-    pub fn set_stencil_reference(&mut self, front: pso::StencilValue, back: pso::StencilValue) {
-        self.0.set_stencil_reference(front, back)
+    pub fn set_stencil_reference(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        self.0.set_stencil_reference(faces, value);
+    }
+
+    ///
+    pub fn set_stencil_read_mask(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        self.0.set_stencil_read_mask(faces, value);
+    }
+
+    ///
+    pub fn set_stencil_write_mask(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        self.0.set_stencil_write_mask(faces, value);
     }
 
     ///
@@ -115,15 +129,25 @@ impl<'a, B: Backend> RenderSubpassCommon<'a, B> {
     }
 
     ///
+    pub fn set_depth_bounds(&mut self, bounds: Range<f32>) {
+        self.0.set_depth_bounds(bounds)
+    }
+
+    ///
     pub fn push_graphics_constants(&mut self, layout: &B::PipelineLayout, stages: pso::ShaderStageFlags, offset: u32, constants: &[u32]) {
         self.0.push_graphics_constants(layout, stages, offset, constants);
     }
 
-    // TODO: set_line_width
-    // TODO: set_depth_bounds
-    // TODO: set_depth_bias
-    // TODO: set_stencil_compare_mask
-    // TODO: set_stencil_write_mask
+    ///
+    pub fn set_line_width(&mut self, width: f32) {
+        self.0.set_line_width(width);
+    }
+
+    ///
+    pub fn set_depth_bias(&mut self, depth_bias: pso::DepthBias) {
+        self.0.set_depth_bias(depth_bias);
+    }
+
     // TODO: pipeline barrier (postponed)
     // TODO: begin/end query
 }
@@ -148,13 +172,22 @@ impl<'a, B: Backend, L: Level> RenderPassInlineEncoder<'a, B, L> {
         T: IntoIterator,
         T::Item: Borrow<ClearValue>,
     {
+        let clear_values = clear_values
+            .into_iter()
+            .map(|cv| ClearValueRaw::from(*cv.borrow()));
+
         cmd_buffer.raw.begin_render_pass(
             render_pass,
             frame_buffer,
             render_area,
             clear_values,
-            SubpassContents::Inline);
-        RenderPassInlineEncoder(Some(RenderSubpassCommon(cmd_buffer.raw)), PhantomData)
+            SubpassContents::Inline,
+        );
+
+        RenderPassInlineEncoder(
+            Some(RenderSubpassCommon(cmd_buffer.raw)),
+            PhantomData,
+        )
     }
 
     /// Start the next subpass.
@@ -216,14 +249,21 @@ impl<'a, B: Backend> RenderPassSecondaryEncoder<'a, B> {
         T: IntoIterator,
         T::Item: Borrow<ClearValue>,
     {
+        let clear_values = clear_values
+            .into_iter()
+            .map(|cv| ClearValueRaw::from(*cv.borrow()));
+
         cmd_buffer.raw.begin_render_pass(
             render_pass,
             frame_buffer,
             render_area,
             clear_values,
-            SubpassContents::SecondaryBuffers
+            SubpassContents::SecondaryBuffers,
         );
-        RenderPassSecondaryEncoder(Some(cmd_buffer.raw))
+
+        RenderPassSecondaryEncoder(
+            Some(cmd_buffer.raw),
+        )
     }
 
     /// Executes the given commands as a secondary command buffer.

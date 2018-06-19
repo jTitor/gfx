@@ -1,10 +1,8 @@
 RUST_BACKTRACE:=1
 EXCLUDES:=
-FEATURES_RENDER:=
 FEATURES_EXTRA:=mint serialize
 FEATURES_HAL:=
 FEATURES_HAL2:=
-CMD_QUAD_RENDER:=cargo check
 
 SDL2_DEST=$(HOME)/deps
 SDL2_CONFIG=$(SDL2_DEST)/usr/bin/sdl2-config
@@ -18,12 +16,14 @@ ifeq ($(OS),Windows_NT)
 		# No d3d12 support on GNU windows ATM
 		# context: https://github.com/gfx-rs/gfx/pull/1417
 		EXCLUDES+= --exclude gfx-backend-dx12
+		EXCLUDES+= --exclude gfx-backend-dx11
 	else
 		FEATURES_HAL2=dx12
 	endif
 else
 	UNAME_S:=$(shell uname -s)
 	EXCLUDES+= --exclude gfx-backend-dx12
+	EXCLUDES+= --exclude gfx-backend-dx11
 	GLUTIN_HEADLESS_FEATURE="--features headless" #TODO?
 	ifeq ($(UNAME_S),Linux)
 		EXCLUDES+= --exclude gfx-backend-metal
@@ -31,9 +31,7 @@ else
 	endif
 	ifeq ($(UNAME_S),Darwin)
 		EXCLUDES+= --exclude gfx-backend-vulkan
-		EXCLUDES+= --exclude quad-render
 		FEATURES_HAL=metal
-		CMD_QUAD_RENDER=pwd
 	endif
 endif
 
@@ -48,22 +46,20 @@ help:
 check:
 	@echo "Note: excluding \`warden\` here, since it depends on serialization"
 	cargo check --all $(EXCLUDES) --exclude gfx-warden
-	cd examples/hal && cargo check --features "gl"
-	cd examples/hal && cargo check --features "$(FEATURES_HAL)"
-	cd examples/hal && cargo check --features "$(FEATURES_HAL2)"
-	cd examples/render/quad_render && $(CMD_QUAD_RENDER)
+	cd examples && cargo check --features "gl"
+	cd examples && cargo check --features "$(FEATURES_HAL)"
+	cd examples && cargo check --features "$(FEATURES_HAL2)"
 	cd src/warden && cargo check --no-default-features
 	cd src/warden && cargo check --features "env_logger gl gl-headless $(FEATURES_HAL) $(FEATURES_HAL2)"
 
 test:
 	cargo test --all $(EXCLUDES)
-	cd src/render && cargo test --features "$(FEATURES_RENDER) $(FEATURES_EXTRA)"
 
 reftests:
-	cd src/warden && cargo test --features "gl"
 	cd src/warden && cargo run --features "$(FEATURES_HAL) $(FEATURES_HAL2)" -- local #TODO: gl
 
 reftests-ci:
+	cd src/warden && cargo test --features "gl"
 	cd src/warden && cargo run --features "gl" -- ci #TODO: "gl-headless"
 
 travis-sdl2:

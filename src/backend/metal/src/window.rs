@@ -1,30 +1,33 @@
-use {Backend, QueueFamily};
-use {native, conversions};
+use {AutoreleasePool, Backend, QueueFamily};
+use internal::Channel;
+use native;
 use device::{Device, PhysicalDevice};
 
-use std::sync::{Arc, Mutex};
+use std::{fmt, ops};
+use std::sync::{Arc, Mutex, RwLock};
 
 use hal::{self, format, image};
 use hal::{Backbuffer, SwapchainConfig};
 use hal::window::Extent2D;
 
-use metal::{self, MTLPixelFormat, MTLTextureUsage};
+use metal;
 use objc::runtime::{Object};
-use core_foundation::base::TCFType;
-use core_foundation::string::{CFString, CFStringRef};
-use core_foundation::dictionary::CFDictionary;
-use core_foundation::number::{CFNumber, CFNumberRef};
 use core_graphics::base::CGFloat;
 use core_graphics::geometry::CGRect;
 use cocoa::foundation::{NSRect};
-use io_surface::{self, IOSurface};
 
 
-pub struct Surface(pub(crate) Arc<SurfaceInner>);
+pub type CAMetalLayer = *mut Object;
+pub type CADrawable = *mut Object;
+
+pub struct Surface {
+    pub(crate) inner: Arc<SurfaceInner>,
+    pub(crate) apply_pixel_scale: bool,
+}
 
 pub(crate) struct SurfaceInner {
     pub(crate) nsview: *mut Object,
-    pub(crate) render_layer: Mutex<*mut Object>,
+    pub(crate) render_layer: Mutex<CAMetalLayer>,
 }
 
 unsafe impl Send for SurfaceInner {}
@@ -36,27 +39,65 @@ impl Drop for SurfaceInner {
     }
 }
 
+pub struct SwapchainInner {
+    frames: Vec<Option<(CADrawable, metal::Texture)>>,
+}
+
+impl ops::Index<hal::FrameImage> for SwapchainInner {
+    type Output = metal::TextureRef;
+    fn index(&self, index: hal::FrameImage) -> &Self::Output {
+        self.frames[index as usize]
+            .as_ref()
+            .map(|&(_, ref tex)| tex)
+            .expect("Frame texture is not resident!")
+    }
+}
+
+unsafe impl Send for SwapchainInner {}
+unsafe impl Sync for SwapchainInner {}
+
+impl fmt::Debug for SwapchainInner {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Swapchain with {} image", self.frames.len())
+    }
+}
+
+impl Drop for SwapchainInner {
+    fn drop(&mut self) {
+        for maybe in self.frames.drain(..) {
+            if let Some((drawable, _)) = maybe {
+                unsafe {
+                    msg_send![drawable, release];
+                }
+            }
+        }
+    }
+}
+
 pub struct Swapchain {
-     surface: Arc<SurfaceInner>,
+    inner: Arc<RwLock<SwapchainInner>>,
+    surface: Arc<SurfaceInner>,
     _size_pixels: (u64, u64),
-    io_surfaces: Vec<IOSurface>,
-    frame_index: usize,
-    present_index: usize,
 }
 
 unsafe impl Send for Swapchain {}
 unsafe impl Sync for Swapchain {}
 
 impl Swapchain {
-    pub(crate) fn present(&mut self) -> (&SurfaceInner, &mut IOSurface) {
-        let id = self.present_index;
-        self.present_index = (id + 1) % self.io_surfaces.len();
-        (&*self.surface, &mut self.io_surfaces[id])
+    pub(crate) fn present(&self, index: hal::FrameImage) {
+        let (drawable, _) = self.inner
+            .write()
+            .unwrap()
+            .frames[index as usize]
+            .take()
+            .expect("Frame is not ready to present!");
+        unsafe {
+            msg_send![drawable, present];
+            msg_send![drawable, release];
+        }
     }
 }
 
-#[allow(bad_style)]
-const kCVPixelFormatType_32RGBA: u32 = (b'R' as u32) << 24 | (b'G' as u32) << 16 | (b'B' as u32) << 8 | b'A' as u32;
 
 impl hal::Surface<Backend> for Surface {
     fn kind(&self) -> image::Kind {
@@ -65,17 +106,33 @@ impl hal::Surface<Backend> for Surface {
         image::Kind::D2(width, height, 1, 1)
     }
 
-    fn capabilities_and_formats(
+    fn compatibility(
         &self, _: &PhysicalDevice,
-    ) -> (hal::SurfaceCapabilities, Option<Vec<format::Format>>) {
+    ) -> (hal::SurfaceCapabilities, Option<Vec<format::Format>>, Vec<hal::PresentMode>) {
+        let render_layer_borrow = self.inner.render_layer.lock().unwrap();
+        let render_layer = *render_layer_borrow;
+        let max_frames: u64 = unsafe {
+            msg_send![render_layer, maximumDrawableCount]
+        };
+
         let caps = hal::SurfaceCapabilities {
-            image_count: 1..8,
+            image_count: 1 .. max_frames as hal::FrameImage,
             current_extent: None,
             extents: Extent2D { width: 4, height: 4} .. Extent2D { width: 4096, height: 4096 },
             max_image_layers: 1,
         };
-        let formats = Some(vec![format::Format::Rgba8Srgb]);
-        (caps, formats)
+
+        let formats = vec![
+            format::Format::Bgra8Unorm,
+            format::Format::Bgra8Srgb,
+            format::Format::Rgba16Float,
+        ];
+        let present_modes = vec![
+            hal::PresentMode::Fifo,
+            hal::PresentMode::Immediate,
+        ];
+
+        (caps, Some(formats), present_modes)
     }
 
     fn supports_queue_family(&self, _queue_family: &QueueFamily) -> bool {
@@ -87,87 +144,98 @@ impl Surface {
     fn pixel_dimensions(&self) -> (image::Size, image::Size) {
         unsafe {
             // NSView bounds are measured in DIPs
-            let bounds: NSRect = msg_send![self.0.nsview, bounds];
-            (bounds.size.width as _, bounds.size.height as _)
+            let bounds: NSRect = msg_send![self.inner.nsview, bounds];
+            let bounds_pixel: NSRect = msg_send![self.inner.nsview, convertRectToBacking:bounds];
+            (bounds_pixel.size.width as _, bounds_pixel.size.height as _)
         }
     }
 }
 
 impl Device {
-    pub fn build_swapchain(
+    pub(crate) fn build_swapchain(
         &self,
         surface: &mut Surface,
         config: SwapchainConfig,
     ) -> (Swapchain, Backbuffer<Backend>) {
-        let format_desc = config.color_format.base_format().0.desc();
-        let (mtl_format, cv_format) = match config.color_format {
-            format::Format::Rgba8Srgb => (MTLPixelFormat::RGBA8Unorm_sRGB, kCVPixelFormatType_32RGBA),
-            _ => panic!("unsupported backbuffer format"), // TODO: more formats
-        };
+        let mtl_format = self.private_caps
+            .map_format(config.color_format)
+            .expect("unsupported backbuffer format");
 
-        let render_layer_borrow = surface.0.render_layer.lock().unwrap();
+        let render_layer_borrow = surface.inner.render_layer.lock().unwrap();
         let render_layer = *render_layer_borrow;
-        let nsview = surface.0.nsview;
+        let nsview = surface.inner.nsview;
+        let format_desc = config.color_format.surface_desc();
+        let framebuffer_only = config.image_usage == image::Usage::COLOR_ATTACHMENT;
+        let display_sync = match config.present_mode {
+            hal::PresentMode::Immediate => false,
+            _ => true,
+        };
+        let device = self.shared.device.lock().unwrap();
+        let device_raw: &metal::DeviceRef = &*device;
 
-        unsafe {
+        let (view_size, scale_factor) = unsafe {
+            msg_send![render_layer, setDevice: device_raw];
+            msg_send![render_layer, setPixelFormat: mtl_format];
+            msg_send![render_layer, setFramebufferOnly: framebuffer_only];
+            //TODO: only set it where supported
+            msg_send![render_layer, setDisplaySyncEnabled: display_sync];
+
             // Update render layer size
             let view_points_size: CGRect = msg_send![nsview, bounds];
             msg_send![render_layer, setBounds: view_points_size];
+
             let view_window: *mut Object = msg_send![nsview, window];
             if view_window.is_null() {
                 panic!("surface is not attached to a window");
             }
-            let scale_factor: CGFloat = msg_send![view_window, backingScaleFactor];
-            msg_send![render_layer, setContentsScale: scale_factor];
-            let pixel_width = view_points_size.size.width as u64;
-            let pixel_height = view_points_size.size.height as u64;
-            let pixel_size = conversions::get_format_bytes_per_pixel(mtl_format) as i32;
-
-            info!("allocating {} IOSurface backbuffers of size {}x{} with pixel format 0x{:x}", config.image_count, pixel_width, pixel_height, cv_format);
-            // Create swap chain surfaces
-            let io_surfaces: Vec<_> = (0..config.image_count).map(|_| {
-                io_surface::new(&CFDictionary::from_CFType_pairs::<CFStringRef, CFNumberRef, CFString, CFNumber>(&[
-                    (TCFType::wrap_under_get_rule(io_surface::kIOSurfaceWidth), CFNumber::from(pixel_width as i32)),
-                    (TCFType::wrap_under_get_rule(io_surface::kIOSurfaceHeight), CFNumber::from(pixel_height as i32)),
-                    (TCFType::wrap_under_get_rule(io_surface::kIOSurfaceBytesPerRow), CFNumber::from(pixel_width as i32 * pixel_size)),
-                    (TCFType::wrap_under_get_rule(io_surface::kIOSurfaceBytesPerElement), CFNumber::from(pixel_size)),
-                    (TCFType::wrap_under_get_rule(io_surface::kIOSurfacePixelFormat), CFNumber::from(cv_format as i32)),
-                ]))
-            }).collect();
-
-            let backbuffer_descriptor = metal::TextureDescriptor::new();
-            backbuffer_descriptor.set_pixel_format(mtl_format);
-            backbuffer_descriptor.set_width(pixel_width);
-            backbuffer_descriptor.set_height(pixel_height);
-            backbuffer_descriptor.set_usage(MTLTextureUsage::MTLTextureUsageRenderTarget);
-
-            let images = io_surfaces.iter().map(|surface| {
-                let mapped_texture: metal::Texture = msg_send![self.device.as_ref(),
-                    newTextureWithDescriptor: &*backbuffer_descriptor
-                    iosurface: surface.obj
-                    plane: 0
-                ];
-                native::Image {
-                    raw: mapped_texture,
-                    format_desc,
-                }
-            }).collect();
-
-            let swapchain = Swapchain {
-                surface: surface.0.clone(),
-                _size_pixels: (pixel_width, pixel_height),
-                io_surfaces,
-                frame_index: 0,
-                present_index: 0,
+            let scale_factor: CGFloat = if surface.apply_pixel_scale {
+                msg_send![view_window, backingScaleFactor]
+            } else {
+                1.0
             };
+            msg_send![render_layer, setContentsScale: scale_factor];
+            info!("view points size {:?} scale factor {:?}", view_points_size, scale_factor);
+            (view_points_size.size, scale_factor)
+        };
 
-            (swapchain, Backbuffer::Images(images))
-        }
+        let pixel_width = (view_size.width * scale_factor) as u64;
+        let pixel_height = (view_size.height * scale_factor) as u64;
+
+        let inner = SwapchainInner {
+            frames: (0 .. config.image_count).map(|_| None).collect(),
+        };
+
+        let swapchain = Swapchain {
+            inner: Arc::new(RwLock::new(inner)),
+            surface: surface.inner.clone(),
+            _size_pixels: (pixel_width, pixel_height),
+        };
+
+        let images = (0 .. config.image_count)
+            .map(|index| native::Image {
+                root: native::ImageRoot::Frame(native::Frame {
+                    swapchain: swapchain.inner.clone(),
+                    index,
+                }),
+                extent: image::Extent {
+                    width: pixel_width as _,
+                    height: pixel_height as _,
+                    depth: 1,
+                },
+                num_layers: None,
+                format_desc,
+                shader_channel: Channel::Float,
+                mtl_format,
+                mtl_type: metal::MTLTextureType::D2,
+            })
+            .collect();
+
+        (swapchain, Backbuffer::Images(images))
     }
 }
 
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_frame(&mut self, sync: hal::FrameSync<Backend>) -> hal::Frame {
+    fn acquire_frame(&mut self, sync: hal::FrameSync<Backend>) -> Result<hal::FrameImage, ()> {
         unsafe {
             match sync {
                 hal::FrameSync::Semaphore(semaphore) => {
@@ -176,11 +244,27 @@ impl hal::Swapchain<Backend> for Swapchain {
                 },
                 hal::FrameSync::Fence(_fence) => unimplemented!(),
             }
-
-            let frame = hal::Frame::new(self.frame_index % self.io_surfaces.len());
-            self.frame_index += 1;
-            frame
         }
+
+        let mut inner = self.inner.write().unwrap();
+        let index = inner.frames
+            .iter_mut()
+            .position(|d| d.is_none())
+            .expect("No frame available to acquire!");
+
+        debug!("acquired frame {}", index);
+        let layer = self.surface.render_layer.lock().unwrap();
+
+        let _ap = AutoreleasePool::new(); // for the drawable
+        inner.frames[index] = Some(unsafe {
+            let drawable: *mut Object = msg_send![*layer, nextDrawable];
+            assert!(!drawable.is_null());
+            let texture: metal::Texture = msg_send![drawable, texture];
+            msg_send![drawable, retain];
+            msg_send![texture, retain];
+            (drawable, texture)
+        });
+
+        Ok(index as _)
     }
 }
-

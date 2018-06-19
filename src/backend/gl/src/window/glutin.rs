@@ -51,10 +51,10 @@ use glutin::{self, GlContext};
 
 
 fn get_window_extent(window: &glutin::GlWindow) -> image::Extent {
-    let (width, height) = window.get_inner_size().unwrap();
+    let inner_size = window.get_inner_size().unwrap();
     image::Extent {
-        width: (width as f32 * window.hidpi_factor()) as image::Size,
-        height: (height as f32 * window.hidpi_factor()) as image::Size,
+        width: (inner_size.width * window.get_hidpi_factor()) as image::Size,
+        height: (inner_size.width * window.get_hidpi_factor()) as image::Size,
         depth: 1,
     }
 }
@@ -65,9 +65,9 @@ pub struct Swapchain {
 }
 
 impl hal::Swapchain<B> for Swapchain {
-    fn acquire_frame(&mut self, _sync: hal::FrameSync<B>) -> hal::Frame {
+    fn acquire_frame(&mut self, _sync: hal::FrameSync<B>) -> Result<hal::FrameImage, ()> {
         // TODO: sync
-        hal::Frame::new(0)
+        Ok(0)
     }
 }
 
@@ -83,6 +83,10 @@ impl Surface {
         Surface {
             window: Starc::new(window)
         }
+    }
+
+    pub fn get_window(&self) -> &glutin::GlWindow {
+        &*self.window
     }
 
     pub fn window(&self) -> &glutin::GlWindow {
@@ -120,11 +124,13 @@ impl hal::Surface<B> for Surface {
         hal::image::Kind::D2(ex.width, ex.height, 1, samples as _)
     }
 
-    fn capabilities_and_formats(&self, _: &PhysicalDevice) -> (hal::SurfaceCapabilities, Option<Vec<f::Format>>) {
+    fn compatibility(
+        &self, _: &PhysicalDevice
+    ) -> (hal::SurfaceCapabilities, Option<Vec<f::Format>>, Vec<hal::PresentMode>) {
         let ex = get_window_extent(&self.window);
         let extent = hal::window::Extent2D::from(ex);
 
-        (hal::SurfaceCapabilities {
+        let caps = hal::SurfaceCapabilities {
             image_count: if self.window.get_pixel_format().double_buffer { 2..3 } else { 1..2 },
             current_extent: Some(extent),
             extents: extent .. hal::window::Extent2D {
@@ -132,7 +138,10 @@ impl hal::Surface<B> for Surface {
                 height: ex.height + 1,
             },
             max_image_layers: 1,
-        }, Some(self.swapchain_formats()))
+        };
+        let present_modes = vec![hal::PresentMode::Fifo]; //TODO
+
+        (caps, Some(self.swapchain_formats()), present_modes)
     }
 
     fn supports_queue_family(&self, _: &QueueFamily) -> bool { true }

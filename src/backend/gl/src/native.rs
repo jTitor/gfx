@@ -45,7 +45,7 @@ pub struct GraphicsPipeline {
     pub(crate) patch_size: Option<gl::types::GLint>,
     pub(crate) blend_targets: Vec<pso::ColorBlendDesc>,
     pub(crate) attributes: Vec<AttributeDesc>,
-    pub(crate) vertex_buffers: Vec<pso::VertexBufferDesc>,
+    pub(crate) vertex_buffers: Vec<Option<pso::VertexBufferDesc>>,
 }
 
 #[derive(Clone, Debug, Copy)]
@@ -91,16 +91,20 @@ pub struct DescriptorSet;
 pub struct DescriptorPool {}
 
 impl pso::DescriptorPool<Backend> for DescriptorPool {
-    fn allocate_sets<I>(&mut self, layouts: I) -> Vec<DescriptorSet>
+    fn allocate_sets<I>(&mut self, layouts: I) -> Vec<Result<DescriptorSet, pso::AllocationError>>
     where
         I: IntoIterator,
         I::Item: Borrow<DescriptorSetLayout>,
     {
-        layouts.into_iter().map(|_| DescriptorSet).collect()
+        layouts.into_iter().map(|_| Ok(DescriptorSet)).collect()
+    }
+
+    fn free_sets(&mut self, _descriptor_sets: &[DescriptorSet]) {
+        // Poof!  Does nothing, because OpenGL doesn't have a meaningful concept of a `DescriptorSet`.
     }
 
     fn reset(&mut self) {
-        unimplemented!()
+        // Poof!  Does nothing, because OpenGL doesn't have a meaningful concept of a `DescriptorSet`.
     }
 }
 

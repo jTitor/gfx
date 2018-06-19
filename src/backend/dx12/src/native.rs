@@ -3,8 +3,9 @@ use winapi::shared::dxgiformat::DXGI_FORMAT;
 use winapi::um::{d3d12, d3dcommon};
 use wio::com::ComPtr;
 
+use range_alloc::RangeAllocator;
 use hal::{format, image, pass, pso, DescriptorPool as HalDescriptorPool};
-use {free_list, Backend, MAX_VERTEX_BUFFERS};
+use {Backend, MAX_VERTEX_BUFFERS};
 use root_constants::RootConstant;
 
 use std::collections::BTreeMap;
@@ -58,7 +59,9 @@ pub struct SubpassDesc {
     pub(crate) color_attachments: Vec<pass::AttachmentRef>,
     pub(crate) depth_stencil_attachment: Option<pass::AttachmentRef>,
     pub(crate) input_attachments: Vec<pass::AttachmentRef>,
+    pub(crate) resolve_attachments: Vec<pass::AttachmentRef>,
     pub(crate) pre_barriers: Vec<BarrierDesc>,
+    pub(crate) post_barriers: Vec<BarrierDesc>,
 }
 
 impl SubpassDesc {
@@ -68,6 +71,7 @@ impl SubpassDesc {
         self.color_attachments.iter()
             .chain(self.depth_stencil_attachment.iter())
             .chain(self.input_attachments.iter())
+            .chain(self.resolve_attachments.iter())
             .any(|&(id, _)| id == at_id)
     }
 }
@@ -79,6 +83,19 @@ pub struct RenderPass {
     pub(crate) post_barriers: Vec<BarrierDesc>,
 }
 
+// Indirection layer attribute -> remap -> binding.
+//
+// Required as vulkan allows attribute offsets larger than the stride.
+// Storing the stride specified in the pipeline required for vertex buffer binding.
+#[derive(Copy, Clone, Debug)]
+pub struct VertexBinding {
+    // Map into the specified bindings on pipeline creation.
+    pub mapped_binding: usize,
+    pub stride: UINT,
+    // Additional offset to rebase the attributes.
+    pub offset: u32,
+}
+
 #[derive(Debug)]
 pub struct GraphicsPipeline {
     pub(crate) raw: *mut d3d12::ID3D12PipelineState,
@@ -86,7 +103,7 @@ pub struct GraphicsPipeline {
     pub(crate) num_parameter_slots: usize, // signature parameter slots, see `PipelineLayout`
     pub(crate) topology: d3d12::D3D12_PRIMITIVE_TOPOLOGY,
     pub(crate) constants: Vec<RootConstant>,
-    pub(crate) vertex_strides: [UINT; MAX_VERTEX_BUFFERS],
+    pub(crate) vertex_bindings: [Option<VertexBinding>; MAX_VERTEX_BUFFERS],
     pub(crate) baked_states: pso::BakedStates,
 }
 unsafe impl Send for GraphicsPipeline { }
@@ -131,39 +148,61 @@ unsafe impl Sync for PipelineLayout { }
 #[derive(Debug, Clone)]
 pub struct Framebuffer {
     pub(crate) attachments: Vec<ImageView>,
+    // Number of layers in the render area. Required for subpass resolves.
+    pub(crate) layers: image::Layer,
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Buffer {
     pub(crate) resource: *mut d3d12::ID3D12Resource,
     pub(crate) size_in_bytes: u32,
-    pub(crate) clear_uav: Option<DualHandle>,
+    #[derivative(Debug="ignore")]
+    pub(crate) clear_uav: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
 }
 unsafe impl Send for Buffer { }
 unsafe impl Sync for Buffer { }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-pub struct BufferView;
+#[derive(Copy, Clone, Derivative)]
+#[derivative(Debug)]
+pub struct BufferView {
+    // Descriptor handle for uniform texel buffers.
+    #[derivative(Debug="ignore")]
+    pub(crate) handle_srv: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE,
+    // Descriptor handle for storage texel buffers.
+    #[derivative(Debug="ignore")]
+    pub(crate) handle_uav: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE,
+}
+unsafe impl Send for BufferView { }
+unsafe impl Sync for BufferView { }
 
+#[derive(Clone)]
+pub enum Place {
+    SwapChain,
+    Heap { raw: ComPtr<d3d12::ID3D12Heap>, offset: u64 },
+}
 
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
 pub struct Image {
     pub(crate) resource: *mut d3d12::ID3D12Resource,
+    #[derivative(Debug="ignore")]
+    pub(crate) place: Place,
+    pub(crate) surface_type: format::SurfaceType,
     pub(crate) kind: image::Kind,
     pub(crate) usage: image::Usage,
     pub(crate) storage_flags: image::StorageFlags,
-    pub(crate) dxgi_format: DXGI_FORMAT,
+    #[derivative(Debug="ignore")]
+    pub(crate) descriptor: d3d12::D3D12_RESOURCE_DESC,
     pub(crate) bytes_per_block: u8,
     // Dimension of a texel block (compressed formats).
     pub(crate) block_dim: (u8, u8),
-    pub(crate) num_levels: image::Level,
     #[derivative(Debug="ignore")]
-    pub(crate) clear_cv: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
+    pub(crate) clear_cv: Vec<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
     #[derivative(Debug="ignore")]
-    pub(crate) clear_dv: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
+    pub(crate) clear_dv: Vec<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
     #[derivative(Debug="ignore")]
-    pub(crate) clear_sv: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
+    pub(crate) clear_sv: Vec<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
 }
 unsafe impl Send for Image { }
 unsafe impl Sync for Image { }
@@ -173,13 +212,14 @@ impl Image {
     pub fn to_subresource_range(&self, aspects: format::Aspects) -> image::SubresourceRange {
         image::SubresourceRange {
             aspects,
-            levels: 0 .. self.num_levels,
+            levels: 0 .. self.descriptor.MipLevels as _,
             layers: 0 .. self.kind.num_layers(),
         }
     }
 
     pub fn calc_subresource(&self, mip_level: UINT, layer: UINT, plane: UINT) -> UINT {
-        mip_level + (layer * self.num_levels as UINT) + (plane * self.num_levels as UINT * self.kind.num_layers() as UINT)
+        mip_level + (layer * self.descriptor.MipLevels as UINT) +
+        (plane * self.descriptor.MipLevels as UINT * self.kind.num_layers() as UINT)
     }
 }
 
@@ -196,9 +236,21 @@ pub struct ImageView {
     pub(crate) handle_dsv: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
     #[derivative(Debug="ignore")]
     pub(crate) handle_uav: Option<d3d12::D3D12_CPU_DESCRIPTOR_HANDLE>,
+    // Required for attachment resolves.
+    pub(crate) dxgi_format: DXGI_FORMAT,
+    pub(crate) num_levels: image::Level,
+    pub(crate) mip_levels: (image::Level, image::Level),
+    pub(crate) layers: (image::Layer, image::Layer),
+    pub(crate) kind: image::Kind,
 }
 unsafe impl Send for ImageView { }
 unsafe impl Sync for ImageView { }
+
+impl ImageView {
+    pub fn calc_subresource(&self, mip_level: UINT, layer: UINT) -> UINT {
+        mip_level + (layer * self.num_levels as UINT)
+    }
+}
 
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -315,6 +367,8 @@ pub struct DualHandle {
     pub(crate) cpu: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE,
     #[derivative(Debug="ignore")]
     pub(crate) gpu: d3d12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// How large the block allocated to this handle is.
+    pub(crate) size: u64,
 }
 
 #[derive(Derivative)]
@@ -325,33 +379,17 @@ pub struct DescriptorHeap {
     pub(crate) handle_size: u64,
     pub(crate) total_handles: u64,
     pub(crate) start: DualHandle,
-    pub(crate) allocator: free_list::Allocator,
+    pub(crate) range_allocator: RangeAllocator<u64>,
 }
 
 impl DescriptorHeap {
-    pub(crate) fn at(&self, index: u64) -> DualHandle {
+    pub(crate) fn at(&self, index: u64, size: u64) -> DualHandle {
         assert!(index < self.total_handles);
         DualHandle {
             cpu: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start.cpu.ptr + (self.handle_size * index) as usize },
             gpu: d3d12::D3D12_GPU_DESCRIPTOR_HANDLE { ptr: self.start.gpu.ptr + self.handle_size * index },
+            size,
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct DescriptorCpuPool {
-    pub(crate) heap: DescriptorHeap,
-    pub(crate) offset: u64,
-    pub(crate) size: u64,
-    pub(crate) max_size: u64,
-}
-
-impl DescriptorCpuPool {
-    pub(crate) fn alloc_handles(&mut self, count: u64) -> DualHandle {
-        assert!(self.size + count <= self.max_size);
-        let index = self.offset + self.size;
-        self.size += count;
-        self.heap.at(index)
     }
 }
 
@@ -362,21 +400,31 @@ impl DescriptorCpuPool {
 pub struct DescriptorHeapSlice {
     #[derivative(Debug="ignore")]
     pub(crate) heap: ComPtr<d3d12::ID3D12DescriptorHeap>,
-    pub(crate) range: Range<u64>,
     pub(crate) start: DualHandle,
     pub(crate) handle_size: u64,
-    pub(crate) next: u64,
+    pub(crate) range_allocator: RangeAllocator<u64>,
 }
 
 impl DescriptorHeapSlice {
-    pub(crate) fn alloc_handles(&mut self, count: u64) -> DualHandle {
-        assert!(self.next + count <= self.range.end);
-        let index = self.next;
-        self.next += count;
-        DualHandle {
-            cpu: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start.cpu.ptr + (self.handle_size * index) as usize },
-            gpu: d3d12::D3D12_GPU_DESCRIPTOR_HANDLE { ptr: self.start.gpu.ptr + (self.handle_size * index) as u64 },
-        }
+    pub(crate) fn alloc_handles(&mut self, count: u64) -> Option<DualHandle> {
+        self.range_allocator.allocate_range(count).map(|range| {
+            DualHandle {
+                cpu: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start.cpu.ptr + (self.handle_size * range.start) as usize },
+                gpu: d3d12::D3D12_GPU_DESCRIPTOR_HANDLE { ptr: self.start.gpu.ptr + (self.handle_size * range.start) as u64 },
+                size: count,
+            }
+        })
+    }
+
+    /// Free handles previously given out by this `DescriptorHeapSlice`.  Do not use this with handles not given out by this `DescriptorHeapSlice`.
+    pub(crate) fn free_handles(&mut self, handle: DualHandle) {
+        let start = (handle.gpu.ptr - self.start.gpu.ptr) / self.handle_size;
+        let handle_range = start..start + handle.size as u64;
+        self.range_allocator.free_range(handle_range);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.range_allocator.reset();
     }
 }
 
@@ -391,32 +439,21 @@ unsafe impl Send for DescriptorPool {}
 unsafe impl Sync for DescriptorPool {}
 
 impl HalDescriptorPool<Backend> for DescriptorPool {
-    fn allocate_set(&mut self, layout: &DescriptorSetLayout) -> DescriptorSet {
+    fn allocate_set(&mut self, layout: &DescriptorSetLayout) -> Result<DescriptorSet, pso::AllocationError> {
         let mut binding_infos = Vec::new();
         let mut first_gpu_sampler = None;
         let mut first_gpu_view = None;
 
         for binding in &layout.bindings {
-            let (has_view, has_sampler, is_uav) = match binding.ty {
-                pso::DescriptorType::Sampler => (false, true, false),
-                pso::DescriptorType::CombinedImageSampler => (true, true, false),
-                pso::DescriptorType::InputAttachment |
-                pso::DescriptorType::SampledImage |
-                pso::DescriptorType::UniformTexelBuffer |
-                pso::DescriptorType::UniformBuffer => (true, false, false),
-                pso::DescriptorType::StorageImage |
-                pso::DescriptorType::StorageTexelBuffer |
-                pso::DescriptorType::StorageBuffer => (true, false, true),
-                _ => unimplemented!()
-            };
-
+            let HeapProperties { has_view, has_sampler, is_uav } = HeapProperties::from(binding.ty);
             while binding_infos.len() <= binding.binding as usize {
                 binding_infos.push(DescriptorBindingInfo::default());
             }
             binding_infos[binding.binding as usize] = DescriptorBindingInfo {
                 count: binding.count as _,
                 view_range: if has_view {
-                    let handle = self.heap_srv_cbv_uav.alloc_handles(binding.count as u64);
+                    let handle = self.heap_srv_cbv_uav.alloc_handles(binding.count as u64)
+                        .ok_or(pso::AllocationError::OutOfPoolMemory)?;
                     if first_gpu_view.is_none() {
                         first_gpu_view = Some(handle.gpu);
                     }
@@ -430,7 +467,8 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
                     None
                 },
                 sampler_range: if has_sampler {
-                    let handle = self.heap_sampler.alloc_handles(binding.count as u64);
+                    let handle = self.heap_sampler.alloc_handles(binding.count as u64)
+                        .ok_or(pso::AllocationError::OutOfPoolMemory)?;
                     if first_gpu_sampler.is_none() {
                         first_gpu_sampler = Some(handle.gpu);
                     }
@@ -447,17 +485,70 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
             };
         }
 
-        DescriptorSet {
+        Ok(DescriptorSet {
             heap_srv_cbv_uav: self.heap_srv_cbv_uav.heap.clone(),
             heap_samplers: self.heap_sampler.heap.clone(),
             binding_infos,
             first_gpu_sampler,
             first_gpu_view,
+        })
+    }
+
+    fn free_sets(&mut self, descriptor_sets: &[DescriptorSet]) {
+        for descriptor_set in descriptor_sets {
+            for binding_info in &descriptor_set.binding_infos {
+                if let Some(ref view_range) = binding_info.view_range {
+                    if HeapProperties::from(view_range.ty).has_view {
+                        self.heap_srv_cbv_uav.free_handles(view_range.handle);
+                    }
+
+                }
+                if let Some(ref sampler_range) = binding_info.sampler_range {
+                    if HeapProperties::from(sampler_range.ty).has_sampler {
+                        self.heap_sampler.free_handles(sampler_range.handle);
+                    }
+                }
+            }
         }
     }
 
     fn reset(&mut self) {
-        unimplemented!()
+        self.heap_srv_cbv_uav.clear();
+        self.heap_sampler.clear();
+    }
+}
+
+struct HeapProperties {
+    has_view: bool,
+    has_sampler: bool,
+    is_uav: bool,
+}
+
+impl HeapProperties {
+    pub fn new(has_view: bool, has_sampler: bool, is_uav: bool) -> Self {
+        HeapProperties {
+            has_view,
+            has_sampler,
+            is_uav,
+        }
+    }
+
+    /// Returns DescriptorType properties for DX12.
+    fn from(ty: pso::DescriptorType) -> HeapProperties {
+        match ty {
+            pso::DescriptorType::Sampler => HeapProperties::new(false, true, false),
+            pso::DescriptorType::CombinedImageSampler => HeapProperties::new(true, true, false),
+            pso::DescriptorType::InputAttachment |
+            pso::DescriptorType::SampledImage |
+            pso::DescriptorType::UniformTexelBuffer |
+            pso::DescriptorType::UniformBufferDynamic |
+            pso::DescriptorType::UniformBuffer => HeapProperties::new(true, false, false),
+            pso::DescriptorType::StorageImage |
+            pso::DescriptorType::StorageTexelBuffer |
+            pso::DescriptorType::StorageBufferDynamic |
+            pso::DescriptorType::StorageBuffer => HeapProperties::new(true, false, true),
+        }
+
     }
 }
 

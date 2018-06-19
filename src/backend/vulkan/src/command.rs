@@ -7,9 +7,10 @@ use ash::vk;
 use ash::version::DeviceV1_0;
 
 use hal::{buffer, command as com, memory, pso, query};
-use hal::{IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
+use hal::{DrawCount, IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
 use hal::format::Aspects;
 use hal::image::{Filter, Layout, SubresourceRange};
+use hal::range::RangeArg;
 use {conv, native as n};
 use {Backend, RawDevice};
 
@@ -52,18 +53,21 @@ where
 }
 
 impl CommandBuffer {
-    fn bind_descriptor_sets<T>(
+    fn bind_descriptor_sets<I, J>(
         &mut self,
         bind_point: vk::PipelineBindPoint,
         layout: &n::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<com::DescriptorSetOffset>,
     {
-        let sets: SmallVec<[vk::DescriptorSet; 16]> = sets.into_iter().map(|set| set.borrow().raw).collect();
-        let dynamic_offsets = &[]; // TODO
+        let sets: SmallVec<[_; 16]> = sets.into_iter().map(|set| set.borrow().raw).collect();
+        let dynamic_offsets: SmallVec<[_; 16]> = offsets.into_iter().map(|offset| *offset.borrow()).collect();
 
         unsafe {
             self.device.0.cmd_bind_descriptor_sets(
@@ -72,19 +76,30 @@ impl CommandBuffer {
                 layout.raw,
                 first_set as u32,
                 &sets,
-                dynamic_offsets,
+                &dynamic_offsets,
             );
         }
     }
 }
 
 impl com::RawCommandBuffer<Backend> for CommandBuffer {
-    fn begin(&mut self, flags: com::CommandBufferFlags) {
+    fn begin(&mut self, flags: com::CommandBufferFlags, info: com::CommandBufferInheritanceInfo<Backend>) {
+        let inheritance_info = vk::CommandBufferInheritanceInfo {
+            s_type: vk::StructureType::CommandBufferInheritanceInfo,
+            p_next: ptr::null(),
+            render_pass: info.subpass.map_or(vk::types::RenderPass::null(), |subpass| subpass.main_pass.raw),
+            subpass: info.subpass.map_or(0, |subpass| subpass.index as u32),
+            framebuffer: info.framebuffer.map_or(vk::types::Framebuffer::null(), |buffer| buffer.raw),
+            occlusion_query_enable: if info.occlusion_query_enable { vk::VK_TRUE } else { vk::VK_FALSE },
+            query_flags: conv::map_query_control_flags(info.occlusion_query_flags),
+            pipeline_statistics: conv::map_pipeline_statistics(info.pipeline_statistics),
+        };
+
         let info = vk::CommandBufferBeginInfo {
             s_type: vk::StructureType::CommandBufferBeginInfo,
             p_next: ptr::null(),
             flags: conv::map_command_buffer_flags(flags),
-            p_inheritance_info: ptr::null(),
+            p_inheritance_info: &inheritance_info,
         };
 
         assert_eq!(Ok(()),
@@ -110,7 +125,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         );
     }
 
-    fn begin_render_pass_raw<T>(
+    fn begin_render_pass<T>(
         &mut self,
         render_pass: &n::RenderPass,
         frame_buffer: &n::Framebuffer,
@@ -240,18 +255,21 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn fill_buffer(
+    fn fill_buffer<R>(
         &mut self,
         buffer: &n::Buffer,
-        range: Range<buffer::Offset>,
+        range: R,
         data: u32,
-    ) {
+    ) where
+        R: RangeArg<buffer::Offset>,
+    {
+        let (offset, size) = conv::map_range_arg(&range);
         unsafe {
             self.device.0.cmd_fill_buffer(
                 self.raw,
                 buffer.raw,
-                range.start,
-                range.end - range.start,
+                offset,
+                size,
                 data,
             );
         }
@@ -273,51 +291,64 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn clear_color_image_raw(
+    fn clear_image<T>(
         &mut self,
         image: &n::Image,
         layout: Layout,
-        range: SubresourceRange,
-        value: com::ClearColorRaw,
-    ) {
-        assert!(Aspects::COLOR.contains(range.aspects));
-        let range = conv::map_subresource_range(&range);
+        color: com::ClearColorRaw,
+        depth_stencil: com::ClearDepthStencilRaw,
+        subresource_ranges: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<SubresourceRange>,
+    {
+        let mut color_ranges = Vec::new();
+        let mut ds_ranges = Vec::new();
+
+        for subresource_range in subresource_ranges {
+            let sub = subresource_range.borrow();
+            let aspect_ds = sub.aspects & (Aspects::DEPTH | Aspects::STENCIL);
+            let vk_range = conv::map_subresource_range(sub);
+            if sub.aspects.contains(Aspects::COLOR) {
+                color_ranges.push(vk::ImageSubresourceRange {
+                    aspect_mask: conv::map_image_aspects(Aspects::COLOR),
+                    .. vk_range
+                });
+            }
+            if !aspect_ds.is_empty() {
+                ds_ranges.push(vk::ImageSubresourceRange {
+                    aspect_mask: conv::map_image_aspects(aspect_ds),
+                    .. vk_range
+                });
+            }
+        }
+
         // Vulkan and HAL share same memory layout
-        let clear_value = unsafe { mem::transmute(value) };
-
-        unsafe {
-            self.device.0.cmd_clear_color_image(
-                self.raw,
-                image.raw,
-                conv::map_image_layout(layout),
-                &clear_value,
-                &[range],
-            )
-        };
-    }
-
-    fn clear_depth_stencil_image_raw(
-        &mut self,
-        image: &n::Image,
-        layout: Layout,
-        range: SubresourceRange,
-        value: com::ClearDepthStencilRaw,
-    ) {
-        assert!((Aspects::DEPTH | Aspects::STENCIL).contains(range.aspects));
-        let range = conv::map_subresource_range(&range);
-        let clear_value = vk::ClearDepthStencilValue {
-            depth: value.depth,
-            stencil: value.stencil,
+        let color_value = unsafe { mem::transmute(color) };
+        let depth_stencil_value = vk::ClearDepthStencilValue {
+            depth: depth_stencil.depth,
+            stencil: depth_stencil.stencil,
         };
 
         unsafe {
-            self.device.0.cmd_clear_depth_stencil_image(
-                self.raw,
-                image.raw,
-                conv::map_image_layout(layout),
-                &clear_value,
-                &[range],
-            )
+            if !color_ranges.is_empty() {
+                self.device.0.cmd_clear_color_image(
+                    self.raw,
+                    image.raw,
+                    conv::map_image_layout(layout),
+                    &color_value,
+                    &color_ranges,
+                )
+            }
+            if !ds_ranges.is_empty() {
+                self.device.0.cmd_clear_depth_stencil_image(
+                    self.raw,
+                    image.raw,
+                    conv::map_image_layout(layout),
+                    &depth_stencil_value,
+                    &ds_ranges,
+                )
+            }
         };
     }
 
@@ -326,53 +357,40 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<com::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<pso::Rect>,
+        U::Item: Borrow<pso::ClearRect>,
     {
         let clears: SmallVec<[vk::ClearAttachment; 16]> = clears
             .into_iter()
             .map(|clear| {
                 match *clear.borrow() {
-                    com::AttachmentClear::Color(index, cv) => {
+                    com::AttachmentClear::Color { index, value } => {
                         vk::ClearAttachment {
                             aspect_mask: vk::IMAGE_ASPECT_COLOR_BIT,
                             color_attachment: index as _,
-                            clear_value: vk::ClearValue { color: conv::map_clear_color(cv) },
+                            clear_value: vk::ClearValue { color: conv::map_clear_color(value) },
                         }
                     }
-                    com::AttachmentClear::Depth(v) => {
+                    com::AttachmentClear::DepthStencil { depth, stencil } => {
                         vk::ClearAttachment {
-                            aspect_mask: vk::IMAGE_ASPECT_DEPTH_BIT,
+                            aspect_mask: if depth.is_some() { vk::IMAGE_ASPECT_DEPTH_BIT } else { vk::ImageAspectFlags::empty() } |
+                                if stencil.is_some() { vk::IMAGE_ASPECT_STENCIL_BIT } else { vk::ImageAspectFlags::empty() },
                             color_attachment: 0,
-                            clear_value: vk::ClearValue { depth: conv::map_clear_depth(v) },
-                        }
-                    }
-                    com::AttachmentClear::Stencil(v) => {
-                        vk::ClearAttachment {
-                            aspect_mask: vk::IMAGE_ASPECT_STENCIL_BIT,
-                            color_attachment: 0,
-                            clear_value: vk::ClearValue { depth: conv::map_clear_stencil(v) },
-                        }
-                    }
-                    com::AttachmentClear::DepthStencil(cv) => {
-                        vk::ClearAttachment {
-                            aspect_mask: vk::IMAGE_ASPECT_DEPTH_BIT | vk::IMAGE_ASPECT_STENCIL_BIT,
-                            color_attachment: 0,
-                            clear_value: vk::ClearValue { depth: conv::map_clear_depth_stencil(cv) },
+                            clear_value: vk::ClearValue {
+                                depth: vk::ClearDepthStencilValue {
+                                    depth: depth.unwrap_or_default(),
+                                    stencil: stencil.unwrap_or_default(),
+                                },
+                            },
                         }
                     }
                 }
-
             })
             .collect();
 
         let rects: SmallVec<[vk::ClearRect; 16]> = rects
             .into_iter()
             .map(|rect| {
-                vk::ClearRect {
-                    base_array_layer: 0,
-                    layer_count: vk::VK_REMAINING_ARRAY_LAYERS,
-                    rect: conv::map_rect(rect.borrow()),
-                }
+                conv::map_clear_rect(rect.borrow())
             })
             .collect();
 
@@ -465,7 +483,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn bind_vertex_buffers(&mut self, vbs: pso::VertexBufferSet<Backend>) {
+    fn bind_vertex_buffers(&mut self, first_binding: u32, vbs: pso::VertexBufferSet<Backend>) {
         let buffers: SmallVec<[vk::Buffer; 16]> =
             vbs.0.iter().map(|&(ref buffer, _)| buffer.raw).collect();
         let offsets: SmallVec<[vk::DeviceSize; 16]> =
@@ -474,14 +492,14 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         unsafe {
             self.device.0.cmd_bind_vertex_buffers(
                 self.raw,
-                0,
+                first_binding,
                 &buffers,
                 &offsets,
             );
         }
     }
 
-    fn set_viewports<T>(&mut self, viewports: T)
+    fn set_viewports<T>(&mut self, first_viewport: u32, viewports: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Viewport>,
@@ -494,11 +512,11 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             .collect();
 
         unsafe {
-            self.device.0.cmd_set_viewport(self.raw, 0, &viewports);
+            self.device.0.cmd_set_viewport(self.raw, first_viewport, &viewports);
         }
     }
 
-    fn set_scissors<T>(&mut self, scissors: T)
+    fn set_scissors<T>(&mut self, first_scissor: u32, scissors: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Rect>,
@@ -511,40 +529,57 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             .collect();
 
         unsafe {
-            self.device.0.cmd_set_scissor(self.raw, &scissors);
+            self.device.0.cmd_set_scissor(self.raw, first_scissor, &scissors);
         }
     }
 
-    fn set_stencil_reference(
-        &mut self, front: pso::StencilValue, back: pso::StencilValue
-    ) {
+    fn set_stencil_reference(&mut self, faces: pso::Face, value: pso::StencilValue) {
         unsafe {
-            if front == back {
-                // set front _and_ back
-                self.device.0.cmd_set_stencil_reference(
-                    self.raw,
-                    vk::STENCIL_FRONT_AND_BACK,
-                    front as u32,
-                );
-            } else {
-                // set both individually
-                self.device.0.cmd_set_stencil_reference(
-                    self.raw,
-                    vk::STENCIL_FACE_FRONT_BIT,
-                    front as u32,
-                );
-                self.device.0.cmd_set_stencil_reference(
-                    self.raw,
-                    vk::STENCIL_FACE_BACK_BIT,
-                    back as u32,
-                );
-            }
+            // Vulkan and HAL share same faces bit flags
+            self.device.0.cmd_set_stencil_reference(self.raw, mem::transmute(faces), value);
+        }
+    }
+
+    fn set_stencil_read_mask(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        unsafe {
+            // Vulkan and HAL share same faces bit flags
+            self.device.0.cmd_set_stencil_compare_mask(self.raw, mem::transmute(faces), value);
+        }
+    }
+
+    fn set_stencil_write_mask(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        unsafe {
+            // Vulkan and HAL share same faces bit flags
+            self.device.0.cmd_set_stencil_write_mask(self.raw, mem::transmute(faces), value);
         }
     }
 
     fn set_blend_constants(&mut self, color: pso::ColorValue) {
         unsafe {
             self.device.0.cmd_set_blend_constants(self.raw, color);
+        }
+    }
+
+    fn set_depth_bounds(&mut self, bounds: Range<f32>) {
+        unsafe {
+            self.device.0.cmd_set_depth_bounds(self.raw, bounds.start, bounds.end);
+        }
+    }
+
+    fn set_line_width(&mut self, width: f32) {
+        unsafe {
+            self.device.0.cmd_set_line_width(self.raw, width);
+        }
+    }
+
+    fn set_depth_bias(&mut self, depth_bias: pso::DepthBias) {
+        unsafe {
+            self.device.0.cmd_set_depth_bias(
+                self.raw,
+                depth_bias.const_factor,
+                depth_bias.clamp,
+                depth_bias.slope_factor,
+            );
         }
     }
 
@@ -558,20 +593,24 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn bind_graphics_descriptor_sets<T>(
+    fn bind_graphics_descriptor_sets<I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<com::DescriptorSetOffset>,
     {
         self.bind_descriptor_sets(
             vk::PipelineBindPoint::Graphics,
             layout,
             first_set,
             sets,
+            offsets,
         );
     }
 
@@ -585,20 +624,24 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn bind_compute_descriptor_sets<T>(
+    fn bind_compute_descriptor_sets<I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<com::DescriptorSetOffset>,
     {
         self.bind_descriptor_sets(
             vk::PipelineBindPoint::Compute,
             layout,
             first_set,
             sets,
+            offsets,
         );
     }
 
@@ -767,7 +810,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         &mut self,
         buffer: &n::Buffer,
         offset: buffer::Offset,
-        draw_count: u32,
+        draw_count: DrawCount,
         stride: u32,
     ) {
         unsafe {
@@ -785,7 +828,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         &mut self,
         buffer: &n::Buffer,
         offset: buffer::Offset,
-        draw_count: u32,
+        draw_count: DrawCount,
         stride: u32,
     ) {
         unsafe {
