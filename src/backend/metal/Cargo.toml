@@ -24,6 +24,13 @@ gfx-hal = { path = "../../hal", version = "0.1" }
 bitflags = "1.0"
 log = "0.4"
 winit = { git = "https://github.com/jTitor/winit", version = "^0.15.1", optional = true }
+smallvec = "0.6"
+spirv_cross = "0.9.2"
+fxhash = "0.2.1"
+
+#Unclear which of these aren't available
+#under iOS.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 metal-rs = "0.10.1"
 foreign-types = "0.3"
 objc = "0.2"
@@ -32,6 +39,3 @@ cocoa = "0.15"
 core-foundation = "0.6"
 core-graphics = "0.14"
 io-surface = "0.10"
-smallvec = "0.6"
-spirv_cross = "0.9.2"
-fxhash = "0.2.1"

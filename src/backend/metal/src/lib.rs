@@ -1,3 +1,5 @@
+#![cfg(any(target_os = "macos", target_os = "ios"))]
+
 extern crate gfx_hal as hal;
 #[macro_use] extern crate bitflags;
 extern crate cocoa;

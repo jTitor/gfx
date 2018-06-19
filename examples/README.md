@@ -13,3 +13,6 @@ For example, to run the `quad` example on the `vulkan` backend, try:
     cargo run --bin quad --features=vulkan
 
 If you run the examples for the first time, it may take some time because all dependencies must be compiled too.
+
+## Extra Dependencies
+When building in Windows, this crate also requires the Windows 10 SDK (https://developer.microsoft.com/en-us/windows/downloads/windows-10-sdk) to be installed, or it may fail with a missing d3d12.lib reference.
