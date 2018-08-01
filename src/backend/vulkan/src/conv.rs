@@ -3,7 +3,7 @@ use byteorder::{NativeEndian, WriteBytesExt};
 use smallvec::SmallVec;
 
 use hal::{buffer, command, format, image, pass, pso, query};
-use hal::{IndexType, Primitive};
+use hal::{IndexType, Primitive, PresentMode};
 use hal::range::RangeArg;
 
 use native as n;
@@ -90,27 +90,6 @@ pub fn map_clear_color(value: command::ClearColor) -> vk::ClearColorValue {
     }
 }
 
-pub fn map_clear_depth_stencil(value: command::ClearDepthStencil) -> vk::ClearDepthStencilValue {
-    vk::ClearDepthStencilValue {
-        depth: value.0,
-        stencil: value.1,
-    }
-}
-
-pub fn map_clear_depth(depth: pso::DepthValue) -> vk::ClearDepthStencilValue {
-    vk::ClearDepthStencilValue {
-        depth,
-        stencil: 0,
-    }
-}
-
-pub fn map_clear_stencil(stencil: pso::StencilValue) -> vk::ClearDepthStencilValue {
-    vk::ClearDepthStencilValue {
-        depth: 0.0,
-        stencil,
-    }
-}
-
 pub fn map_offset(offset: image::Offset) -> vk::Offset3D {
     vk::Offset3D {
         x: offset.x,
@@ -124,6 +103,16 @@ pub fn map_extent(offset: image::Extent) -> vk::Extent3D {
         width: offset.width,
         height: offset.height,
         depth: offset.depth,
+    }
+}
+
+pub fn map_subresource(
+    sub: &image::Subresource,
+) -> vk::ImageSubresource {
+    vk::ImageSubresource {
+        aspect_mask: map_image_aspects(sub.aspects),
+        mip_level: sub.level as _,
+        array_layer: sub.layer as _,
     }
 }
 
@@ -255,10 +244,12 @@ pub fn map_polygon_mode(rm: pso::PolygonMode) -> (vk::PolygonMode, f32) {
     }
 }
 
-pub fn map_cull_face(cf: pso::CullFace) -> vk::CullModeFlags {
+pub fn map_cull_face(cf: pso::Face) -> vk::CullModeFlags {
     match cf {
-        pso::CullFace::Front   => vk::CULL_MODE_FRONT_BIT,
-        pso::CullFace::Back    => vk::CULL_MODE_BACK_BIT,
+        pso::Face::NONE => vk::CULL_MODE_NONE,
+        pso::Face::FRONT => vk::CULL_MODE_FRONT_BIT,
+        pso::Face::BACK => vk::CULL_MODE_BACK_BIT,
+        _ => vk::CULL_MODE_FRONT_AND_BACK,
     }
 }
 
@@ -303,9 +294,18 @@ pub fn map_stencil_side(side: &pso::StencilFace) -> vk::StencilOpState {
         pass_op: map_stencil_op(side.op_pass),
         depth_fail_op: map_stencil_op(side.op_depth_fail),
         compare_op: map_comparison(side.fun),
-        compare_mask: side.mask_read as u32,
-        write_mask: side.mask_write as u32,
-        reference: 0,
+        compare_mask: match side.mask_read {
+            pso::State::Static(mr) => mr,
+            pso::State::Dynamic => !0,
+        },
+        write_mask: match side.mask_write {
+            pso::State::Static(mw) => mw,
+            pso::State::Dynamic => !0,
+        },
+        reference: match side.reference {
+            pso::State::Static(r) => r,
+            pso::State::Dynamic => 0,
+        },
     }
 }
 
@@ -391,6 +391,11 @@ pub fn map_pipeline_statistics(
 ) -> vk::QueryPipelineStatisticFlags {
     // Safe due to equivalence of HAL values and Vulkan values
     unsafe { mem::transmute(statistics) }
+}
+
+pub fn map_query_control_flags(flags: query::QueryControl) -> vk::QueryControlFlags {
+    // Safe due to equivalence of HAL values and Vulkan values
+    unsafe { mem::transmute(flags) }
 }
 
 pub fn map_image_features(features: vk::FormatFeatureFlags) -> format::ImageFeature {
@@ -487,6 +492,14 @@ pub fn map_rect(rect: &pso::Rect) -> vk::Rect2D {
     }
 }
 
+pub fn map_clear_rect(rect: &pso::ClearRect) -> vk::ClearRect {
+    vk::ClearRect {
+        base_array_layer: rect.layers.start as _,
+        layer_count: (rect.layers.end - rect.layers.start) as _,
+        rect: map_rect(&rect.rect),
+    }
+}
+
 pub fn map_viewport(vp: &pso::Viewport) -> vk::Viewport {
     vk::Viewport {
         x: vp.rect.x as _,
@@ -501,4 +514,9 @@ pub fn map_viewport(vp: &pso::Viewport) -> vk::Viewport {
 pub fn map_image_flags(flags: image::StorageFlags) -> vk::ImageCreateFlags {
     // the flag values have to match Vulkan
     unsafe { mem::transmute(flags) }
+}
+
+pub fn map_vk_present_mode(mode: vk::PresentModeKHR) -> PresentMode {
+    // the enum variants have to match Vulkan
+    unsafe { mem::transmute(mode) }
 }

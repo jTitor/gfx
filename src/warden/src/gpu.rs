@@ -56,15 +56,15 @@ pub struct Buffer<B: hal::Backend> {
 }
 
 impl<B: hal::Backend> Buffer<B> {
-    fn barrier_to(&self, state: b::State) -> memory::Barrier<B> {
+    fn barrier_to(&self, access: b::Access) -> memory::Barrier<B> {
         memory::Barrier::Buffer {
-            states: self.stable_state .. state,
+            states: self.stable_state .. access,
             target: &self.handle,
         }
     }
-    fn barrier_from(&self, state: b::State) -> memory::Barrier<B> {
+    fn barrier_from(&self, access: b::Access) -> memory::Barrier<B> {
         memory::Barrier::Buffer {
-            states: state .. self.stable_state,
+            states: access .. self.stable_state,
             target: &self.handle,
         }
     }
@@ -75,7 +75,25 @@ pub struct Image<B: hal::Backend> {
     _memory: B::Memory,
     kind: i::Kind,
     format: f::Format,
+    range: i::SubresourceRange,
     stable_state: i::State,
+}
+
+impl<B: hal::Backend> Image<B> {
+    fn barrier_to(&self, access: i::Access, layout: i::Layout) -> memory::Barrier<B> {
+        memory::Barrier::Image {
+            states: self.stable_state .. (access, layout),
+            target: &self.handle,
+            range: self.range.clone(),
+        }
+    }
+    fn barrier_from(&self, access: i::Access, layout: i::Layout) -> memory::Barrier<B> {
+        memory::Barrier::Image {
+            states: (access, layout) .. self.stable_state,
+            target: &self.handle,
+            range: self.range.clone(),
+        }
+    }
 }
 
 pub struct RenderPass<B: hal::Backend> {
@@ -109,7 +127,7 @@ pub struct Scene<B: hal::Backend, C> {
     init_submit: c::Submit<B, C, c::MultiShot, c::Primary>,
     device: B::Device,
     queue_group: hal::QueueGroup<B, C>,
-    command_pool: hal::CommandPool<B, C>,
+    command_pool: Option<hal::CommandPool<B, C>>,
     upload_buffers: HashMap<String, (B::Buffer, B::Memory)>,
     download_type: hal::MemoryTypeId,
     limits: hal::Limits,
@@ -125,7 +143,7 @@ fn align(x: u64, y: u64) -> u64 {
 
 impl<B: hal::Backend> Scene<B, hal::General> {
     pub fn new(
-        adapter: hal::Adapter<B>, raw: &raw::Scene, data_path: PathBuf
+        mut adapter: hal::Adapter<B>, raw: &raw::Scene, data_path: PathBuf
     ) -> Result<Self, Error> {
         info!("creating Scene from {:?}", data_path);
         let memory_types = adapter
@@ -142,7 +160,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         let upload_type: hal::MemoryTypeId = memory_types
             .iter()
             .position(|mt| {
-                mt.properties.contains(memory::Properties::CPU_VISIBLE)
+                mt.properties.contains(memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT)
                 //&&!mt.properties.contains(memory::Properties::CPU_CACHED)
             })
             .unwrap()
@@ -150,7 +168,8 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         let download_type = memory_types
             .iter()
             .position(|mt| {
-                mt.properties.contains(memory::Properties::CPU_VISIBLE | memory::Properties::CPU_CACHED)
+                mt.properties.contains(memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT)
+                //&&!mt.properties.contains(memory::Properties::CPU_CACHED)
             })
             .unwrap()
             .into();
@@ -418,6 +437,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             _memory: memory,
                             kind,
                             format,
+                            range: COLOR_RANGE.clone(),
                             stable_state,
                         });
                     }
@@ -456,7 +476,11 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                         attachments.keys().position(|s| s == sp).unwrap()
                                     })
                                     .collect::<Vec<_>>();
-                                (colors, ds, inputs, preserves)
+                                let resolves = sp.resolves
+                                    .iter()
+                                    .map(&att_ref)
+                                    .collect::<Vec<_>>();
+                                (colors, ds, inputs, preserves, resolves)
                             })
                             .collect::<Vec<_>>();
                         let raw_subs = temp
@@ -466,6 +490,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                 depth_stencil: t.1.as_ref(),
                                 inputs: &t.2,
                                 preserves: &t.3,
+                                resolves: &t.4,
                             })
                             .collect::<Vec<_>>();
                         let raw_deps = dependencies
@@ -513,8 +538,10 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             .unwrap();
                         resources.shaders.insert(name.clone(), module);
                     }
-                    raw::Resource::DescriptorSetLayout { ref bindings } => {
-                        let layout = device.create_descriptor_set_layout(bindings);
+                    raw::Resource::DescriptorSetLayout { ref bindings, ref immutable_samplers } => {
+                        assert!(immutable_samplers.is_empty()); //TODO! requires changing the order,
+                        // since samples are expect to be all read by this point
+                        let layout = device.create_descriptor_set_layout(bindings, &[]);
                         let binding_indices = bindings.iter().map(|dsb| dsb.binding).collect();
                         resources.desc_set_layouts.insert(name.clone(), (binding_indices, layout));
                     }
@@ -541,7 +568,8 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         let desc_set = resources.desc_pools
                             .get_mut(pool)
                             .expect(&format!("Missing descriptor pool: {}", pool))
-                            .allocate_set(set_layout);
+                            .allocate_set(set_layout)
+                            .expect(&format!("Failed to allocate set with layout: {:?}", set_layout));
                         resources.desc_sets.insert(name.clone(), desc_set);
                         // fill it up
                         let set = &resources.desc_sets[name];
@@ -642,6 +670,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             blender: blender.clone(),
                             depth_stencil: depth_stencil.clone(),
                             baked_states: pso::BakedStates::default(), //TODO
+                            multisampling: None, // TODO
                             layout: &resources.pipeline_layouts[layout],
                             subpass: hal::pass::Subpass {
                                 main_pass: &resources.render_passes[&subpass.parent].handle,
@@ -685,40 +714,192 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         // fill up command buffers
         let mut jobs = HashMap::new();
         for (name, job) in &raw.jobs {
+            use raw::TransferCommand as Tc;
             let mut command_buf = command_pool.acquire_command_buffer(false);
             match *job {
-                raw::Job::Transfer { ref commands } => {
-                    use raw::TransferCommand as Tc;
-                    for command in commands {
-                        match *command {
-                            Tc::CopyBuffer { ref src, ref dst, ref regions } => {
-                                let sb = resources.buffers
-                                    .get(src)
-                                    .expect(&format!("Missing source buffer: {}", src));
-                                let db = resources.buffers
-                                    .get(dst)
-                                    .expect(&format!("Missing destination buffer: {}", dst));
-                                command_buf.pipeline_barrier(
-                                    pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
-                                    memory::Dependencies::empty(),
-                                    vec![
-                                        sb.barrier_to(b::State::TRANSFER_READ),
-                                        db.barrier_to(b::State::TRANSFER_WRITE),
-                                    ],
-                                );
-                                command_buf.copy_buffer(&sb.handle, &db.handle, regions);
-                                command_buf.pipeline_barrier(
-                                    pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
-                                    memory::Dependencies::empty(),
-                                    vec![
-                                        sb.barrier_from(b::State::TRANSFER_READ),
-                                        db.barrier_from(b::State::TRANSFER_WRITE),
-                                    ],
-                                );
-                            }
-                            Tc::CopyBufferToImage => unimplemented!(),
-                            Tc::CopyImageToBuffer => unimplemented!(),
-                        }
+                raw::Job::Transfer(ref command) => match *command {
+                    Tc::CopyBuffer { ref src, ref dst, ref regions } => {
+                        let sb = resources.buffers
+                            .get(src)
+                            .expect(&format!("Missing source buffer: {}", src));
+                        let db = resources.buffers
+                            .get(dst)
+                            .expect(&format!("Missing destination buffer: {}", dst));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![
+                                sb.barrier_to(b::State::TRANSFER_READ),
+                                db.barrier_to(b::State::TRANSFER_WRITE),
+                            ],
+                        );
+                        command_buf.copy_buffer(&sb.handle, &db.handle, regions);
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![
+                                sb.barrier_from(b::State::TRANSFER_READ),
+                                db.barrier_from(b::State::TRANSFER_WRITE),
+                            ],
+                        );
+                    }
+                    Tc::CopyImage { ref src, ref dst, ref regions } => {
+                        let st = resources.images
+                            .get(src)
+                            .expect(&format!("Missing source image: {}", src));
+                        let dt = resources.images
+                            .get(dst)
+                            .expect(&format!("Missing destination image: {}", dst));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![
+                                st.barrier_to(i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
+                                dt.barrier_to(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                        command_buf.copy_image(
+                            &st.handle, i::Layout::TransferSrcOptimal,
+                            &dt.handle, i::Layout::TransferDstOptimal,
+                            regions,
+                        );
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![
+                                st.barrier_from(i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
+                                dt.barrier_from(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                    }
+                    Tc::CopyBufferToImage { ref src, ref dst, ref regions } => {
+                        let sb = resources.buffers
+                            .get(src)
+                            .expect(&format!("Missing source buffer: {}", src));
+                        let dt = resources.images
+                            .get(dst)
+                            .expect(&format!("Missing destination image: {}", dst));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![
+                                sb.barrier_to(b::State::TRANSFER_READ),
+                                dt.barrier_to(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                        command_buf.copy_buffer_to_image(
+                            &sb.handle,
+                            &dt.handle, i::Layout::TransferDstOptimal,
+                            regions,
+                        );
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![
+                                sb.barrier_from(b::State::TRANSFER_READ),
+                                dt.barrier_from(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                    }
+                    Tc::CopyImageToBuffer { ref src, ref dst, ref regions } => {
+                        let st = resources.images
+                            .get(src)
+                            .expect(&format!("Missing source image: {}", src));
+                        let db = resources.buffers
+                            .get(dst)
+                            .expect(&format!("Missing destination buffer: {}", dst));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![
+                                st.barrier_to(i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
+                                db.barrier_to(b::State::TRANSFER_WRITE),
+                            ],
+                        );
+                        command_buf.copy_image_to_buffer(
+                            &st.handle, i::Layout::TransferSrcOptimal,
+                            &db.handle,
+                            regions,
+                        );
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![
+                                st.barrier_from(i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
+                                db.barrier_from(b::State::TRANSFER_WRITE),
+                            ],
+                        );
+                    }
+                    Tc::ClearImage { ref image, color, depth_stencil, ref ranges } => {
+                        let img = resources.images
+                            .get(image)
+                            .expect(&format!("Missing clear image: {}", image));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![
+                                img.barrier_to(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                        command_buf.clear_image(
+                            &img.handle, i::Layout::TransferDstOptimal,
+                            color,
+                            depth_stencil,
+                            ranges,
+                        );
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![
+                                img.barrier_from(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                    }
+                    Tc::BlitImage { ref src, ref dst, filter, ref regions } => {
+                        let st = resources.images
+                            .get(src)
+                            .expect(&format!("Missing source image: {}", src));
+                        let dt = resources.images
+                            .get(dst)
+                            .expect(&format!("Missing destination image: {}", dst));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![
+                                st.barrier_to(i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
+                                dt.barrier_to(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                        command_buf.blit_image(
+                            &st.handle, i::Layout::TransferSrcOptimal,
+                            &dt.handle, i::Layout::TransferDstOptimal,
+                            filter,
+                            regions,
+                        );
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![
+                                st.barrier_from(i::Access::TRANSFER_READ, i::Layout::TransferSrcOptimal),
+                                dt.barrier_from(i::Access::TRANSFER_WRITE, i::Layout::TransferDstOptimal),
+                            ],
+                        );
+                    }
+                    Tc::FillBuffer { ref buffer, start, end, data } => {
+                        let buf = resources.buffers
+                            .get(buffer)
+                            .expect(&format!("Missing buffer: {}", buffer));
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TOP_OF_PIPE .. pso::PipelineStage::TRANSFER,
+                            memory::Dependencies::empty(),
+                            vec![buf.barrier_to(b::State::TRANSFER_WRITE)],
+                        );
+                        command_buf.fill_buffer(&buf.handle, (start, end), data);
+                        command_buf.pipeline_barrier(
+                            pso::PipelineStage::TRANSFER .. pso::PipelineStage::BOTTOM_OF_PIPE,
+                            memory::Dependencies::empty(),
+                            vec![buf.barrier_from(b::State::TRANSFER_WRITE)],
+                        );
                     }
                 }
                 raw::Job::Graphics { ref framebuffer, ref pass, ref clear_values } => {
@@ -731,8 +912,8 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         h: extent.height as _,
                     };
                     let mut encoder = command_buf.begin_render_pass_inline(&rp.handle, fb, rect, clear_values);
-                    encoder.set_scissors(Some(rect));
-                    encoder.set_viewports(Some(pso::Viewport {
+                    encoder.set_scissors(0, Some(rect));
+                    encoder.set_viewports(0, Some(pso::Viewport {
                         rect,
                         depth: 0.0 .. 1.0,
                     }));
@@ -764,10 +945,8 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                                 .expect(&format!("Missing vertex buffer: {}", name))
                                                 .handle;
                                             (buf, offset)
-                                        })
-                                        .collect::<Vec<_>>();
-                                    let set = pso::VertexBufferSet(buffers_raw);
-                                    encoder.bind_vertex_buffers(set);
+                                        });
+                                    encoder.bind_vertex_buffers(0, buffers_raw);
                                 }
                                 Dc::BindPipeline(ref name) => {
                                     let pso = resources.graphics_pipelines
@@ -786,6 +965,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                                 .get(name)
                                                 .expect(&format!("Missing descriptor set: {}", name))
                                         }),
+                                        &[],
                                     );
                                 }
                                 Dc::Draw { ref vertices, ref instances } => {
@@ -795,10 +975,10 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                     encoder.draw_indexed(indices.clone(), base_vertex, instances.clone());
                                 }
                                 Dc::SetViewports(ref viewports) => {
-                                    encoder.set_viewports(viewports);
+                                    encoder.set_viewports(0, viewports);
                                 }
                                 Dc::SetScissors(ref scissors) => {
-                                    encoder.set_scissors(scissors);
+                                    encoder.set_scissors(0, scissors);
                                 }
                             }
                         }
@@ -817,6 +997,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                 .get(name)
                                 .expect(&format!("Missing descriptor set: {}", name))
                         }),
+                        &[],
                     );
                     command_buf.dispatch(dispatch);
                 }
@@ -834,7 +1015,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             init_submit,
             device,
             queue_group,
-            command_pool,
+            command_pool: Some(command_pool),
             upload_buffers,
             download_type,
             limits,
@@ -924,9 +1105,9 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         let submission = hal::queue::Submission::new()
             .submit(Some(copy_submit));
         self.queue_group.queues[0].submit(submission, Some(&copy_fence));
-        //queue.destroy_command_pool(command_pool);
         self.device.wait_for_fence(&copy_fence, !0);
         self.device.destroy_fence(copy_fence);
+        self.device.destroy_command_pool(command_pool.into_raw());
 
         let mapping = self
             .device
@@ -1032,9 +1213,9 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         let submission = hal::queue::Submission::new()
             .submit(Some(copy_submit));
         self.queue_group.queues[0].submit(submission, Some(&copy_fence));
-        //queue.destroy_command_pool(command_pool);
         self.device.wait_for_fence(&copy_fence, !0);
         self.device.destroy_fence(copy_fence);
+        self.device.destroy_command_pool(command_pool.into_raw());
 
         let mapping = self
             .device
@@ -1060,7 +1241,6 @@ impl<B: hal::Backend, C> Drop for Scene<B, C> {
         }
         //TODO: free those properly
         let _ = &self.queue_group;
-        let _ = &self.command_pool;
-        //self.device.destroy_command_pool(self.command_pool.downgrade())
+        self.device.destroy_command_pool(self.command_pool.take().unwrap().into_raw());
     }
 }

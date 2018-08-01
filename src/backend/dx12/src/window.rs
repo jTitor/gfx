@@ -7,6 +7,7 @@ use winit;
 use winapi::shared::dxgi1_4;
 use winapi::shared::windef::{HWND, RECT};
 use winapi::um::winuser::GetClientRect;
+use winapi::um::d3d12;
 use wio::com::ComPtr;
 
 use hal::{self, format as f, image as i};
@@ -61,9 +62,9 @@ impl hal::Surface<Backend> for Surface {
         i::Kind::D2(self.width, self.height, 1, 1)
     }
 
-    fn capabilities_and_formats(
+    fn compatibility(
         &self, _: &PhysicalDevice,
-    ) -> (hal::SurfaceCapabilities, Option<Vec<f::Format>>) {
+    ) -> (hal::SurfaceCapabilities, Option<Vec<f::Format>>, Vec<hal::PresentMode>) {
         let extent = hal::window::Extent2D {
             width: self.width,
             height: self.height,
@@ -88,7 +89,11 @@ impl hal::Surface<Backend> for Surface {
             f::Format::Rgba16Float,
         ];
 
-        (capabilities, Some(formats))
+        let present_modes = vec![
+            hal::PresentMode::Fifo //TODO
+        ];
+
+        (capabilities, Some(formats), present_modes)
     }
 }
 
@@ -98,10 +103,13 @@ pub struct Swapchain {
     pub(crate) frame_queue: VecDeque<usize>,
     #[allow(dead_code)]
     pub(crate) rtv_heap: n::DescriptorHeap,
+    // need to associate raw image pointers with the swapchain so they can be properly released
+    // when the swapchain is destroyed
+    pub(crate) _resources: Vec<ComPtr<d3d12::ID3D12Resource>>,
 }
 
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_frame(&mut self, _sync: hal::FrameSync<Backend>) -> hal::Frame {
+    fn acquire_image(&mut self, _sync: hal::FrameSync<Backend>) -> Result<hal::SwapImageIndex, ()> {
         // TODO: sync
 
         if false {
@@ -114,8 +122,7 @@ impl hal::Swapchain<Backend> for Swapchain {
         }
 
         // TODO:
-        let index = unsafe { self.inner.GetCurrentBackBufferIndex() };
-        hal::Frame::new(index as usize)
+        Ok(unsafe { self.inner.GetCurrentBackBufferIndex() })
     }
 }
 

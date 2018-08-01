@@ -5,8 +5,8 @@
 //! please see [the official Vulkan documentation](https://www.khronos.org/registry/vulkan/specs/1.0/man/html/VkFormat.html)
 //!
 //! `gfx-rs` splits a `Format` into two sub-components, a `SurfaceType` and
-//! a `ChannelType`.  The `SurfaceType` specifies how the large the channels are, 
-//! for instance `R32_G32_B32_A32`.  The `ChannelType` specifies how the 
+//! a `ChannelType`.  The `SurfaceType` specifies how the large the channels are,
+//! for instance `R32_G32_B32_A32`.  The `ChannelType` specifies how the
 //! components are interpreted, for instance `Float` or `Int`.
 
 bitflags!(
@@ -33,17 +33,27 @@ pub struct FormatDesc {
     ///
     /// * Depth/Stencil formats are opaque formats, where the total number of bits is unknown.
     ///   A dummy value is used for these formats instead (sum of depth and stencil bits).
-    ///   For copy operations, the number of bits of the corresonding aspect should be used.
+    ///   For copy operations, the number of bits of the corresponding aspect should be used.
     /// * The total number can be larger than the sum of individual format bits
     ///   (`color`, `alpha`, `depth` and `stencil`) for packed formats.
     /// * For compressed formats, this denotes the number of bits per block.
     pub bits: u16,
     /// Dimensions (width, height) of the texel blocks.
-    ///
-    /// For uncompressed formats these are always (1, 1).
     pub dim: (u8, u8),
+    /// The format representation depends on the endianness of the platform.
+    ///
+    /// * On little-endian systems, the actual oreder of components is reverse of what
+    ///   a surface type specifies.
+    pub packed: bool,
     /// Format aspects
     pub aspects: Aspects,
+}
+
+impl FormatDesc {
+    /// Check if the format is compressed.
+    pub fn is_compressed(&self) -> bool {
+        self.dim != (1, 1)
+    }
 }
 
 /// Description of the bits distribution of a format.
@@ -115,7 +125,7 @@ impl Default for Swizzle {
 }
 
 /// Format properties of the physical device.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Properties {
     /// A bitmask of the features supported when an image with linear tiling is requested.
@@ -131,6 +141,7 @@ pub struct Properties {
 
 bitflags!(
     /// Image feature flags.
+    #[derive(Default)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct ImageFeature: u32 {
         /// Image view can be sampled.
@@ -158,6 +169,7 @@ bitflags!(
 
 bitflags!(
     /// Buffer feature flags.
+    #[derive(Default)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct BufferFeature: u32 {
         /// Buffer view can be used as uniform texel buffer.
@@ -222,13 +234,14 @@ macro_rules! surface_types {
                 }
             }
 
-            ///
+            /// Return the format descriptor.
             pub fn desc(&self) -> FormatDesc {
                 match *self {
                     $( SurfaceType::$name => FormatDesc {
-                        bits: $total,
-                        aspects: $(Aspects::$aspect)|*,
+                        bits: $total.min(!$total),
                         dim: $dim,
+                        packed: $total > 0x1000,
+                        aspects: $(Aspects::$aspect)|*,
                     }, )*
                 }
             }
@@ -237,28 +250,29 @@ macro_rules! surface_types {
 }
 
 // ident { num_bits, aspects, dim, (color, alpha, ..) }
+// if the number of bits is given with exclamation (e.g. `!16`), the format is considered packed
 surface_types! {
-    R4_G4               {   8, COLOR, (1, 1), color: 8 },
-    R4_G4_B4_A4         {  16, COLOR, (1, 1), color: 12, alpha: 4 },
-    B4_G4_R4_A4         {  16, COLOR, (1, 1), color: 12, alpha: 4 },
-    R5_G6_B5            {  16, COLOR, (1, 1), color: 16 },
-    B5_G6_R5            {  16, COLOR, (1, 1), color: 16 },
-    R5_G5_B5_A1         {  16, COLOR, (1, 1), color: 15, alpha: 1 },
-    B5_G5_R5_A1         {  16, COLOR, (1, 1), color: 15, alpha: 1 },
-    A1_R5_G5_B5         {  16, COLOR, (1, 1), color: 15, alpha: 1 },
+    R4_G4               {  !8, COLOR, (1, 1), color: 8 },
+    R4_G4_B4_A4         { !16, COLOR, (1, 1), color: 12, alpha: 4 },
+    B4_G4_R4_A4         { !16, COLOR, (1, 1), color: 12, alpha: 4 },
+    R5_G6_B5            { !16, COLOR, (1, 1), color: 16 },
+    B5_G6_R5            { !16, COLOR, (1, 1), color: 16 },
+    R5_G5_B5_A1         { !16, COLOR, (1, 1), color: 15, alpha: 1 },
+    B5_G5_R5_A1         { !16, COLOR, (1, 1), color: 15, alpha: 1 },
+    A1_R5_G5_B5         { !16, COLOR, (1, 1), color: 15, alpha: 1 },
     R8                  {   8, COLOR, (1, 1), color: 8 },
     R8_G8               {  16, COLOR, (1, 1), color: 16 },
     R8_G8_B8            {  24, COLOR, (1, 1), color: 24 },
     B8_G8_R8            {  24, COLOR, (1, 1), color: 24 },
     R8_G8_B8_A8         {  32, COLOR, (1, 1), color: 24, alpha: 8 },
     B8_G8_R8_A8         {  32, COLOR, (1, 1), color: 24, alpha: 8 },
-    A8_B8_G8_R8         {  32, COLOR, (1, 1), color: 24, alpha: 8 },
-    A2_R10_G10_B10      {  32, COLOR, (1, 1), color: 30, alpha: 2 },
-    A2_B10_G10_R10      {  32, COLOR, (1, 1), color: 30, alpha: 2 },
+    A8_B8_G8_R8         { !32, COLOR, (1, 1), color: 24, alpha: 8 },
+    A2_R10_G10_B10      { !32, COLOR, (1, 1), color: 30, alpha: 2 },
+    A2_B10_G10_R10      { !32, COLOR, (1, 1), color: 30, alpha: 2 },
     R16                 {  16, COLOR, (1, 1), color: 16 },
     R16_G16             {  32, COLOR, (1, 1), color: 32 },
     R16_G16_B16         {  48, COLOR, (1, 1), color: 48 },
-    R16_G16_B16_A16     {  48, COLOR, (1, 1), color: 48, alpha: 16 },
+    R16_G16_B16_A16     {  64, COLOR, (1, 1), color: 48, alpha: 16 },
     R32                 {  32, COLOR, (1, 1), color: 32 },
     R32_G32             {  64, COLOR, (1, 1), color: 64 },
     R32_G32_B32         {  96, COLOR, (1, 1), color: 96 },
@@ -267,10 +281,10 @@ surface_types! {
     R64_G64             { 128, COLOR, (1, 1), color: 128 },
     R64_G64_B64         { 192, COLOR, (1, 1), color: 192 },
     R64_G64_B64_A64     { 256, COLOR, (1, 1), color: 192, alpha: 64 },
-    B10_G11_R11         {  32, COLOR, (1, 1), color: 32 },
-    E5_B9_G9_R9         {  32, COLOR, (1, 1), color: 27 }, // 32-bit packed format
+    B10_G11_R11         { !32, COLOR, (1, 1), color: 32 },
+    E5_B9_G9_R9         { !32, COLOR, (1, 1), color: 27 },
     D16                 {  16, DEPTH, (1, 1), depth: 16 },
-    X8D24               {  32, DEPTH, (1, 1), depth: 24 },
+    X8D24               { !32, DEPTH, (1, 1), depth: 24 },
     D32                 {  32, DEPTH, (1, 1), depth: 32 },
     S8                  {   8, STENCIL, (1, 1), stencil: 8 },
     D16_S8              {  24, DEPTH | STENCIL, (1, 1), depth: 16, stencil: 8 },
@@ -569,31 +583,28 @@ impl Format {
     ///
     /// Returns `None` if format is `Undefined`.
     pub fn base_format(self) -> BaseFormat {
-        assert!(NUM_FORMATS > self as usize);
+        assert!(self as usize != 0 && NUM_FORMATS > self as usize);
         BASE_FORMATS[self as usize - 1]
     }
 
-    /// Retuns aspect flags of the format.
-    pub fn aspects(self) -> Aspects {
-        self.base_format()
-            .0
-            .desc()
-            .aspects
+    /// A shortcut to obtain surface format description.
+    pub fn surface_desc(&self) -> FormatDesc {
+        self.base_format().0.desc()
     }
 
     /// Returns if the format has a color aspect.
     pub fn is_color(self) -> bool {
-        self.aspects().contains(Aspects::COLOR)
+        self.surface_desc().aspects.contains(Aspects::COLOR)
     }
 
     /// Returns if the format has a depth aspect.
     pub fn is_depth(self) -> bool {
-        self.aspects().contains(Aspects::DEPTH)
+        self.surface_desc().aspects.contains(Aspects::DEPTH)
     }
 
     /// Returns if the format has a stencil aspect.
     pub fn is_stencil(self) -> bool {
-        self.aspects().contains(Aspects::STENCIL)
+        self.surface_desc().aspects.contains(Aspects::STENCIL)
     }
 }
 

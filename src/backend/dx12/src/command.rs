@@ -1,19 +1,24 @@
 
-use hal::{buffer, command as com, image, memory, pass, pso, query};
-use hal::{IndexCount, IndexType, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
+use hal::{buffer, command as com, format, image, memory, pass, pso, query};
+use hal::{DrawCount, IndexCount, IndexType, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
+use hal::backend::FastHashMap;
 use hal::format::Aspects;
+use hal::range::RangeArg;
 
 use std::{cmp, iter, mem, ptr};
 use std::borrow::Borrow;
 use std::ops::Range;
+use std::sync::Arc;
 
-use winapi::um::d3d12;
-use winapi::shared::minwindef::{FALSE, UINT};
-use winapi::shared::dxgiformat;
+use winapi::Interface;
+use winapi::um::{d3d12, d3dcommon};
+use winapi::shared::minwindef::{FALSE, UINT, TRUE};
+use winapi::shared::{dxgiformat, winerror};
 
 use wio::com::ComPtr;
 
-use {conv, native as n, Backend, CmdSignatures, MAX_VERTEX_BUFFERS};
+use {conv, device, descriptors_cpu, internal, native as n, Backend, Device, Shared, MAX_VERTEX_BUFFERS, validate_line_width};
+use device::ViewInfo;
 use root_constants::RootConstant;
 use smallvec::SmallVec;
 
@@ -38,85 +43,11 @@ fn get_rect(rect: &pso::Rect) -> d3d12::D3D12_RECT {
 }
 
 fn div(a: u32, b: u32) -> u32 {
-    assert_eq!(a % b, 0);
-    a / b
+    (a + b - 1) / b
 }
 
-fn bind_descriptor_sets<'a, T>(
-    raw: &ComPtr<d3d12::ID3D12GraphicsCommandList>,
-    pipeline: &mut PipelineCache,
-    layout: &n::PipelineLayout,
-    first_set: usize,
-    sets: T,
-) where
-    T: IntoIterator,
-    T::Item: Borrow<n::DescriptorSet>,
-{
-    let mut sets = sets.into_iter().peekable();
-    let (srv_cbv_uav_start, sampler_start) = if let Some(set_0) = sets.peek().map(Borrow::borrow) {
-        // Bind descriptor heaps
-        unsafe {
-            // TODO: Can we bind them always or only once?
-            //       Resize while recording?
-            let mut heaps = [
-                set_0.heap_srv_cbv_uav.as_raw(),
-                set_0.heap_samplers.as_raw(),
-            ];
-            raw.SetDescriptorHeaps(2, heaps.as_mut_ptr())
-        }
-
-        (set_0.srv_cbv_uav_gpu_start().ptr, set_0.sampler_gpu_start().ptr)
-    } else {
-        return
-    };
-
-    pipeline.srv_cbv_uav_start = srv_cbv_uav_start;
-    pipeline.sampler_start = sampler_start;
-
-    let mut table_id = 0;
-    for table in &layout.tables[..first_set] {
-        if table.contains(n::SRV_CBV_UAV) {
-            table_id += 1;
-        }
-        if table.contains(n::SAMPLERS) {
-            table_id += 1;
-        }
-    }
-
-    let table_base_offset = layout
-        .root_constants
-        .iter()
-        .fold(0, |sum, c| sum + c.range.end - c.range.start);
-
-    for (set, table) in sets.zip(layout.tables[first_set..].iter()) {
-        let set = set.borrow();
-        set.first_gpu_view.map(|gpu| {
-            assert!(table.contains(n::SRV_CBV_UAV));
-
-            let root_offset = table_id + table_base_offset;
-            // Cast is safe as offset **must** be in u32 range. Unable to
-            // create heaps with more descriptors.
-            let table_offset = (gpu.ptr - srv_cbv_uav_start) as u32;
-            pipeline
-                .user_data
-                .set_srv_cbv_uav_table(root_offset as _, table_offset);
-
-            table_id += 1;
-        });
-        set.first_gpu_sampler.map(|gpu| {
-            assert!(table.contains(n::SAMPLERS));
-
-            let root_offset = table_id + table_base_offset;
-            // Cast is safe as offset **must** be in u32 range. Unable to
-            // create heaps with more descriptors.
-            let table_offset = (gpu.ptr - sampler_start) as u32;
-            pipeline
-                .user_data
-                .set_sampler_table(root_offset as _, table_offset);
-
-            table_id += 1;
-        });
-    }
+fn up_align(x: u32, alignment: u32) -> u32 {
+    (x + alignment - 1) & !(alignment - 1)
 }
 
 #[derive(Clone)]
@@ -200,6 +131,11 @@ impl UserData {
     fn clear_dirty(&mut self, i: usize) {
         self.dirty_mask &= !(1 << i);
     }
+
+    /// Mark all entries as dirty.
+    fn dirty_all(&mut self) {
+        self.dirty_mask = !0;
+    }
 }
 
 #[derive(Clone)]
@@ -230,12 +166,94 @@ impl PipelineCache {
             sampler_start: 0,
         }
     }
+
+    fn bind_descriptor_sets<'a, I, J>(
+        &mut self,
+        layout: &n::PipelineLayout,
+        first_set: usize,
+        sets: I,
+        offsets: J,
+    ) -> [*mut d3d12::ID3D12DescriptorHeap; 2]
+    where
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<com::DescriptorSetOffset>,
+    {
+        assert!(offsets.into_iter().next().is_none()); //TODO
+
+        let mut sets = sets.into_iter().peekable();
+        let (
+            srv_cbv_uav_start, sampler_start,
+            heap_srv_cbv_uav, heap_sampler,
+        ) = if let Some(set_0) = sets.peek().map(Borrow::borrow) {
+            (
+                set_0.srv_cbv_uav_gpu_start().ptr, set_0.sampler_gpu_start().ptr,
+                set_0.heap_srv_cbv_uav.as_raw(), set_0.heap_samplers.as_raw(),
+            )
+        } else {
+            return [ptr::null_mut(); 2];
+        };
+
+        self.srv_cbv_uav_start = srv_cbv_uav_start;
+        self.sampler_start = sampler_start;
+
+        let mut table_id = 0;
+        for table in &layout.tables[..first_set] {
+            if table.contains(n::SRV_CBV_UAV) {
+                table_id += 1;
+            }
+            if table.contains(n::SAMPLERS) {
+                table_id += 1;
+            }
+        }
+
+        let table_base_offset = layout
+            .root_constants
+            .iter()
+            .fold(0, |sum, c| sum + c.range.end - c.range.start);
+
+        for (set, table) in sets.zip(layout.tables[first_set..].iter()) {
+            let set = set.borrow();
+            set.first_gpu_view.map(|gpu| {
+                assert!(table.contains(n::SRV_CBV_UAV));
+
+                let root_offset = table_id + table_base_offset;
+                // Cast is safe as offset **must** be in u32 range. Unable to
+                // create heaps with more descriptors.
+                let table_offset = (gpu.ptr - srv_cbv_uav_start) as u32;
+                self
+                    .user_data
+                    .set_srv_cbv_uav_table(root_offset as _, table_offset);
+
+                table_id += 1;
+            });
+            set.first_gpu_sampler.map(|gpu| {
+                assert!(table.contains(n::SAMPLERS));
+
+                let root_offset = table_id + table_base_offset;
+                // Cast is safe as offset **must** be in u32 range. Unable to
+                // create heaps with more descriptors.
+                let table_offset = (gpu.ptr - sampler_start) as u32;
+                self
+                    .user_data
+                    .set_sampler_table(root_offset as _, table_offset);
+
+                table_id += 1;
+            });
+        }
+
+        [heap_srv_cbv_uav, heap_sampler]
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum BindPoint {
     Compute,
-    Graphics,
+    Graphics {
+        /// Internal pipelines used for blitting, copying, etc.
+        internal: bool,
+    }
 }
 
 #[derive(Clone)]
@@ -253,7 +271,7 @@ struct Copy {
 pub struct CommandBuffer {
     raw: ComPtr<d3d12::ID3D12GraphicsCommandList>,
     allocator: ComPtr<d3d12::ID3D12CommandAllocator>,
-    signatures: CmdSignatures,
+    shared: Arc<Shared>,
 
     // Cache renderpasses for graphics operations
     pass_cache: Option<RenderPassCache>,
@@ -262,11 +280,17 @@ pub struct CommandBuffer {
     // Cache current graphics root signature and pipeline to minimize rebinding and support two
     // bindpoints.
     gr_pipeline: PipelineCache,
+    // Primitive topology of the currently bound graphics pipeline.
+    // Caching required for internal graphics pipelines.
+    primitive_topology: d3d12::D3D12_PRIMITIVE_TOPOLOGY,
     // Cache current compute root signature and pipeline.
     comp_pipeline: PipelineCache,
     // D3D12 only has one slot for both bindpoints. Need to rebind everything if we want to switch
     // between different bind points (ie. calling draw or dispatch).
     active_bindpoint: BindPoint,
+    // Current descriptor heaps heaps (CBV/SRV/UAV and Sampler).
+    // Required for resetting due to internal descriptor heaps.
+    active_descriptor_heaps: [*mut d3d12::ID3D12DescriptorHeap; 2],
 
     // Active queries in the command buffer.
     // Queries must begin and end in the same command buffer, which allows us to track them.
@@ -279,34 +303,63 @@ pub struct CommandBuffer {
     // Cached vertex buffer views to bind.
     // `Stride` values are not known at `bind_vertex_buffers` time because they are only stored
     // inside the pipeline state.
+    vertex_bindings_remap: [Option<n::VertexBinding>; MAX_VERTEX_BUFFERS],
     vertex_buffer_views: [d3d12::D3D12_VERTEX_BUFFER_VIEW; MAX_VERTEX_BUFFERS],
 
     // Re-using allocation for the image-buffer copies.
     copies: Vec<Copy>,
+
+    // D3D12 only allows setting all viewports or all scissors at once, not partial updates.
+    // So we must cache the implied state for these partial updates.
+    viewport_cache: SmallVec<[d3d12::D3D12_VIEWPORT; d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize]>,
+    scissor_cache: SmallVec<[d3d12::D3D12_RECT; d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize]>,
+
+    // HACK: renderdoc workaround for temporary RTVs
+    rtv_pools: Vec<ComPtr<d3d12::ID3D12DescriptorHeap>>,
+    // Temporary gpu descriptor heaps (internal).
+    temporary_gpu_heaps: Vec<ComPtr<d3d12::ID3D12DescriptorHeap>>,
+    // Resources that need to be alive till the end of the GPU execution.
+    retained_resources: Vec<ComPtr<d3d12::ID3D12Resource>>,
 }
 
 unsafe impl Send for CommandBuffer { }
 unsafe impl Sync for CommandBuffer { }
 
+// Insetion point for subpasses.
+enum BarrierPoint {
+    // Pre barriers are inserted of the beginning when switching into a new subpass.
+    Pre,
+    // Post barriers are applied after exectuing the user defined commands.
+    Post,
+}
+
 impl CommandBuffer {
     pub(crate) fn new(
         raw: ComPtr<d3d12::ID3D12GraphicsCommandList>,
         allocator: ComPtr<d3d12::ID3D12CommandAllocator>,
-        signatures: CmdSignatures,
+        shared: Arc<Shared>,
     ) -> Self {
         CommandBuffer {
             raw,
             allocator,
-            signatures,
+            shared,
             pass_cache: None,
             cur_subpass: !0,
             gr_pipeline: PipelineCache::new(),
+            primitive_topology: d3dcommon::D3D_PRIMITIVE_TOPOLOGY_UNDEFINED,
             comp_pipeline: PipelineCache::new(),
-            active_bindpoint: BindPoint::Graphics,
+            active_bindpoint: BindPoint::Graphics { internal: false },
+            active_descriptor_heaps: [ptr::null_mut(); 2],
             occlusion_query: None,
             pipeline_stats_query: None,
+            vertex_bindings_remap: [None; MAX_VERTEX_BUFFERS],
             vertex_buffer_views: [NULL_VERTEX_BUFFER_VIEW; MAX_VERTEX_BUFFERS],
             copies: Vec::new(),
+            viewport_cache: SmallVec::new(),
+            scissor_cache: SmallVec::new(),
+            rtv_pools: Vec::new(),
+            temporary_gpu_heaps: Vec::new(),
+            retained_resources: Vec::new(),
         }
     }
 
@@ -319,17 +372,38 @@ impl CommandBuffer {
         self.pass_cache = None;
         self.cur_subpass = !0;
         self.gr_pipeline = PipelineCache::new();
+        self.primitive_topology = d3dcommon::D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         self.comp_pipeline = PipelineCache::new();
-        self.active_bindpoint = BindPoint::Graphics;
+        self.active_bindpoint = BindPoint::Graphics { internal: false };
+        self.active_descriptor_heaps = [ptr::null_mut(); 2];
         self.occlusion_query = None;
         self.pipeline_stats_query = None;
+        self.vertex_bindings_remap = [None; MAX_VERTEX_BUFFERS];
         self.vertex_buffer_views = [NULL_VERTEX_BUFFER_VIEW; MAX_VERTEX_BUFFERS];
+        self.rtv_pools.clear();
+        self.temporary_gpu_heaps.clear();
+        self.retained_resources.clear();
     }
 
-    fn insert_subpass_barriers(&self) {
+    // Indicates that the pipeline slot has been overriden with an internal pipeline.
+    //
+    // This only invalidates the slot and the user data!
+    fn set_internal_graphics_pipeline(&mut self) {
+        self.active_bindpoint = BindPoint::Graphics { internal: true };
+        self.gr_pipeline.user_data.dirty_all();
+    }
+
+    fn bind_descriptor_heaps(&mut self) {
+        unsafe { self.raw.SetDescriptorHeaps(2, self.active_descriptor_heaps.as_mut_ptr()); }
+    }
+
+    fn insert_subpass_barriers(&self, insertion: BarrierPoint) {
         let state = self.pass_cache.as_ref().unwrap();
-        let proto_barriers = match state.render_pass.subpasses.get(self.cur_subpass) {
-            Some(subpass) => &subpass.pre_barriers,
+        let proto_barriers =  match state.render_pass.subpasses.get(self.cur_subpass) {
+            Some(subpass) => match insertion {
+                BarrierPoint::Pre => &subpass.pre_barriers,
+                BarrierPoint::Post => &subpass.post_barriers,
+            },
             None => &state.render_pass.post_barriers,
         };
 
@@ -407,6 +481,44 @@ impl CommandBuffer {
         }
     }
 
+    fn resolve_attachments(&self) {
+        let state = self.pass_cache.as_ref().unwrap();
+        let framebuffer = &state.framebuffer;
+        let subpass = &state.render_pass.subpasses[self.cur_subpass];
+
+        for (i, resolve_attachment) in subpass.resolve_attachments.iter().enumerate() {
+            let (dst_attachment, _) = *resolve_attachment;
+            let (src_attachment, _) = subpass.color_attachments[i];
+
+            let resolve_src = state.framebuffer.attachments[src_attachment];
+            let resolve_dst = state.framebuffer.attachments[dst_attachment];
+
+            // The number of layers of the render area are given on framebuffer creation.
+            for l in 0..framebuffer.layers {
+                // Attachtments only have a single mip level by specification.
+                let subresource_src = resolve_src.calc_subresource(
+                    resolve_src.mip_levels.0 as _,
+                    (resolve_src.layers.0 + l) as _,
+                );
+                let subresource_dst = resolve_dst.calc_subresource(
+                    resolve_dst.mip_levels.0 as _,
+                    (resolve_dst.layers.0 + l) as _,
+                );
+
+                // TODO: take width and height of render area into account.
+                unsafe {
+                    self.raw.ResolveSubresource(
+                        resolve_dst.resource,
+                        subresource_dst,
+                        resolve_src.resource,
+                        subresource_src,
+                        resolve_dst.dxgi_format,
+                    );
+                }
+            }
+        }
+    }
+
     fn clear_render_target_view(
         &self,
         rtv: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -460,30 +572,73 @@ impl CommandBuffer {
     }
 
     fn set_graphics_bind_point(&mut self) {
-        if self.active_bindpoint != BindPoint::Graphics {
-            // Switch to graphics bind point
-            let (pipeline, _) = self.gr_pipeline.pipeline.expect("No graphics pipeline bound");
-            unsafe { self.raw.SetPipelineState(pipeline); }
-            self.active_bindpoint = BindPoint::Graphics;
+        match self.active_bindpoint {
+            BindPoint::Compute => {
+                // Switch to graphics bind point
+                let (pipeline, _) = self.gr_pipeline.pipeline.expect("No graphics pipeline bound");
+                unsafe { self.raw.SetPipelineState(pipeline); }
+            }
+            BindPoint::Graphics { internal: true } => {
+                // Switch to graphics bind point
+                let (pipeline, signature) = self.gr_pipeline.pipeline.expect("No graphics pipeline bound");
+                unsafe {
+                    self.raw.SetPipelineState(pipeline);
+                    self.raw.SetGraphicsRootSignature(signature);
+                }
+                self.bind_descriptor_heaps();
+            }
+            BindPoint::Graphics { internal: false } => {}
         }
 
+        self.active_bindpoint = BindPoint::Graphics { internal: false };
         let cmd_buffer = &mut self.raw;
 
         // Bind vertex buffers
-        // We currently don't support offsets for vertex buffer binding, therefore,
-        // we only need to find out how many vertex buffer we need to bind.
-        let num_vbs = self.vertex_buffer_views
-            .iter()
-            .position(|view| view.SizeInBytes == 0)
-            .unwrap_or(MAX_VERTEX_BUFFERS);
+        // Use needs_bind array to determine which buffers still need to be bound
+        // and bind them one continuous group at a time.
+        {
+            let vbs_remap = &self.vertex_bindings_remap;
+            let vbs = &self.vertex_buffer_views;
+            let mut last_end_slot = 0;
+            loop {
+                match vbs_remap[last_end_slot..]
+                    .iter()
+                    .position(|remap| remap.is_some())
+                {
+                    Some(start_offset) => {
+                        let start_slot = last_end_slot + start_offset;
+                        let buffers = vbs_remap[start_slot..]
+                            .iter()
+                            .take_while(|x| x.is_some())
+                            .filter_map(|x| *x)
+                            .map(|mapping| {
+                                let view = vbs[mapping.mapped_binding];
 
-        unsafe {
-            cmd_buffer.IASetVertexBuffers(
-                0,
-                num_vbs as _,
-                self.vertex_buffer_views.as_ptr(),
-            );
+                                d3d12::D3D12_VERTEX_BUFFER_VIEW {
+                                    BufferLocation: view.BufferLocation + mapping.offset as u64,
+                                    SizeInBytes: view.SizeInBytes - mapping.offset,
+                                    StrideInBytes: mapping.stride,
+                                }
+                            })
+                            .collect::<SmallVec<[_; MAX_VERTEX_BUFFERS]>>();
+                        let num_views = buffers.len();
+
+                        unsafe {
+                            cmd_buffer.IASetVertexBuffers(
+                                start_slot as _,
+                                buffers.len() as _,
+                                buffers.as_ptr(),
+                            );
+                        }
+                        last_end_slot = start_slot + num_views;
+                    },
+                    None => break,
+                }
+            }
         }
+        // Don't re-bind vertex buffers again.
+        self.vertex_bindings_remap = [None; MAX_VERTEX_BUFFERS];
+
         // Flush root signature data
         Self::flush_user_data(
             &mut self.gr_pipeline,
@@ -502,12 +657,24 @@ impl CommandBuffer {
     }
 
     fn set_compute_bind_point(&mut self) {
-        if self.active_bindpoint != BindPoint::Compute {
-            // Switch to compute bind point
-            assert!(self.comp_pipeline.pipeline.is_some(), "No compute pipeline bound");
-            let (pipeline, _) = self.comp_pipeline.pipeline.unwrap();
-            unsafe { self.raw.SetPipelineState(pipeline); }
-            self.active_bindpoint = BindPoint::Compute;
+        match self.active_bindpoint {
+            BindPoint::Graphics { internal } => {
+                // Switch to compute bind point
+                let (pipeline, _) = self.comp_pipeline.pipeline.expect("No compute pipeline bound");
+                unsafe { self.raw.SetPipelineState(pipeline); }
+                self.active_bindpoint = BindPoint::Compute;
+
+                if internal {
+                    self.bind_descriptor_heaps();
+                    // Rebind the graphics root signature as we come from an internal graphics.
+                    // Issuing a draw call afterwards would hide the information that we internally
+                    // changed the graphics root signature.
+                    if let Some((_, signature)) = self.gr_pipeline.pipeline {
+                        unsafe { self.raw.SetGraphicsRootSignature(signature); }
+                    }
+                }
+            }
+            BindPoint::Compute => {} // Nothing to do
         }
 
         let cmd_buffer = &mut self.raw;
@@ -630,6 +797,11 @@ impl CommandBuffer {
         } else {
             r.buffer_height
         };
+        let image_extent_aligned = image::Extent {
+            width: up_align(r.image_extent.width, image.block_dim.0 as _),
+            height: up_align(r.image_extent.height, image.block_dim.1 as _),
+            depth: r.image_extent.depth,
+        };
         let row_pitch = div(buffer_width, image.block_dim.0 as _) * image.bytes_per_block as u32;
         let slice_pitch = div(buffer_height, image.block_dim.1 as _) * row_pitch;
         let is_pitch_aligned = row_pitch % d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0;
@@ -637,33 +809,33 @@ impl CommandBuffer {
         for layer in r.image_layers.layers.clone() {
             let img_subresource = image
                 .calc_subresource(r.image_layers.level as _, layer as _, 0);
-            let layer_offset = r.buffer_offset as u64 + (layer as u32 * slice_pitch * r.image_extent.depth) as u64;
+            let layer_relative = (layer - r.image_layers.layers.start) as u32;
+            let layer_offset = r.buffer_offset as u64 + (layer_relative * slice_pitch * r.image_extent.depth) as u64;
             let aligned_offset = layer_offset & !(d3d12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64 - 1);
             if layer_offset == aligned_offset && is_pitch_aligned {
                 // trivial case: everything is aligned, ready for copying
                 copies.push(Copy {
                     footprint_offset: aligned_offset,
-                    footprint: r.image_extent,
+                    footprint: image_extent_aligned,
                     row_pitch,
                     img_subresource,
                     img_offset: r.image_offset,
                     buf_offset: image::Offset::ZERO,
-                    copy_extent: r.image_extent,
+                    copy_extent: image_extent_aligned,
                 });
             } else if is_pitch_aligned {
                 // buffer offset is not aligned
-                assert_eq!(image.block_dim, (1, 1)); // TODO
-                let row_pitch_texels = row_pitch / image.bytes_per_block as u32;
+                let row_pitch_texels = row_pitch / image.bytes_per_block as u32 * image.block_dim.0 as u32;
                 let gap = (layer_offset - aligned_offset) as i32;
                 let buf_offset = image::Offset {
-                    x: gap % row_pitch as i32,
-                    y: (gap % slice_pitch as i32) / row_pitch as i32,
+                    x: (gap % row_pitch as i32) / image.bytes_per_block as i32 * image.block_dim.0 as i32,
+                    y: (gap % slice_pitch as i32) / row_pitch as i32 * image.block_dim.1 as i32,
                     z: gap / slice_pitch as i32,
                 };
                 let footprint = image::Extent {
-                    width: buf_offset.x as u32 + r.image_extent.width,
-                    height: buf_offset.y as u32 + r.image_extent.height,
-                    depth: buf_offset.z as u32 + r.image_extent.depth,
+                    width: buf_offset.x as u32 + image_extent_aligned.width,
+                    height: buf_offset.y as u32 + image_extent_aligned.height,
+                    depth: buf_offset.z as u32 + image_extent_aligned.depth,
                 };
                 if r.image_extent.width + buf_offset.x as u32 <= row_pitch_texels {
                     // we can map it to the aligned one and adjust the offsets accordingly
@@ -674,7 +846,7 @@ impl CommandBuffer {
                         img_subresource,
                         img_offset: r.image_offset,
                         buf_offset,
-                        copy_extent: r.image_extent,
+                        copy_extent: image_extent_aligned
                     });
                 } else {
                     // split the copy region into 2 that suffice the previous condition
@@ -700,8 +872,8 @@ impl CommandBuffer {
                     copies.push(Copy {
                         footprint_offset: aligned_offset,
                         footprint: image::Extent {
-                            width: r.image_extent.width - half,
-                            height: footprint.height + 1,
+                            width: image_extent_aligned.width - half,
+                            height: footprint.height + image.block_dim.1 as u32,
                             depth: footprint.depth,
                         },
                         row_pitch,
@@ -712,44 +884,44 @@ impl CommandBuffer {
                         },
                         buf_offset: image::Offset {
                             x: 0,
-                            .. buf_offset
+                            y: buf_offset.y + image.block_dim.1 as i32,
+                            z: buf_offset.z,
                         },
                         copy_extent: image::Extent {
-                            width: r.image_extent.width - half,
-                            .. r.image_extent
+                            width: image_extent_aligned.width - half,
+                            .. image_extent_aligned
                         },
                     });
                 }
             } else {
                 // worst case: row by row copy
-                assert_eq!(image.block_dim, (1, 1)); // TODO
                 for z in 0 .. r.image_extent.depth {
-                    for y in 0 .. r.image_extent.height {
+                    for y in 0 .. image_extent_aligned.height / image.block_dim.1 as u32 {
                         // an image row starts non-aligned
                         let row_offset = layer_offset +
                             z as u64 * slice_pitch as u64 +
                             y as u64 * row_pitch as u64;
                         let aligned_offset = row_offset & !(d3d12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64 - 1);
                         let next_aligned_offset = aligned_offset + d3d12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
-                        let cut_row_texels = (next_aligned_offset - row_offset) / image.bytes_per_block as u64;
-                        let cut_width = cmp::min(r.image_extent.width, cut_row_texels as image::Size);
-                        let gap_texels = (row_offset - aligned_offset) as image::Size / image.bytes_per_block as image::Size;
+                        let cut_row_texels = (next_aligned_offset - row_offset) / image.bytes_per_block as u64 * image.block_dim.0 as u64;
+                        let cut_width = cmp::min(image_extent_aligned.width, cut_row_texels as image::Size);
+                        let gap_texels = (row_offset - aligned_offset) as image::Size / image.bytes_per_block as image::Size * image.block_dim.0 as image::Size;
                         // this is a conservative row pitch that should be compatible with both copies
-                        let max_unaligned_pitch = r.image_extent.width * image.bytes_per_block as u32;
-                        let row_pitch = (max_unaligned_pitch | d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) + 1;
+                        let max_unaligned_pitch = (r.image_extent.width + gap_texels) * image.bytes_per_block as u32;
+                        let row_pitch = (max_unaligned_pitch | (d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) + 1;
 
                         copies.push(Copy {
                             footprint_offset: aligned_offset,
                             footprint: image::Extent {
                                 width: cut_width + gap_texels,
-                                height: 1,
+                                height: image.block_dim.1 as _,
                                 depth: 1,
                             },
                             row_pitch,
                             img_subresource,
                             img_offset: image::Offset {
                                 x: r.image_offset.x,
-                                y: r.image_offset.y + y as i32,
+                                y: r.image_offset.y + image.block_dim.1 as i32 * y as i32,
                                 z: r.image_offset.z + z as i32,
                             },
                             buf_offset: image::Offset {
@@ -759,35 +931,35 @@ impl CommandBuffer {
                             },
                             copy_extent: image::Extent {
                                 width: cut_width,
-                                height: 1,
+                                height: image.block_dim.1 as _,
                                 depth: 1,
                             },
                         });
 
                         // and if it crosses a pitch alignment - we copy the rest separately
-                        if cut_width == r.image_extent.width {
+                        if cut_width >= image_extent_aligned.width {
                             continue;
                         }
-                        let leftover = r.image_extent.width - cut_width;
+                        let leftover = image_extent_aligned.width - cut_width;
 
                         copies.push(Copy {
                             footprint_offset: next_aligned_offset,
                             footprint: image::Extent {
                                 width: leftover,
-                                height: 1,
+                                height: image.block_dim.1 as _,
                                 depth: 1,
                             },
                             row_pitch,
                             img_subresource,
                             img_offset: image::Offset {
                                 x: r.image_offset.x + cut_width as i32,
-                                y: r.image_offset.y + y as i32,
+                                y: r.image_offset.y + y as i32 * image.block_dim.1 as i32,
                                 z: r.image_offset.z + z as i32,
                             },
                             buf_offset: image::Offset::ZERO,
                             copy_extent: image::Extent {
                                 width: leftover,
-                                height: 1,
+                                height: image.block_dim.1 as _,
                                 depth: 1,
                             },
                         });
@@ -799,8 +971,8 @@ impl CommandBuffer {
 }
 
 impl com::RawCommandBuffer<Backend> for CommandBuffer {
-    fn begin(&mut self, _flags: com::CommandBufferFlags) {
-        // TODO: Implement flags somehow.
+    fn begin(&mut self, _flags: com::CommandBufferFlags, _info: com::CommandBufferInheritanceInfo<Backend>) {
+        // TODO: Implement flags and secondary command buffers (bundles).
         self.reset();
     }
 
@@ -812,7 +984,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         self.reset();
     }
 
-    fn begin_render_pass_raw<T>(
+    fn begin_render_pass<T>(
         &mut self,
         render_pass: &n::RenderPass,
         framebuffer: &n::Framebuffer,
@@ -870,19 +1042,25 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             attachment_clears,
         });
         self.cur_subpass = 0;
-        self.insert_subpass_barriers();
+        self.insert_subpass_barriers(BarrierPoint::Pre);
         self.bind_targets();
     }
 
     fn next_subpass(&mut self, _contents: com::SubpassContents) {
+        self.insert_subpass_barriers(BarrierPoint::Post);
+        self.resolve_attachments();
+
         self.cur_subpass += 1;
-        self.insert_subpass_barriers();
+        self.insert_subpass_barriers(BarrierPoint::Pre);
         self.bind_targets();
     }
 
     fn end_render_pass(&mut self) {
+        self.insert_subpass_barriers(BarrierPoint::Post);
+        self.resolve_attachments();
+
         self.cur_subpass = !0;
-        self.insert_subpass_barriers();
+        self.insert_subpass_barriers(BarrierPoint::Pre);
         self.pass_cache = None;
     }
 
@@ -1012,34 +1190,34 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn clear_color_image_raw(
+    fn clear_image<T>(
         &mut self,
         image: &n::Image,
         _: image::Layout,
-        range: image::SubresourceRange,
-        value: com::ClearColorRaw,
-    ) {
-        assert_eq!(range, image.to_subresource_range(Aspects::COLOR));
-        let rtv = image.clear_cv.unwrap();
-        self.clear_render_target_view(rtv, value, &[]);
-    }
-
-    fn clear_depth_stencil_image_raw(
-        &mut self,
-        image: &n::Image,
-        _layout: image::Layout,
-        range: image::SubresourceRange,
-        value: com::ClearDepthStencilRaw,
-    ) {
-        assert!((Aspects::DEPTH | Aspects::STENCIL).contains(range.aspects));
-        assert_eq!(range, image.to_subresource_range(range.aspects));
-        if range.aspects.contains(Aspects::DEPTH) {
-            let dsv = image.clear_dv.unwrap();
-            self.clear_depth_stencil_view(dsv, Some(value.depth), None, &[]);
-        }
-        if range.aspects.contains(Aspects::STENCIL) {
-            let dsv = image.clear_sv.unwrap();
-            self.clear_depth_stencil_view(dsv, None, Some(value.stencil as _), &[]);
+        color: com::ClearColorRaw,
+        depth_stencil: com::ClearDepthStencilRaw,
+        subresource_ranges: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<image::SubresourceRange>,
+    {
+        for subresource_range in subresource_ranges {
+            let sub = subresource_range.borrow();
+            assert_eq!(sub.levels, 0 .. 1); //TODO
+            for layer in sub.layers.clone() {
+                if sub.aspects.contains(Aspects::COLOR) {
+                    let rtv = image.clear_cv[layer as usize];
+                    self.clear_render_target_view(rtv, color, &[]);
+                }
+                if sub.aspects.contains(Aspects::DEPTH) {
+                    let dsv = image.clear_dv[layer as usize];
+                    self.clear_depth_stencil_view(dsv, Some(depth_stencil.depth), None, &[]);
+                }
+                if sub.aspects.contains(Aspects::STENCIL) {
+                    let dsv = image.clear_sv[layer as usize];
+                    self.clear_depth_stencil_view(dsv, None, Some(depth_stencil.stencil as _), &[]);
+                }
+            }
         }
     }
 
@@ -1048,36 +1226,107 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<com::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<pso::Rect>,
+        U::Item: Borrow<pso::ClearRect>,
     {
-        assert!(self.pass_cache.is_some(), "`clear_attachments` can only be called inside a renderpass");
-        let rects: SmallVec<[d3d12::D3D12_RECT; 16]> = rects.into_iter().map(|rect| get_rect(rect.borrow())).collect();
-        for clear in clears {
-            let clear = clear.borrow();
-            match *clear {
-                com::AttachmentClear::Color(index, cv) => {
-                    let rtv = {
-                        let pass_cache = self.pass_cache.as_ref().unwrap();
-                        let rtv_id = pass_cache
-                            .render_pass
-                            .subpasses[self.cur_subpass]
-                            .color_attachments[index]
-                            .0;
+        let pass_cache = match self.pass_cache {
+            Some(ref cache) => cache,
+            None => panic!("`clear_attachments` can only be called inside a renderpass")
+        };
+        let sub_pass = &pass_cache.render_pass.subpasses[self.cur_subpass];
 
-                        pass_cache
-                            .framebuffer
-                            .attachments[rtv_id]
-                            .handle_rtv
-                            .unwrap()
+        let clear_rects: SmallVec<[pso::ClearRect; 16]> = rects
+            .into_iter()
+            .map(|rect| rect.borrow().clone())
+            .collect();
+
+        let mut device = self.shared.service_pipes.device.clone();
+
+        for clear in clears {
+            match *clear.borrow() {
+                com::AttachmentClear::Color { index, value } => {
+                    let attachment = {
+                        let rtv_id = sub_pass.color_attachments[index];
+                        pass_cache.framebuffer.attachments[rtv_id.0]
                     };
 
-                    self.clear_render_target_view(
-                        rtv,
-                        cv.into(),
-                        &rects,
+                    let mut rtv_pool = descriptors_cpu::HeapLinear::new(
+                        &device,
+                        d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        clear_rects.len()
                     );
+
+                    for clear_rect in &clear_rects {
+                        let rect = [get_rect(&clear_rect.rect)];
+
+                        let view_info = device::ViewInfo {
+                            resource: attachment.resource,
+                            kind: attachment.kind,
+                            flags: image::StorageFlags::empty(),
+                            view_kind: image::ViewKind::D2Array,
+                            format: attachment.dxgi_format,
+                            range: image::SubresourceRange {
+                                aspects: Aspects::COLOR,
+                                levels: attachment.mip_levels.0 .. attachment.mip_levels.1,
+                                layers: clear_rect.layers.clone()
+                            }
+                        };
+                        let rtv = rtv_pool.alloc_handle();
+                        Device::view_image_as_render_target_impl(
+                            &mut device,
+                            rtv,
+                            view_info
+                        ).unwrap();
+
+                        self.clear_render_target_view(
+                            rtv,
+                            value.into(),
+                            &rect,
+                        );
+                    }
                 }
-                _ => unimplemented!(),
+                com::AttachmentClear::DepthStencil { depth, stencil } => {
+                    let attachment = {
+                        let dsv_id = sub_pass.depth_stencil_attachment.unwrap();
+                        pass_cache.framebuffer.attachments[dsv_id.0]
+                    };
+
+                    let mut dsv_pool = descriptors_cpu::HeapLinear::new(
+                        &device,
+                        d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                        clear_rects.len()
+                    );
+
+                    for clear_rect in &clear_rects {
+                        let rect = [get_rect(&clear_rect.rect)];
+
+                        let view_info = device::ViewInfo {
+                            resource: attachment.resource,
+                            kind: attachment.kind,
+                            flags: image::StorageFlags::empty(),
+                            view_kind: image::ViewKind::D2Array,
+                            format: attachment.dxgi_format,
+                            range: image::SubresourceRange {
+                                aspects: if depth.is_some()  { Aspects::DEPTH } else { Aspects::empty() } |
+                                    if stencil.is_some() { Aspects::STENCIL } else {Aspects::empty() },
+                                levels: attachment.mip_levels.0 .. attachment.mip_levels.1,
+                                layers: clear_rect.layers.clone()
+                            }
+                        };
+                        let dsv = dsv_pool.alloc_handle();
+                        Device::view_image_as_depth_stencil_impl(
+                            &mut device,
+                            dsv,
+                            view_info
+                        ).unwrap();
+
+                        self.clear_depth_stencil_view(
+                            dsv,
+                            depth,
+                            stencil,
+                            &rect,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1093,6 +1342,8 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<com::ImageResolve>,
     {
+        assert_eq!(src.descriptor.Format, dst.descriptor.Format);
+
         {
             // Insert barrier for `COPY_DEST` to `RESOLVE_DEST` as we only expose
             // `TRANSFER_WRITE` which is used for all copy commands.
@@ -1116,7 +1367,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                         src.calc_subresource(r.src_subresource.level as UINT, r.src_subresource.layers.start as UINT + layer, 0),
                         dst.resource,
                         dst.calc_subresource(r.dst_subresource.level as UINT, r.dst_subresource.layers.start as UINT + layer, 0),
-                        src.dxgi_format,
+                        src.descriptor.Format,
                     );
                 }
             }
@@ -1138,17 +1389,232 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
 
     fn blit_image<T>(
         &mut self,
-        _src: &n::Image,
+        src: &n::Image,
         _src_layout: image::Layout,
-        _dst: &n::Image,
+        dst: &n::Image,
         _dst_layout: image::Layout,
-        _filter: image::Filter,
-        _regions: T,
+        filter: image::Filter,
+        regions: T,
     ) where
         T: IntoIterator,
         T::Item: Borrow<com::ImageBlit>
     {
-        unimplemented!()
+        let device = self.shared.service_pipes.device.clone();
+
+        // TODO: Resource barriers for src.
+        // TODO: depth or stencil images not supported so far
+
+        // TODO: only supporting 2D images
+        match (src.kind, dst.kind) {
+            (image::Kind::D2(..), image::Kind::D2(..)) => {},
+            _ => unimplemented!(),
+        }
+
+        // Descriptor heap for the current blit, only storing the src image
+        let srv_heap = Device::create_descriptor_heap_impl(
+            &mut device.clone(),
+            d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            true,
+            1,
+        );
+        let srv_handle = srv_heap.at(0, 0);
+
+        let srv_desc = Device::build_image_as_shader_resource_desc(
+            &ViewInfo {
+                resource: src.resource,
+                kind: src.kind,
+                flags: src.storage_flags,
+                view_kind: image::ViewKind::D2Array, // TODO
+                format: src.descriptor.Format,
+                range: image::SubresourceRange {
+                    aspects: format::Aspects::COLOR, // TODO
+                    levels: 0..src.descriptor.MipLevels as _,
+                    layers: 0..src.kind.num_layers(),
+                },
+            }
+        ).unwrap();
+        unsafe {
+            device.CreateShaderResourceView(src.resource, &srv_desc, srv_handle.cpu);
+            self.raw.SetDescriptorHeaps(1, &mut srv_heap.raw.as_raw());
+        }
+        self.temporary_gpu_heaps.push(srv_heap.raw);
+
+        let filter = match filter {
+            image::Filter::Nearest => d3d12::D3D12_FILTER_MIN_MAG_MIP_POINT,
+            image::Filter::Linear => d3d12::D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        };
+
+        struct Instance {
+            rtv: d3d12::D3D12_CPU_DESCRIPTOR_HANDLE,
+            viewport: d3d12::D3D12_VIEWPORT,
+            data: internal::BlitData,
+        };
+        let mut instances = FastHashMap::<internal::BlitKey, Vec<Instance>>::default();
+        let mut barriers = Vec::new();
+
+        for region in regions {
+            let r = region.borrow();
+
+            let first_layer = r.dst_subresource.layers.start;
+            let num_layers = r.dst_subresource.layers.end - first_layer;
+
+            // WORKAROUND: renderdoc crashes if we destroy the pool too early
+            let rtv_pool = Device::create_descriptor_heap_impl(
+                &mut device.clone(),
+                d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                false,
+                num_layers as _,
+            );
+            self.rtv_pools.push(rtv_pool.raw.clone());
+
+            let key = match r.dst_subresource.aspects {
+                format::Aspects::COLOR => {
+                    // Create RTVs of the dst image for the miplevel of the current region
+                    for i in 0 .. num_layers {
+                        let mut desc = d3d12::D3D12_RENDER_TARGET_VIEW_DESC {
+                            Format: dst.descriptor.Format,
+                            ViewDimension: d3d12::D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+                            u: unsafe { mem::zeroed() },
+                        };
+
+                        *unsafe { desc.u.Texture2DArray_mut() } = d3d12::D3D12_TEX2D_ARRAY_RTV {
+                            MipSlice: r.dst_subresource.level as _,
+                            FirstArraySlice: (i + first_layer) as u32,
+                            ArraySize: 1,
+                            PlaneSlice: 0, // TODO
+                        };
+
+                        let view = rtv_pool.at(i as _, 0).cpu;
+                        unsafe {
+                            device.CreateRenderTargetView(dst.resource, &desc, view);
+                        }
+                    }
+
+                    (dst.descriptor.Format, filter)
+                },
+                _ => unimplemented!(),
+            };
+
+            // Take flipping into account
+            let viewport = d3d12::D3D12_VIEWPORT {
+                TopLeftX: cmp::min(r.dst_bounds.start.x, r.dst_bounds.end.x) as _,
+                TopLeftY: cmp::min(r.dst_bounds.start.y, r.dst_bounds.end.y) as _,
+                Width: (r.dst_bounds.end.x - r.dst_bounds.start.x).abs() as _,
+                Height: (r.dst_bounds.end.y - r.dst_bounds.start.y).abs() as _,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+
+            let mut list = instances
+                .entry(key)
+                .or_insert(Vec::new());
+
+            for i in 0..num_layers {
+                let src_layer = r.src_subresource.layers.start + i;
+                // Screen space triangle blitting
+                let data = {
+                    // Image extents, layers are treated as depth
+                    let (sx, dx) = if r.dst_bounds.start.x > r.dst_bounds.end.x {
+                        (r.src_bounds.end.x, r.src_bounds.start.x - r.src_bounds.end.x)
+                    } else {
+                        (r.src_bounds.start.x, r.src_bounds.end.x - r.src_bounds.start.x)
+                    };
+                    let (sy, dy) = if r.dst_bounds.start.y > r.dst_bounds.end.y {
+                        (r.src_bounds.end.y, r.src_bounds.start.y - r.src_bounds.end.y)
+                    } else {
+                        (r.src_bounds.start.y, r.src_bounds.end.y - r.src_bounds.start.y)
+                    };
+                    let image::Extent { width, height, .. } = src.kind.level_extent(r.src_subresource.level);
+
+                    internal::BlitData {
+                        src_offset: [
+                            sx as f32 / width as f32,
+                            sy as f32 / height as f32,
+                        ],
+                        src_extent: [
+                            dx as f32 / width as f32,
+                            dy as f32 / height as f32,
+                        ],
+                        layer: src_layer as f32,
+                        level: r.src_subresource.level as _,
+                    }
+                };
+
+                list.push(Instance {
+                    rtv: rtv_pool.at(i as _, 0).cpu,
+                    viewport,
+                    data,
+                });
+
+                barriers.push(Self::transition_barrier(
+                    d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: dst.resource,
+                        Subresource: dst.calc_subresource(r.dst_subresource.level as _, (first_layer + i) as _, 0),
+                        StateBefore: d3d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: d3d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    }
+                ));
+            }
+        }
+
+        // pre barriers
+        unsafe {
+            self.raw.ResourceBarrier(barriers.len() as _, barriers.as_ptr());
+        }
+        // execute blits
+        self.set_internal_graphics_pipeline();
+        for (key, list) in instances {
+            let blit = self.shared.service_pipes.get_blit_2d_color(key);
+            unsafe {
+                self.raw.IASetPrimitiveTopology(d3dcommon::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                self.raw.SetPipelineState(blit.pipeline.as_raw());
+                self.raw.SetGraphicsRootSignature(blit.signature.as_raw());
+                self.raw.SetGraphicsRootDescriptorTable(0, srv_handle.gpu);
+            }
+            for inst in list {
+                let scissor = d3d12::D3D12_RECT {
+                    left: inst.viewport.TopLeftX as _,
+                    top: inst.viewport.TopLeftY as _,
+                    right: (inst.viewport.TopLeftX + inst.viewport.Width) as _,
+                    bottom: (inst.viewport.TopLeftY + inst.viewport.Height) as _,
+                };
+                unsafe {
+                    self.raw.RSSetViewports(1, &inst.viewport);
+                    self.raw.RSSetScissorRects(1, &scissor);
+                    self.raw.SetGraphicsRoot32BitConstants(
+                        1,
+                        (mem::size_of::<internal::BlitData>() / 4) as _,
+                        &inst.data as *const _ as *const _,
+                        0,
+                    );
+                    self.raw.OMSetRenderTargets(1, &inst.rtv, TRUE, ptr::null());
+                    self.raw.DrawInstanced(3, 1, 0, 0);
+                }
+            }
+        }
+        // post barriers
+        for bar in &mut barriers {
+            let mut transition = *unsafe { bar.u.Transition_mut() };
+            mem::swap(&mut transition.StateBefore, &mut transition.StateAfter);
+        }
+        unsafe {
+            self.raw.ResourceBarrier(barriers.len() as _, barriers.as_ptr());
+        }
+
+        // Reset states
+        unsafe {
+            self.raw.RSSetViewports(
+                self.viewport_cache.len() as _,
+                self.viewport_cache.as_ptr(),
+            );
+            self.raw.RSSetScissorRects(
+                self.scissor_cache.len() as _,
+                self.scissor_cache.as_ptr(),
+            );
+            if self.primitive_topology != d3dcommon::D3D_PRIMITIVE_TOPOLOGY_UNDEFINED {
+                self.raw.IASetPrimitiveTopology(self.primitive_topology);
+            }
+        }
     }
 
     fn bind_index_buffer(&mut self, ibv: buffer::IndexBufferView<Backend>) {
@@ -1168,21 +1634,30 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn bind_vertex_buffers(&mut self, vbs: pso::VertexBufferSet<Backend>) {
+    fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    where
+        I: IntoIterator<Item = (T, buffer::Offset)>,
+        T: Borrow<n::Buffer>,
+    {
         // Only cache the vertex buffer views as we don't know the stride (PSO).
-        for (&(buffer, offset), view) in vbs.0.iter().zip(self.vertex_buffer_views.iter_mut()) {
-            let base = unsafe { (*buffer.resource).GetGPUVirtualAddress() };
-            view.BufferLocation = base + offset as u64;
-            view.SizeInBytes = buffer.size_in_bytes - offset as u32;
+        assert!(first_binding as usize <= MAX_VERTEX_BUFFERS);
+        for ((buffer, offset), view) in buffers
+            .into_iter()
+            .zip(self.vertex_buffer_views[first_binding as _..].iter_mut())
+        {
+            let b = buffer.borrow();
+            let base = unsafe { (*b.resource).GetGPUVirtualAddress() };
+            view.BufferLocation = base + offset;
+            view.SizeInBytes = b.size_in_bytes - offset as u32;
         }
     }
 
-    fn set_viewports<T>(&mut self, viewports: T)
+    fn set_viewports<T>(&mut self, first_viewport: u32, viewports: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Viewport>,
     {
-        let viewports: SmallVec<[d3d12::D3D12_VIEWPORT; 16]> = viewports
+        let viewports = viewports
             .into_iter()
             .map(|viewport| {
                 let viewport = viewport.borrow();
@@ -1195,25 +1670,45 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                     MaxDepth: viewport.depth.end,
                 }
             })
-            .collect();
+            .enumerate();
+
+        for (i, viewport) in viewports {
+            if i + first_viewport as usize >= self.viewport_cache.len() {
+                self.viewport_cache.push(viewport);
+            } else {
+                self.viewport_cache[i + first_viewport as usize] = viewport;
+            }
+        }
 
         unsafe {
             self.raw.RSSetViewports(
-                viewports.len() as _,
-                viewports.as_ptr(),
+                self.viewport_cache.len() as _,
+                self.viewport_cache.as_ptr(),
             );
         }
     }
 
-    fn set_scissors<T>(&mut self, scissors: T)
+    fn set_scissors<T>(&mut self, first_scissor: u32, scissors: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Rect>,
     {
-        let rects: SmallVec<[d3d12::D3D12_RECT; 16]> = scissors.into_iter().map(|rect| get_rect(rect.borrow())).collect();
+        let rects = scissors
+            .into_iter()
+            .map(|rect| get_rect(rect.borrow()))
+            .enumerate();
+
+        for (i, rect) in rects {
+            if i + first_scissor as usize >= self.scissor_cache.len() {
+                self.scissor_cache.push(rect);
+            } else {
+                self.scissor_cache[i + first_scissor as usize] = rect;
+            }
+        }
+
         unsafe {
             self.raw
-                .RSSetScissorRects(rects.len() as _, rects.as_ptr())
+                .RSSetScissorRects(self.scissor_cache.len() as _, self.scissor_cache.as_ptr())
         };
     }
 
@@ -1221,16 +1716,40 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         unsafe { self.raw.OMSetBlendFactor(&color); }
     }
 
-    fn set_stencil_reference(&mut self, front: pso::StencilValue, back: pso::StencilValue) {
-        if front != back {
-            error!(
-                "Unable to set different stencil ref values for front ({}) and back ({})",
-                front,
-                back,
+    fn set_stencil_reference(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        assert!(!faces.is_empty());
+
+        if !faces.is_all() {
+            warn!(
+                "Stencil ref values set for both faces but only one was requested ({})",
+                faces.bits(),
             );
         }
 
-        unsafe { self.raw.OMSetStencilRef(front as _); }
+        unsafe { self.raw.OMSetStencilRef(value as _); }
+    }
+
+    fn set_stencil_read_mask(&mut self, _faces: pso::Face, _value: pso::StencilValue) {
+        unimplemented!();
+    }
+
+    fn set_stencil_write_mask(&mut self, _faces: pso::Face, _value: pso::StencilValue) {
+        unimplemented!();
+    }
+
+    fn set_depth_bounds(&mut self, bounds: Range<f32>) {
+        match self.raw.cast::<d3d12::ID3D12GraphicsCommandList1>() {
+            Ok(cmd_list1) => unsafe { cmd_list1.OMSetDepthBounds(bounds.start, bounds.end) },
+            Err(_) => warn!("Depth bounds test is not supported"),
+        }
+    }
+
+    fn set_line_width(&mut self, width: f32) {
+        validate_line_width(width);
+    }
+
+    fn set_depth_bias(&mut self, _depth_bias: pso::DepthBias) {
+        unimplemented!()
     }
 
     fn bind_graphics_pipeline(&mut self, pipeline: &n::GraphicsPipeline) {
@@ -1244,45 +1763,46 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                     self.gr_pipeline.num_parameter_slots = pipeline.num_parameter_slots;
                     self.gr_pipeline.root_constants = pipeline.constants.clone();
                     // All slots need to be rebound internally on signature change.
-                    self.gr_pipeline.user_data.dirty_mask = !0;
+                    self.gr_pipeline.user_data.dirty_all();
                 }
             }
             self.raw.SetPipelineState(pipeline.raw);
             self.raw.IASetPrimitiveTopology(pipeline.topology);
+            self.primitive_topology = pipeline.topology;
         };
 
-        self.active_bindpoint = BindPoint::Graphics;
+        self.active_bindpoint = BindPoint::Graphics { internal: false };
         self.gr_pipeline.pipeline = Some((pipeline.raw, pipeline.signature));
-
-        // Update strides
-        for (view, stride) in self.vertex_buffer_views
-                                  .iter_mut()
-                                  .zip(pipeline.vertex_strides.iter())
-        {
-            view.StrideInBytes = *stride;
-        }
+        self.vertex_bindings_remap = pipeline.vertex_bindings;
 
         if let Some(ref vp) = pipeline.baked_states.viewport {
-            self.set_viewports(iter::once(vp));
+            self.set_viewports(0, iter::once(vp));
         }
         if let Some(ref rect) = pipeline.baked_states.scissor {
-            self.set_scissors(iter::once(rect));
+            self.set_scissors(0, iter::once(rect));
         }
         if let Some(color) = pipeline.baked_states.blend_color {
             self.set_blend_constants(color);
         }
+        if let Some(ref bounds) = pipeline.baked_states.depth_bounds {
+            self.set_depth_bounds(bounds.clone());
+        }
     }
 
-    fn bind_graphics_descriptor_sets<'a, T>(
+    fn bind_graphics_descriptor_sets<'a, I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<com::DescriptorSetOffset>,
     {
-        bind_descriptor_sets(&self.raw, &mut self.gr_pipeline, layout, first_set, sets);
+        self.active_descriptor_heaps = self.gr_pipeline.bind_descriptor_sets(layout, first_set, sets, offsets);
+        self.bind_descriptor_heaps();
     }
 
     fn bind_compute_pipeline(&mut self, pipeline: &n::ComputePipeline) {
@@ -1296,7 +1816,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                     self.comp_pipeline.num_parameter_slots = pipeline.num_parameter_slots;
                     self.comp_pipeline.root_constants = pipeline.constants.clone();
                     // All slots need to be rebound internally on signature change.
-                    self.comp_pipeline.user_data.dirty_mask = !0;
+                    self.comp_pipeline.user_data.dirty_all();
                 }
             }
             self.raw.SetPipelineState(pipeline.raw);
@@ -1306,16 +1826,20 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         self.comp_pipeline.pipeline = Some((pipeline.raw, pipeline.signature));
     }
 
-    fn bind_compute_descriptor_sets<T>(
+    fn bind_compute_descriptor_sets<I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<com::DescriptorSetOffset>,
     {
-        bind_descriptor_sets(&self.raw, &mut self.comp_pipeline, layout, first_set, sets);
+        self.active_descriptor_heaps = self.comp_pipeline.bind_descriptor_sets(layout, first_set, sets, offsets);
+        self.bind_descriptor_heaps();
     }
 
     fn dispatch(&mut self, count: WorkGroupCount) {
@@ -1329,7 +1853,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         self.set_compute_bind_point();
         unsafe {
             self.raw.ExecuteIndirect(
-                self.signatures.dispatch.as_raw(),
+                self.shared.signatures.dispatch.as_raw(),
                 1,
                 buffer.resource,
                 offset,
@@ -1339,18 +1863,31 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    fn fill_buffer(
+    fn fill_buffer<R>(
         &mut self,
         buffer: &n::Buffer,
-        range: Range<buffer::Offset>,
+        range: R,
         data: u32,
-    ) {
+    ) where
+        R: RangeArg<buffer::Offset>,
+    {
         assert!(buffer.clear_uav.is_some(), "Buffer needs to be created with usage `TRANSFER_DST`");
-        assert_eq!(range, 0..buffer.size_in_bytes as u64); // TODO: Need to dynamically create UAVs
+        let bytes_per_unit = 4;
+        let start = *range.start().unwrap_or(&0) as i32;
+        let end = *range.end().unwrap_or(&(buffer.size_in_bytes as u64)) as i32;
+        if start % 4  != 0 || end % 4 != 0 {
+            warn!("Fill buffer bounds have to be multiples of 4");
+        }
+        let rect = d3d12::D3D12_RECT {
+            left: start / bytes_per_unit,
+            top: 0,
+            right: end / bytes_per_unit,
+            bottom: 1,
+        };
 
         // Insert barrier for `COPY_DEST` to `UNORDERED_ACCESS` as we use
         // `TRANSFER_WRITE` for all clear commands.
-        let transition_barrier = Self::transition_barrier(
+        let pre_barrier = Self::transition_barrier(
             d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: buffer.resource,
                 Subresource: d3d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -1358,21 +1895,26 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 StateAfter: d3d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             }
         );
-        unsafe { self.raw.ResourceBarrier(1, &transition_barrier) };
+        unsafe { self.raw.ResourceBarrier(1, &pre_barrier) };
 
-        let handles = buffer.clear_uav.unwrap();
+        error!("fill_buffer currently unimplemented");
+        // TODO: GPU handle must be in the current heap. Atm we use a CPU descriptor heap for allocation
+        //       which is not shader visible.
+        /*
+        let handle = buffer.clear_uav.unwrap();
         unsafe {
             self.raw.ClearUnorderedAccessViewUint(
-                handles.gpu,
-                handles.cpu,
+                handle.gpu,
+                handle.cpu,
                 buffer.resource,
                 &[data as UINT; 4],
-                0,
-                ptr::null_mut(), // TODO: lift with the forementioned restriction
+                1,
+                &rect as *const _,
             );
         }
+        */
 
-        let transition_barrier = Self::transition_barrier(
+        let post_barrier = Self::transition_barrier(
             d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: buffer.resource,
                 Subresource: d3d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -1380,7 +1922,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 StateAfter: d3d12::D3D12_RESOURCE_STATE_COPY_DEST,
             }
         );
-        unsafe { self.raw.ResourceBarrier(1, &transition_barrier) };
+        unsafe { self.raw.ResourceBarrier(1, &post_barrier) };
     }
 
     fn update_buffer(
@@ -1430,19 +1972,74 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             u: unsafe { mem::zeroed() },
         };
-
         let mut dst_image = d3d12::D3D12_TEXTURE_COPY_LOCATION {
             pResource: dst.resource,
             Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             u: unsafe { mem::zeroed() },
         };
 
+        let device = self.shared.service_pipes.device.clone();
+        let src_desc = src.surface_type.desc();
+        let dst_desc = dst.surface_type.desc();
+        assert_eq!(src_desc.bits, dst_desc.bits);
+        //Note: Direct3D 10.1 enables copies between prestructured-typed textures
+        // and block-compressed textures of the same bit widths.
+        let do_alias = src.surface_type != dst.surface_type &&
+            src_desc.is_compressed() == dst_desc.is_compressed();
+
+        if do_alias {
+            // D3D12 only permits changing the channel type for copies,
+            // similarly to how it allows the views to be created.
+
+            // create an aliased resource to the source
+            let mut alias = ptr::null_mut();
+            let desc = d3d12::D3D12_RESOURCE_DESC {
+                Format: dst.descriptor.Format,
+                .. src.descriptor.clone()
+            };
+            let (heap_ptr, offset) = match src.place {
+                n::Place::SwapChain => {
+                    error!("Unable to copy from a swapchain image with format conversion: {:?} -> {:?}",
+                        src.descriptor.Format, dst.descriptor.Format);
+                    return
+                }
+                n::Place::Heap { ref raw, offset } => (raw.as_raw(), offset),
+            };
+            assert_eq!(winerror::S_OK, unsafe {
+                device.CreatePlacedResource(
+                    heap_ptr,
+                    offset,
+                    &desc,
+                    d3d12::D3D12_RESOURCE_STATE_COMMON,
+                    ptr::null(),
+                    &d3d12::ID3D12Resource::uuidof(),
+                    &mut alias,
+                )
+            });
+            src_image.pResource = alias as _;
+            self.retained_resources.push(unsafe {
+                ComPtr::from_raw(alias as _)
+            });
+
+            // signal the aliasing transition
+            let sub_barrier = d3d12::D3D12_RESOURCE_ALIASING_BARRIER {
+                pResourceBefore: src.resource,
+                pResourceAfter: src_image.pResource,
+            };
+            let mut barrier = d3d12::D3D12_RESOURCE_BARRIER {
+                Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                u: unsafe { mem::zeroed() },
+            };
+            unsafe {
+                *barrier.u.Aliasing_mut() = sub_barrier;
+                self.raw.ResourceBarrier(1, &barrier as *const _);
+            }
+        }
+
         for region in regions {
             let r = region.borrow();
             debug_assert_eq!(r.src_subresource.layers.len(), r.dst_subresource.layers.len());
-            let num_layers = r.src_subresource.layers.len() as image::Layer;
-            let src_layer_start = r.src_subresource.layers.start;
-            let dst_layer_start = r.dst_subresource.layers.start;
             let src_box = d3d12::D3D12_BOX {
                 left: r.src_offset.x as _,
                 top: r.src_offset.y as _,
@@ -1452,11 +2049,11 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 back: (r.src_offset.z + r.extent.depth as i32) as _,
             };
 
-            for layer in 0..num_layers {
+            for (src_layer, dst_layer) in r.src_subresource.layers.clone().zip(r.dst_subresource.layers.clone()) {
                 *unsafe { src_image.u.SubresourceIndex_mut() } =
-                    src.calc_subresource(r.src_subresource.level as _, (src_layer_start + layer) as _, 0);
+                    src.calc_subresource(r.src_subresource.level as _, src_layer as _, 0);
                 *unsafe { dst_image.u.SubresourceIndex_mut() } =
-                    dst.calc_subresource(r.dst_subresource.level as _, (dst_layer_start + layer) as _, 0);
+                    dst.calc_subresource(r.dst_subresource.level as _, dst_layer as _, 0);
                 unsafe {
                     self.raw.CopyTextureRegion(
                         &dst_image,
@@ -1467,6 +2064,23 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                         &src_box,
                     );
                 }
+            }
+        }
+
+        if do_alias {
+            // signal the aliasing transition - back to the original
+            let sub_barrier = d3d12::D3D12_RESOURCE_ALIASING_BARRIER {
+                pResourceBefore: src_image.pResource,
+                pResourceAfter: src.resource,
+            };
+            let mut barrier = d3d12::D3D12_RESOURCE_BARRIER {
+                Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                u: unsafe { mem::zeroed() },
+            };
+            unsafe {
+                *barrier.u.Aliasing_mut() = sub_barrier;
+                self.raw.ResourceBarrier(1, &barrier as *const _);
             }
         }
     }
@@ -1515,7 +2129,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             let footprint = d3d12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                 Offset: c.footprint_offset,
                 Footprint: d3d12::D3D12_SUBRESOURCE_FOOTPRINT {
-                    Format: image.dxgi_format,
+                    Format: image.descriptor.Format,
                     Width: c.footprint.width,
                     Height: c.footprint.height,
                     Depth: c.footprint.depth,
@@ -1581,7 +2195,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             let footprint = d3d12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                 Offset: c.footprint_offset,
                 Footprint: d3d12::D3D12_SUBRESOURCE_FOOTPRINT {
-                    Format: image.dxgi_format,
+                    Format: image.descriptor.Format,
                     Width: c.footprint.width,
                     Height: c.footprint.height,
                     Depth: c.footprint.depth,
@@ -1637,14 +2251,14 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         &mut self,
         buffer: &n::Buffer,
         offset: buffer::Offset,
-        draw_count: u32,
+        draw_count: DrawCount,
         stride: u32,
     ) {
         assert_eq!(stride, 16);
         self.set_graphics_bind_point();
         unsafe {
             self.raw.ExecuteIndirect(
-                self.signatures.draw.as_raw(),
+                self.shared.signatures.draw.as_raw(),
                 draw_count,
                 buffer.resource,
                 offset,
@@ -1658,14 +2272,14 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         &mut self,
         buffer: &n::Buffer,
         offset: buffer::Offset,
-        draw_count: u32,
+        draw_count: DrawCount,
         stride: u32,
     ) {
         assert_eq!(stride, 20);
         self.set_graphics_bind_point();
         unsafe {
             self.raw.ExecuteIndirect(
-                self.signatures.draw_indexed.as_raw(),
+                self.shared.signatures.draw_indexed.as_raw(),
                 draw_count,
                 buffer.resource,
                 offset,

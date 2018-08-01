@@ -1,11 +1,14 @@
 #[macro_use]
 extern crate log;
+#[macro_use]
 extern crate ash;
 extern crate byteorder;
 extern crate gfx_hal as hal;
 #[macro_use]
 extern crate lazy_static;
 extern crate smallvec;
+#[cfg(feature = "use-rtld-next")]
+extern crate shared_library;
 
 #[cfg(windows)]
 extern crate winapi;
@@ -19,23 +22,30 @@ extern crate xcb;
 #[cfg(feature = "glsl-to-spirv")]
 extern crate glsl_to_spirv;
 
+#[cfg(not(feature = "use-rtld-next"))]
 use ash::{Entry, LoadingError};
 use ash::extensions as ext;
 use ash::version::{EntryV1_0, DeviceV1_0, InstanceV1_0, V1_0};
 use ash::vk;
 
 use hal::{format, image, memory, queue};
-use hal::{Features, Limits, PatchSize, QueueType};
+use hal::{Features, SwapImageIndex, Limits, PatchSize, QueueType};
 use hal::error::{DeviceCreationError, HostExecutionError};
 
 use std::{fmt, mem, ptr};
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
+
+#[cfg(feature = "use-rtld-next")]
+use shared_library::dynamic_library::{DynamicLibrary, SpecialHandles};
+#[cfg(feature = "use-rtld-next")]
+use ash::{EntryCustom, LoadingError};
 
 mod command;
 mod conv;
 mod device;
+mod info;
 mod native;
 mod pool;
 mod result;
@@ -64,9 +74,23 @@ const SURFACE_EXTENSIONS: &'static [&'static str] = &[
     vk::VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
 ];
 
+#[cfg(not(feature = "use-rtld-next"))]
 lazy_static! {
     // Entry function pointers
     pub static ref VK_ENTRY: Result<Entry<V1_0>, LoadingError> = Entry::new();
+}
+
+#[cfg(feature = "use-rtld-next")]
+lazy_static! {
+    // Entry function pointers
+    pub static ref VK_ENTRY: Result<EntryCustom<V1_0, ()>, LoadingError>
+        = EntryCustom::new_custom(
+            || Ok(()),
+            |_, name| unsafe {
+                DynamicLibrary::symbol_special(SpecialHandles::Next, &*name.to_string_lossy())
+                    .unwrap_or(ptr::null_mut())
+            }
+        );
 }
 
 pub struct RawInstance(pub ash::Instance<V1_0>, Option<(ext::DebugReport, vk::DebugReportCallbackEXT)>);
@@ -143,7 +167,7 @@ impl Instance {
             application_version: version,
             p_engine_name: b"gfx-rs\0".as_ptr() as *const _,
             engine_version: 1,
-            api_version: 0, //TODO: VK_API_VERSION_1_1
+            api_version: vk_make_version!(1, 0, 0),
         };
 
         let instance_extensions = entry
@@ -318,11 +342,11 @@ pub struct PhysicalDevice {
 
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     fn open(
-        &self, families: Vec<(&QueueFamily, Vec<hal::QueuePriority>)>
+        &self, families: &[(&QueueFamily, &[hal::QueuePriority])]
     ) -> Result<hal::Gpu<Backend>, DeviceCreationError> {
         let family_infos = families
             .iter()
-            .map(|&(ref family, ref priorities)| vk::DeviceQueueCreateInfo {
+            .map(|&(family, priorities)| vk::DeviceQueueCreateInfo {
                 s_type: vk::StructureType::DeviceQueueCreateInfo,
                 p_next: ptr::null(),
                 flags: vk::DeviceQueueCreateFlags::empty(),
@@ -393,7 +417,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         let device_arc = device.raw.clone();
         let queues = families
             .into_iter()
-            .map(|(family, priorities)| {
+            .map(|&(family, ref priorities)| {
                 let family_index = family.index;
                 let mut family_raw = hal::backend::RawQueueGroup::new(family.clone());
                 for id in 0 .. priorities.len() {
@@ -406,7 +430,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                         swapchain_fn: swapchain_fn.clone(),
                     });
                 }
-                (queue::QueueFamilyId(family_index as _), family_raw)
+                family_raw
             })
             .collect();
 
@@ -510,6 +534,11 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     }
 
     fn features(&self) -> Features {
+        // see https://github.com/gfx-rs/gfx/issues/1930
+        let is_windows_intel_kaby = cfg!(windows) &&
+            self.properties.vendor_id == info::intel::VENDOR &&
+            self.properties.device_id & info::intel::DEVICE_KABY_LAKE_MASK == info::intel::DEVICE_KABY_LAKE_MASK;
+
         let features = self.instance.0.get_physical_device_features(self.handle);
         let mut bits = Features::empty();
 
@@ -534,7 +563,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         if features.sample_rate_shading != 0 {
             bits |= Features::SAMPLE_RATE_SHADING;
         }
-        if features.dual_src_blend != 0 {
+        if features.dual_src_blend != 0 && !is_windows_intel_kaby {
             bits |= Features::DUAL_SRC_BLENDING;
         }
         if features.logic_op != 0 {
@@ -607,9 +636,21 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             max_viewports: limits.max_viewports as _,
             max_compute_group_count: [max_group_count[0] as _, max_group_count[1] as _, max_group_count[2] as _],
             max_compute_group_size: [max_group_size[0] as _, max_group_size[1] as _, max_group_size[2] as _],
+            max_vertex_input_attributes: limits.max_vertex_input_attributes as _,
+            max_vertex_input_bindings: limits.max_vertex_input_bindings as _,
+            max_vertex_input_attribute_offset: limits.max_vertex_input_attribute_offset as _,
+            max_vertex_input_binding_stride: limits.max_vertex_input_binding_stride as _,
+            max_vertex_output_components: limits.max_vertex_output_components as _,
             min_buffer_copy_offset_alignment: limits.optimal_buffer_copy_offset_alignment as _,
             min_buffer_copy_pitch_alignment: limits.optimal_buffer_copy_row_pitch_alignment as _,
+            min_texel_buffer_offset_alignment: limits.min_texel_buffer_offset_alignment as _,
             min_uniform_buffer_offset_alignment: limits.min_uniform_buffer_offset_alignment as _,
+            min_storage_buffer_offset_alignment: limits.min_storage_buffer_offset_alignment as _,
+            framebuffer_color_samples_count: limits.framebuffer_color_sample_counts.flags() as _,
+            framebuffer_depth_samples_count: limits.framebuffer_depth_sample_counts.flags() as _,
+            framebuffer_stencil_samples_count: limits.framebuffer_stencil_sample_counts.flags() as _,
+            max_color_attachments: limits.max_color_attachments as _,
+            non_coherent_atom_size: limits.non_coherent_atom_size as _,
         }
     }
 }
@@ -683,10 +724,10 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
         assert_eq!(Ok(()), result);
     }
 
-    fn present<IS, IW>(&mut self, swapchains: IS, wait_semaphores: IW)
+    fn present<IS, S, IW>(&mut self, swapchains: IS, wait_semaphores: IW) -> Result<(), ()>
     where
-        IS: IntoIterator,
-        IS::Item: BorrowMut<window::Swapchain>,
+        IS: IntoIterator<Item = (S, SwapImageIndex)>,
+        S: Borrow<window::Swapchain>,
         IW: IntoIterator,
         IW::Item: Borrow<native::Semaphore>,
     {
@@ -697,15 +738,9 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
 
         let mut frames = Vec::new();
         let mut vk_swapchains = Vec::new();
-        for mut swapchain in swapchains {
-            let swapchain = swapchain.borrow_mut();
-
-            frames.push(swapchain
-                .frame_queue
-                .pop_front()
-                .expect("No frame currently acquired.") as _
-            );
-            vk_swapchains.push(swapchain.raw);
+        for (swapchain, index) in swapchains {
+            vk_swapchains.push(swapchain.borrow().raw);
+            frames.push(index);
         }
 
         let info = vk::PresentInfoKHR {
@@ -719,10 +754,14 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
             p_results: ptr::null_mut(),
         };
 
-        assert_eq!(vk::Result::Success, unsafe {
+        match unsafe {
             self.swapchain_fn
                 .queue_present_khr(*self.raw, &info)
-        });
+        } {
+            vk::Result::Success => Ok(()),
+            vk::Result::SuboptimalKhr | vk::Result::ErrorOutOfDateKhr => Err(()),
+            _ => panic!("Failed to present frame"),
+        }
     }
 
     fn wait_idle(&self) -> Result<(), HostExecutionError> {

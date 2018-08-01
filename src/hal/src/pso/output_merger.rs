@@ -3,29 +3,29 @@
 //! the input shader results, depth/stencil information, etc.
 
 use super::graphics::StencilValue;
+use super::State;
 
 /// A pixel-wise comparison function.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Comparison {
     /// `false`
-    Never,
+    Never = 0,
     /// `x < y`
-    Less,
-    /// `x <= y`
-    LessEqual,
+    Less = 1,
     /// `x == y`
-    Equal,
-    /// `x >= y`
-    GreaterEqual,
+    Equal = 2,
+    /// `x <= y`
+    LessEqual = 3,
     /// `x > y`
-    Greater,
+    Greater = 4,
     /// `x != y`
-    NotEqual,
+    NotEqual = 5,
+    /// `x >= y`
+    GreaterEqual = 6,
     /// `true`
-    Always,
+    Always = 7,
 }
-
 
 bitflags!(
     /// Target output color mask.
@@ -61,25 +61,25 @@ impl Default for ColorMask {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Factor {
-    Zero,
-    One,
-    SrcColor,
-    OneMinusSrcColor,
-    DstColor,
-    OneMinusDstColor,
-    SrcAlpha,
-    OneMinusSrcAlpha,
-    DstAlpha,
-    OneMinusDstAlpha,
-    ConstColor,
-    OneMinusConstColor,
-    ConstAlpha,
-    OneMinusConstAlpha,
-    SrcAlphaSaturate,
-    Src1Color,
-    OneMinusSrc1Color,
-    Src1Alpha,
-    OneMinusSrc1Alpha,
+    Zero = 0,
+    One = 1,
+    SrcColor = 2,
+    OneMinusSrcColor = 3,
+    DstColor = 4,
+    OneMinusDstColor = 5,
+    SrcAlpha = 6,
+    OneMinusSrcAlpha = 7,
+    DstAlpha = 8,
+    OneMinusDstAlpha = 9,
+    ConstColor = 10,
+    OneMinusConstColor = 11,
+    ConstAlpha = 12,
+    OneMinusConstAlpha = 13,
+    SrcAlphaSaturate = 14,
+    Src1Color = 15,
+    OneMinusSrc1Color = 16,
+    Src1Alpha = 17,
+    OneMinusSrc1Alpha = 18,
 }
 
 /// Blending operations.
@@ -230,25 +230,26 @@ impl DepthTest {
 }
 
 /// The operation to use for stencil masking.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum StencilOp {
     /// Keep the current value in the stencil buffer (no change).
-    Keep,
+    Keep = 0,
     /// Set the value in the stencil buffer to zero.
-    Zero,
-    /// Set the stencil buffer value to `value` from `StencilSide`
-    Replace,
+    Zero = 1,
+    /// Set the stencil buffer value to `reference` from `StencilFace`.
+    Replace = 2,
     /// Increment the stencil buffer value, clamping to its maximum value.
-    IncrementClamp,
-    /// Increment the stencil buffer value, wrapping around to 0 on overflow.
-    IncrementWrap,
+    IncrementClamp = 3,
     /// Decrement the stencil buffer value, clamping to its minimum value.
-    DecrementClamp,
-    /// Decrement the stencil buffer value, wrapping around to the maximum value on overflow.
-    DecrementWrap,
+    DecrementClamp = 4,
     /// Bitwise invert the current value in the stencil buffer.
-    Invert,
+    Invert = 5,
+    /// Increment the stencil buffer value, wrapping around to 0 on overflow.
+    IncrementWrap = 6,
+    /// Decrement the stencil buffer value, wrapping around to the maximum value on overflow.
+    DecrementWrap = 7,
 }
 
 /// Complete stencil state for a given side of a face.
@@ -259,15 +260,31 @@ pub struct StencilFace {
     pub fun: Comparison,
     /// A mask that is ANDd with both the stencil buffer value and the reference value when they
     /// are read before doing the stencil test.
-    pub mask_read: StencilValue,
+    pub mask_read: State<StencilValue>,
     /// A mask that is ANDd with the stencil value before writing to the stencil buffer.
-    pub mask_write: StencilValue,
+    pub mask_write: State<StencilValue>,
     /// What operation to do if the stencil test fails.
     pub op_fail: StencilOp,
     /// What operation to do if the stencil test passes but the depth test fails.
     pub op_depth_fail: StencilOp,
     /// What operation to do if both the depth and stencil test pass.
     pub op_pass: StencilOp,
+    /// The reference value used for stencil tests.
+    pub reference: State<StencilValue>,
+}
+
+impl Default for StencilFace {
+    fn default() -> StencilFace {
+        StencilFace {
+            fun: Comparison::Never,
+            mask_read: State::Static(!0),
+            mask_write: State::Static(!0),
+            op_fail: StencilOp::Keep,
+            op_depth_fail: StencilOp::Keep,
+            op_pass: StencilOp::Keep,
+            reference: State::Static(0),
+        }
+    }
 }
 
 /// Defines a stencil test. Stencil testing is an operation
@@ -303,3 +320,16 @@ pub struct DepthStencilDesc {
     /// Stencil test/write.
     pub stencil: StencilTest,
 }
+
+bitflags!(
+    /// Face.
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct Face: u32 {
+        /// Empty face. TODO: remove when constexpr are stabilized to use empty()
+        const NONE = 0x0;
+        /// Front face.
+        const FRONT = 0x1;
+        /// Back face.
+        const BACK = 0x2;
+    }
+);

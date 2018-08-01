@@ -48,7 +48,7 @@ pub enum DescriptorType {
     ///
     UniformBufferDynamic = 8,
     ///
-    UniformImageDynamic = 9,
+    StorageBufferDynamic = 9,
     /// Allows unfiltered loads of pixel local data in the fragment shader.
     InputAttachment = 10,
 }
@@ -74,7 +74,8 @@ pub struct DescriptorSetLayoutBinding {
     pub count: DescriptorArrayIndex,
     /// Valid shader stages.
     pub stage_flags: ShaderStageFlags,
-    // TODO: immutable samplers?
+    /// Use the associated list of immutable samplers.
+    pub immutable_samplers: bool,
 }
 
 /// Set of descriptors of a specific type.
@@ -87,35 +88,69 @@ pub struct DescriptorRangeDesc {
     pub count: usize,
 }
 
+/// An error allocating descriptor sets from a pool.
+#[derive(Fail, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationError {
+    /// Memory allocation on the host side failed.
+    /// This could be caused by a lack of memory or pool fragmentation.
+    #[fail(display = "Host memory allocation failed.")]
+    OutOfHostMemory,
+    /// Memory allocation on the host side failed.
+    /// This could be caused by a lack of memory or pool fragmentation.
+    #[fail(display = "Device memory allocation failed.")]
+    OutOfDeviceMemory,
+    /// Memory allocation failed as there is not enough in the pool.
+    /// This could be caused by too many descriptor sets being created.
+    #[fail(display = "Descriptor pool memory allocation failed.")]
+    OutOfPoolMemory,
+    /// Memory allocation failed due to pool fragmentation.
+    #[fail(display = "Descriptor pool is fragmented.")]
+    FragmentedPool,
+    /// Descriptor set allocation failed as the layout is incompatible with the pool.
+    #[fail(display = "Descriptor layout incompatible with pool.")]
+    IncompatibleLayout,
+}
 
 /// A descriptor pool is a collection of memory from which descriptor sets are allocated.
 pub trait DescriptorPool<B: Backend>: Send + Sync + fmt::Debug {
     /// Allocate a descriptor set from the pool.
     ///
     /// The descriptor set will be allocated from the pool according to the corresponding set layout.
-    /// The descriptor pool _must_ have enough space in to allocate the required descriptor.
     /// Descriptors will become invalid once the pool is reset. Usage of invalidated descriptor sets results
     /// in undefined behavior.
-    fn allocate_set(&mut self, layout: &B::DescriptorSetLayout) -> B::DescriptorSet {
-        self.allocate_sets(Some(layout)).remove(0)
+    fn allocate_set(&mut self, layout: &B::DescriptorSetLayout) -> Result<B::DescriptorSet, AllocationError> {
+        let mut sets = Vec::with_capacity(1);
+        self.allocate_sets(Some(layout), &mut sets)
+            .map(|_| sets.remove(0))
     }
 
     /// Allocate one or multiple descriptor sets from the pool.
     ///
     /// Each descriptor set will be allocated from the pool according to the corresponding set layout.
-    /// The descriptor pool _must_ have enough space in to allocate the required descriptors.
     /// Descriptors will become invalid once the pool is reset. Usage of invalidated descriptor sets results
     /// in undefined behavior.
-    fn allocate_sets<I>(&mut self, layouts: I) -> Vec<B::DescriptorSet>
+    fn allocate_sets<I>(&mut self, layouts: I, sets: &mut Vec<B::DescriptorSet>) -> Result<(), AllocationError>
     where
         I: IntoIterator,
         I::Item: Borrow<B::DescriptorSetLayout>,
     {
-        layouts
-            .into_iter()
-            .map(|layout| self.allocate_set(layout.borrow()))
-            .collect()
+        let base = sets.len();
+        for layout in layouts {
+            match self.allocate_set(layout.borrow()) {
+                Ok(set) => sets.push(set),
+                Err(e) => {
+                    self.free_sets(sets.drain(base ..));
+                    return Err(e)
+                }
+            }
+        }
+        Ok(())
     }
+
+    /// Free the given descriptor sets provided as an iterator.
+    fn free_sets<I>(&mut self, descriptor_sets: I)
+    where
+        I: IntoIterator<Item = B::DescriptorSet>;
 
     /// Resets a descriptor pool, releasing all resources from all the descriptor sets
     /// allocated from it and freeing the descriptor sets. Invalidates all descriptor
@@ -145,7 +180,8 @@ pub enum Descriptor<'a, B: Backend> {
     Image(&'a B::ImageView, Layout),
     CombinedImageSampler(&'a B::ImageView, Layout, &'a B::Sampler),
     Buffer(&'a B::Buffer, Range<Option<Offset>>),
-    TexelBuffer(&'a B::BufferView),
+    UniformTexelBuffer(&'a B::BufferView),
+    StorageTexelBuffer(&'a B::BufferView),
 }
 
 

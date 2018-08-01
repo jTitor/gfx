@@ -226,6 +226,8 @@ bitflags! {
         const SAMPLER_LOD_BIAS = 0x2000;
         /// Support setting border texel colors.
         const SAMPLER_BORDER_COLOR = 0x4000;
+        /// Support explicit layouts in shader.
+        const EXPLICIT_LAYOUTS_IN_SHADER = 0x8000;
     }
 }
 
@@ -302,7 +304,9 @@ pub fn query_all(gl: &gl::Gl) -> (Info, Features, LegacyFeatures, Limits, Privat
         max_viewports: 1,
         min_buffer_copy_offset_alignment: 1,
         min_buffer_copy_pitch_alignment: 1,
+        min_texel_buffer_offset_alignment: 1, // TODO
         min_uniform_buffer_offset_alignment: 1, // TODO
+        min_storage_buffer_offset_alignment: 1, // TODO
         .. Limits::default()
     };
 
@@ -344,6 +348,11 @@ pub fn query_all(gl: &gl::Gl) -> (Info, Features, LegacyFeatures, Limits, Privat
         Ext("GL_EXT_texture_filter_anisotropic"),
     ]) {
         features |= Features::SAMPLER_ANISOTROPY;
+    }
+    if info.is_supported(&[
+        Core(4, 2),
+    ]) {
+        legacy |= LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER;
     }
     if info.is_supported(&[
         Core(3, 3),

@@ -4,6 +4,7 @@ use gl;
 
 use hal::{self, buffer, command, image, memory, pass, pso, query, ColorSlot};
 use hal::format::ChannelType;
+use hal::range::RangeArg;
 
 use {native as n, Backend};
 use pool::{self, BufferMemory};
@@ -72,10 +73,11 @@ pub enum Command {
     BindIndexBuffer(gl::types::GLuint),
     //BindVertexBuffers(BufferSlice),
     SetViewports {
+        first_viewport: u32,
         viewport_ptr: BufferSlice,
         depth_range_ptr: BufferSlice,
     },
-    SetScissors(BufferSlice),
+    SetScissors(u32, BufferSlice),
     SetBlendColor(pso::ColorValue),
 
     /// Clear floating-point color drawbuffer of bound framebuffer.
@@ -104,6 +106,12 @@ pub enum Command {
     CopyBufferToSurface(n::RawBuffer, n::Surface, command::BufferImageCopy),
     CopyTextureToBuffer(n::Texture, n::RawBuffer, command::BufferImageCopy),
     CopySurfaceToBuffer(n::Surface, n::RawBuffer, command::BufferImageCopy),
+    CopyImageToTexture(n::ImageKind, n::Texture, command::ImageCopy),
+    CopyImageToSurface(n::ImageKind, n::Surface, command::ImageCopy),
+
+    BindBufferRange(gl::types::GLenum, gl::types::GLuint, n::RawBuffer, gl::types::GLintptr, gl::types::GLsizeiptr),
+    BindTexture(gl::types::GLenum, n::Texture),
+    BindSampler(gl::types::GLuint, n::Texture),
 }
 
 pub type FrameBufferTarget = gl::types::GLenum;
@@ -149,7 +157,7 @@ struct Cache {
     // Maps bound vertex buffer offset (index) to handle.
     vertex_buffers: Vec<gl::types::GLuint>,
     // Active vertex buffer descriptions.
-    vertex_buffer_descs: Vec<pso::VertexBufferDesc>,
+    vertex_buffer_descs: Vec<Option<pso::VertexBufferDesc>>,
     // Active attributes.
     attributes: Vec<n::AttributeDesc>,
 }
@@ -363,20 +371,18 @@ impl RawCommandBuffer {
 
             let handle = vertex_buffers[binding];
 
-            if vertex_buffer_descs.len() <= binding {
-                error!("No vertex buffer description bound at {}", binding);
+            match vertex_buffer_descs.get(binding) {
+                Some(&Some(desc)) => {
+                    assert_eq!(desc.rate, 0); // TODO: Input rate
+                    push_cmd_internal(
+                        &self.id,
+                        &mut self.memory,
+                        &mut self.buf,
+                        Command::BindAttribute(*attribute, handle, desc.stride as _, attribute.vertex_attrib_fn)
+                    );
+                }
+                _ => error!("No vertex buffer description bound at {}", binding),
             }
-
-            let desc = &vertex_buffer_descs[binding];
-
-            assert_eq!(desc.rate, 0); // TODO: Input rate
-
-            push_cmd_internal(
-                &self.id,
-                &mut self.memory,
-                &mut self.buf,
-                Command::BindAttribute(*attribute, handle, desc.stride as _, attribute.vertex_attrib_fn)
-            );
         }
     }
 
@@ -472,7 +478,11 @@ impl RawCommandBuffer {
 }
 
 impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
-    fn begin(&mut self, _flags: hal::command::CommandBufferFlags) { // TODO: Implement flags!
+    fn begin(
+        &mut self,
+        _flags: hal::command::CommandBufferFlags,
+        _inheritance_info: hal::command::CommandBufferInheritanceInfo<Backend>
+    ) { // TODO: Implement flags!
         if self.individual_reset {
             // Implicit buffer reset when individual reset is set.
             self.reset(false);
@@ -525,7 +535,10 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         // TODO
     }
 
-    fn fill_buffer(&mut self, _buffer: &n::Buffer, _range: Range<buffer::Offset>, _data: u32) {
+    fn fill_buffer<R>(&mut self, _buffer: &n::Buffer, _range: R, _data: u32)
+    where
+        R: RangeArg<buffer::Offset>,
+    {
         unimplemented!()
     }
 
@@ -533,7 +546,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
-    fn begin_render_pass_raw<T>(
+    fn begin_render_pass<T>(
         &mut self,
         render_pass: &n::RenderPass,
         framebuffer: &n::FrameBuffer,
@@ -600,13 +613,17 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         // TODO
     }
 
-    fn clear_color_image_raw(
+    fn clear_image<T>(
         &mut self,
         image: &n::Image,
         _: image::Layout,
-        _range: image::SubresourceRange,
-        value: command::ClearColorRaw,
-    ) {
+        color: command::ClearColorRaw,
+        _depth_stencil: command::ClearDepthStencilRaw,
+        _subresource_ranges: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<image::SubresourceRange>,
+    {
         // TODO: clearing strategies
         //  1.  < GL 3.0 / GL ES 3.0: glClear
         //  2.  < GL 4.4: glClearBuffer
@@ -626,20 +643,10 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         match image.channel {
             ChannelType::Unorm | ChannelType::Inorm | ChannelType::Ufloat |
             ChannelType::Float | ChannelType::Srgb | ChannelType::Uscaled |
-            ChannelType::Iscaled => self.push_cmd(Command::ClearBufferColorF(0, unsafe { value.float32 })),
-            ChannelType::Uint => self.push_cmd(Command::ClearBufferColorU(0, unsafe { value.uint32 })),
-            ChannelType::Int => self.push_cmd(Command::ClearBufferColorI(0, unsafe { value.int32 })),
+            ChannelType::Iscaled => self.push_cmd(Command::ClearBufferColorF(0, unsafe { color.float32 })),
+            ChannelType::Uint => self.push_cmd(Command::ClearBufferColorU(0, unsafe { color.uint32 })),
+            ChannelType::Int => self.push_cmd(Command::ClearBufferColorI(0, unsafe { color.int32 })),
         }
-    }
-
-    fn clear_depth_stencil_image_raw(
-        &mut self,
-        _image: &n::Image,
-        _: image::Layout,
-        _range: image::SubresourceRange,
-        _value: command::ClearDepthStencilRaw,
-    ) {
-        unimplemented!()
     }
 
     fn clear_attachments<T, U>(&mut self, _: T, _: U)
@@ -647,7 +654,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<command::AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<pso::Rect>,
+        U::Item: Borrow<pso::ClearRect>,
     {
         unimplemented!()
     }
@@ -691,21 +698,24 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         self.push_cmd(Command::BindIndexBuffer(ibv.buffer.raw));
     }
 
-    fn bind_vertex_buffers(&mut self, vbs: hal::pso::VertexBufferSet<Backend>) {
-        if vbs.0.len() == 0 {
-            return
-        }
-
-        let needed_length = vbs.0.iter().map(|vb| vb.1).max().unwrap() + 1;
-
-        self.cache.vertex_buffers.resize(needed_length as usize, 0);
-
-        for vb in vbs.0 {
-            self.cache.vertex_buffers[vb.1 as usize] = vb.0.raw;
+    fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    where
+        I: IntoIterator<Item = (T, buffer::Offset)>,
+        T: Borrow<n::Buffer>,
+    {
+        for (i, (buffer, offset)) in buffers.into_iter().enumerate() {
+            let index = first_binding as usize + i;
+            if self.cache.vertex_buffers.len() <= index {
+                self.cache.vertex_buffers.resize(index+1, 0);
+            }
+            self.cache.vertex_buffers[index] = buffer.borrow().raw;
+            if offset != 0 {
+                error!("Vertex buffer offset {} is not supported", offset);
+            }
         }
     }
 
-    fn set_viewports<T>(&mut self, viewports: T)
+    fn set_viewports<T>(&mut self, first_viewport: u32, viewports: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Viewport>,
@@ -733,17 +743,17 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                 error!("Number of viewports can not be zero.");
                 self.cache.error_state = true;
             }
-            n if n <= self.limits.max_viewports => {
-                self.push_cmd(Command::SetViewports { viewport_ptr, depth_range_ptr });
+            n if n + first_viewport as usize <= self.limits.max_viewports => {
+                self.push_cmd(Command::SetViewports { first_viewport, viewport_ptr, depth_range_ptr });
             }
             _ => {
-                error!("Number of viewports exceeds the number of maximum viewports");
+                error!("Number of viewports and first viewport index exceed the number of maximum viewports");
                 self.cache.error_state = true;
             }
         }
     }
 
-    fn set_scissors<T>(&mut self, scissors: T)
+    fn set_scissors<T>(&mut self, first_scissor: u32, scissors: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Rect>,
@@ -762,21 +772,47 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                 error!("Number of scissors can not be zero.");
                 self.cache.error_state = true;
             }
-            n if n <= self.limits.max_viewports => {
-                self.push_cmd(Command::SetScissors(scissors_ptr));
+            n if n + first_scissor as usize <= self.limits.max_viewports => {
+                self.push_cmd(Command::SetScissors(first_scissor, scissors_ptr));
             }
             _ => {
-                error!("Number of scissors exceeds the number of maximum viewports");
+                error!("Number of scissors and first scissor index exceed the maximum number of viewports");
                 self.cache.error_state = true;
             }
         }
     }
 
-    fn set_stencil_reference(&mut self, front: pso::StencilValue, back: pso::StencilValue) {
+    fn set_stencil_reference(&mut self, faces: pso::Face, value: pso::StencilValue) {
+        assert!(!faces.is_empty());
+
+        let mut front = 0;
+        let mut back = 0;
+
+        if let Some((last_front, last_back)) = self.cache.stencil_ref {
+            front = last_front;
+            back = last_back;
+        }
+
+        if faces.contains(pso::Face::FRONT) {
+            front = value;
+        }
+
+        if faces.contains(pso::Face::BACK) {
+            back = value;
+        }
+
         // Only cache the stencil references values until
         // we assembled all the pieces to set the stencil state
         // from the pipeline.
         self.cache.stencil_ref = Some((front, back));
+    }
+
+    fn set_stencil_read_mask(&mut self, _faces: pso::Face, _value: pso::StencilValue) {
+        unimplemented!();
+    }
+
+    fn set_stencil_write_mask(&mut self, _faces: pso::Face, _value: pso::StencilValue) {
+        unimplemented!();
     }
 
     fn set_blend_constants(&mut self, cv: pso::ColorValue) {
@@ -784,6 +820,18 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
             self.cache.blend_color = Some(cv);
             self.push_cmd(Command::SetBlendColor(cv));
         }
+    }
+
+    fn set_depth_bounds(&mut self, _: Range<f32>) {
+        warn!("Depth bounds test is not supported");
+    }
+
+    fn set_line_width(&mut self, _width: f32) {
+        unimplemented!()
+    }
+
+    fn set_depth_bias(&mut self, _depth_bias: pso::DepthBias) {
+        unimplemented!()
     }
 
     fn bind_graphics_pipeline(&mut self, pipeline: &n::GraphicsPipeline) {
@@ -819,16 +867,62 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         self.update_blend_targets(blend_targets);
     }
 
-    fn bind_graphics_descriptor_sets<T>(
+    fn bind_graphics_descriptor_sets<I, J>(
         &mut self,
-        _layout: &n::PipelineLayout,
-        _first_set: usize,
-        _sets: T,
+        layout: &n::PipelineLayout,
+        first_set: usize,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<command::DescriptorSetOffset>,
     {
-        // TODO
+        assert!(offsets.into_iter().next().is_none()); // TODO: offsets unsupported
+
+        let mut set = first_set as _;
+        let drd = &*layout.desc_remap_data.read().unwrap();
+
+        for desc_set in sets {
+            let desc_set = desc_set.borrow();
+            for new_binding in &*desc_set.bindings.lock().unwrap() {
+                match new_binding {
+                    n::DescSetBindings::Buffer {ty: btype, binding, buffer, offset, size} => {
+                        let btype = match btype {
+                            n::BindingTypes::UniformBuffers => gl::UNIFORM_BUFFER,
+                            n::BindingTypes::Images => panic!("Wrong desc set binding"),
+                        };
+                        for binding in drd.get_binding(n::BindingTypes::UniformBuffers, set, *binding).unwrap() {
+                            self.push_cmd(Command::BindBufferRange(
+                                btype,
+                                *binding,
+                                *buffer,
+                                *offset,
+                                *size,
+                            ))
+                        }
+                    }
+                    n::DescSetBindings::Texture(binding, texture) => {
+                        for binding in drd.get_binding(n::BindingTypes::Images, set, *binding).unwrap() {
+                            self.push_cmd(Command::BindTexture(
+                                *binding,
+                                *texture,
+                            ))
+                        }
+                    }
+                    n::DescSetBindings::Sampler(binding, sampler) => {
+                        for binding in drd.get_binding(n::BindingTypes::Images, set, *binding).unwrap() {
+                            self.push_cmd(Command::BindSampler(
+                                *binding,
+                                *sampler,
+                            ))
+                        }
+                    }
+                }
+            }
+            set += 1;
+        }
     }
 
     fn bind_compute_pipeline(&mut self, pipeline: &n::ComputePipeline) {
@@ -842,14 +936,17 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         }
     }
 
-    fn bind_compute_descriptor_sets<T>(
+    fn bind_compute_descriptor_sets<I, J>(
         &mut self,
         _layout: &n::PipelineLayout,
         _first_set: usize,
-        _sets: T,
+        _sets: I,
+        _offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<n::DescriptorSet>,
+        I: IntoIterator,
+        I::Item: Borrow<n::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<command::DescriptorSetOffset>,
     {
         // TODO
     }
@@ -882,16 +979,29 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
 
     fn copy_image<T>(
         &mut self,
-        _src: &n::Image,
+        src: &n::Image,
         _src_layout: image::Layout,
-        _dst: &n::Image,
+        dst: &n::Image,
         _dst_layout: image::Layout,
-        _regions: T,
+        regions: T,
     ) where
         T: IntoIterator,
         T::Item: Borrow<command::ImageCopy>,
     {
-        unimplemented!()
+        let old_offset = self.buf.offset;
+
+        for region in regions {
+            let r = region.borrow().clone();
+            let cmd = match dst.kind {
+                n::ImageKind::Surface(s) => Command::CopyImageToSurface(src.kind, s, r),
+                n::ImageKind::Texture(t) => Command::CopyImageToTexture(src.kind, t, r),
+            };
+            self.push_cmd(cmd);
+        }
+
+        if self.buf.offset == old_offset {
+            error!("At least one region must be specified");
+        }
     }
 
      fn copy_buffer_to_image<T>(
@@ -1011,7 +1121,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         &mut self,
         _buffer: &n::Buffer,
         _offset: buffer::Offset,
-        _draw_count: u32,
+        _draw_count: hal::DrawCount,
         _stride: u32,
     ) {
         unimplemented!()
@@ -1021,7 +1131,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         &mut self,
         _buffer: &n::Buffer,
         _offset: buffer::Offset,
-        _draw_count: u32,
+        _draw_count: hal::DrawCount,
         _stride: u32,
     ) {
         unimplemented!()

@@ -15,6 +15,8 @@ pub struct Subpass {
     pub inputs: Vec<AttachmentRef>,
     #[serde(default)]
     pub preserves: Vec<String>,
+    #[serde(default)]
+    pub resolves: Vec<AttachmentRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +77,8 @@ pub enum Resource {
     Shader(String),
     DescriptorSetLayout {
         bindings: Vec<hal::pso::DescriptorSetLayoutBinding>,
+        #[serde(default)]
+        immutable_samplers: Vec<String>,
     },
     DescriptorPool {
         capacity: usize,
@@ -99,7 +103,7 @@ pub enum Resource {
         input_assembler: hal::pso::InputAssemblerDesc,
         blender: hal::pso::BlendDesc,
         #[serde(default)]
-        depth_stencil: Option<hal::pso::DepthStencilDesc>,
+        depth_stencil: hal::pso::DepthStencilDesc,
         layout: String,
         subpass: SubpassRef,
     },
@@ -121,8 +125,39 @@ pub enum TransferCommand {
         dst: String,
         regions: Vec<hal::command::BufferCopy>,
     },
-    CopyBufferToImage,
-    CopyImageToBuffer,
+    CopyImage {
+        src: String,
+        dst: String,
+        regions: Vec<hal::command::ImageCopy>,
+    },
+    CopyBufferToImage {
+        src: String,
+        dst: String,
+        regions: Vec<hal::command::BufferImageCopy>,
+    },
+    CopyImageToBuffer {
+        src: String,
+        dst: String,
+        regions: Vec<hal::command::BufferImageCopy>,
+    },
+    ClearImage {
+        image: String,
+        color: hal::command::ClearColor,
+        depth_stencil: hal::command::ClearDepthStencil,
+        ranges: Vec<hal::image::SubresourceRange>,
+    },
+    BlitImage {
+        src: String,
+        dst: String,
+        filter: hal::image::Filter,
+        regions: Vec<hal::command::ImageBlit>,
+    },
+    FillBuffer {
+        buffer: String,
+        start: Option<hal::buffer::Offset>,
+        end: Option<hal::buffer::Offset>,
+        data: u32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -170,9 +205,7 @@ pub struct DrawPass {
 
 #[derive(Debug, Deserialize)]
 pub enum Job {
-    Transfer {
-        commands: Vec<TransferCommand>,
-    },
+    Transfer(TransferCommand),
     Graphics {
         framebuffer: String,
         clear_values: Vec<hal::command::ClearValue>,

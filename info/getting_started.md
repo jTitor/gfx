@@ -13,10 +13,10 @@ sudo dnf install -y libX11-devel vulkan
 For Ubuntu
 
 ```bash
-sudo apt install -y libx11-dev libvulkan-dev
+sudo apt install -y libx11-dev libvulkan-dev libxcb1-dev xorg-dev
 ```
 
-For Linux, a Vulkan compatible driver must also be installed. For example, the open source ``` mesa-vulkan-drivers ``` for Intel or Radeon gpu's. The proprietary Nvidia drivers support Vulkan out of the box but, as of time of writing, Nouveau users are currenty limited to OpenGL.
+For Linux, a Vulkan compatible driver must also be installed. For example, the open source `mesa-vulkan-drivers` for Intel or Radeon gpu's. The proprietary Nvidia drivers support Vulkan out of the box but, as of time of writing, Nouveau users are currenty limited to OpenGL.
 
 ## Usage
 
@@ -26,7 +26,7 @@ To run an example, simply use `cargo run` and specify the backend with `--featur
 
 ```bash
 git clone https://github.com/gfx-rs/gfx
-cd gfx/examples/hal
+cd gfx/examples
 cargo run --bin quad --features vulkan
 cargo run --bin compute --features dx12 1 2 3 4
 ```

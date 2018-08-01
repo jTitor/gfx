@@ -67,8 +67,8 @@ where Cf: format::RenderFormat
 */
 
 fn get_window_dimensions(window: &winit::Window) -> tex::Dimensions {
-    let (width, height) = window.get_inner_size().unwrap();
-    ((width as f32 * window.hidpi_factor()) as tex::Size, (height as f32 * window.hidpi_factor()) as tex::Size, 1, 1.into())
+    let px = window.get_inner_size().unwrap().to_physical(window.get_hidpi_factor());
+    (px.width as tex::Size, px.height as tex::Size, 1, 1.into())
 }
 
 pub struct Surface11 {
@@ -134,7 +134,7 @@ impl core::Surface<device_dx11::Backend> for Surface11 {
             unsafe {
                 swap_chain.GetBuffer(
                     0,
-                    &dxguid::IID_ID3D11Texture2D,
+                    &dxguid::ID3D11Texture2D::uuidof(),
                     &mut back_buffer as *mut *mut winapi::ID3D11Texture2D as *mut *mut _);
             }
 
@@ -215,9 +215,9 @@ impl core::Swapchain<device_dx11::Backend> for Swapchain11 {
         &self.images
     }
 
-    fn acquire_frame(&mut self, sync: core::FrameSync<device_dx11::Resources>) -> core::Frame {
+    fn acquire_image(&mut self, sync: core::FrameSync<device_dx11::Resources>) -> Result<core::Frame, ()> {
         // TODO: sync
-        core::Frame::new(0)
+        Ok(core::Frame::new(0))
     }
 
     fn present<Q>(&mut self, _present_queue: &mut Q, wait_semaphores: &[&h::Semaphore<device_dx11::Resources>])

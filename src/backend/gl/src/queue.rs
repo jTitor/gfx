@@ -1,5 +1,5 @@
 use std::{mem, ptr, slice};
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use Starc;
 
 use hal;
@@ -387,7 +387,7 @@ impl CommandQueue {
                     gl.DispatchComputeIndirect(offset as _);
                 }
             }
-            com::Command::SetViewports { viewport_ptr, depth_range_ptr } => {
+            com::Command::SetViewports { first_viewport, viewport_ptr, depth_range_ptr } => {
                 let gl = &self.share.context;
                 let viewports = Self::get::<[f32; 4]>(data_buf, viewport_ptr);
                 let depth_ranges = Self::get::<[f64; 2]>(data_buf, depth_range_ptr);
@@ -404,11 +404,11 @@ impl CommandQueue {
                 } else if num_viewports > 1 {
                     // Support for these functions is coupled with the support
                     // of multiple viewports.
-                    unsafe { gl.ViewportArrayv(0, num_viewports as i32, viewports.as_ptr() as *const _) };
-                    unsafe { gl.DepthRangeArrayv(0, num_viewports as i32, depth_ranges.as_ptr() as *const _) };
+                    unsafe { gl.ViewportArrayv(first_viewport, num_viewports as i32, viewports.as_ptr() as *const _) };
+                    unsafe { gl.DepthRangeArrayv(first_viewport, num_viewports as i32, depth_ranges.as_ptr() as *const _) };
                 }
             }
-            com::Command::SetScissors(data_ptr) => {
+            com::Command::SetScissors(first_scissor, data_ptr) => {
                 let gl = &self.share.context;
                 let scissors = Self::get::<[i32; 4]>(data_buf, data_ptr);
                 let num_scissors = scissors.len();
@@ -420,7 +420,7 @@ impl CommandQueue {
                 } else {
                     // Support for this function is coupled with the support
                     // of multiple viewports.
-                    unsafe { gl.ScissorArrayv(0, num_scissors as i32, scissors.as_ptr() as *const _) };
+                    unsafe { gl.ScissorArrayv(first_scissor, num_scissors as i32, scissors.as_ptr() as *const _) };
                 }
             }
             com::Command::SetBlendColor(color) => {
@@ -545,6 +545,25 @@ impl CommandQueue {
             com::Command::CopySurfaceToBuffer(..) => {
                 unimplemented!() //TODO: use FBO
             }
+            com::Command::CopyImageToTexture(..) => {
+                unimplemented!() //TODO: use FBO
+            }
+            com::Command::CopyImageToSurface(..) => {
+                unimplemented!() //TODO: use FBO
+            }
+            com::Command::BindBufferRange(target, index, buffer, offset, size) => unsafe {
+                let gl = &self.share.context;
+                gl.BindBufferRange(target, index, buffer, offset, size);
+            }
+            com::Command::BindTexture(index, texture) => unsafe {
+                let gl = &self.share.context;
+                gl.ActiveTexture(gl::TEXTURE0 + index);
+                gl.BindTexture(gl::TEXTURE_2D, texture);
+            }
+            com::Command::BindSampler(index, sampler) => unsafe {
+                let gl = &self.share.context;
+                gl.BindSampler(index, sampler);
+            }
             /*
             com::Command::BindConstantBuffer(pso::ConstantBufferParam(buffer, _, slot)) => unsafe {
                 self.share.context.BindBufferBase(gl::UNIFORM_BUFFER, slot as gl::types::GLuint, buffer);
@@ -652,6 +671,7 @@ impl CommandQueue {
             panic!("Error {:?} executing command: {:?}", err, cmd)
         }
     }
+    
     fn signal_fence(&mut self, fence: &native::Fence) {
         if self.share.private_caps.sync {
             let gl = &self.share.context;
@@ -701,22 +721,24 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
     }
 
     #[cfg(feature = "glutin")]
-    fn present<IS, IW>(&mut self, swapchains: IS, _wait_semaphores: IW)
+    fn present<IS, S, IW>(&mut self, swapchains: IS, _wait_semaphores: IW) -> Result<(), ()>
     where
-        IS: IntoIterator,
-        IS::Item: BorrowMut<window::glutin::Swapchain>,
+        IS: IntoIterator<Item = (S, hal::SwapImageIndex)>,
+        S: Borrow<window::glutin::Swapchain>,
         IW: IntoIterator,
         IW::Item: Borrow<native::Semaphore>,
     {
         use glutin::GlContext;
 
         for swapchain in swapchains {
-            swapchain
+            swapchain.0
                 .borrow()
                 .window
                 .swap_buffers()
                 .unwrap();
         }
+
+        Ok(())
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {

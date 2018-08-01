@@ -4,12 +4,13 @@
 			kind: D2(1, 1, 1, 1),
 			num_levels: 1,
 			format: Rgba8Unorm,
-			usage: (bits: 0x24), //COLOR_ATTACHMENT | SAMPLED (temporary for GL)
+			usage: (bits: 0x14), //COLOR_ATTACHMENT | SAMPLED (temporary for GL)
 		),
 		"pass": RenderPass(
 			attachments: {
 				"c": (
 					format: Some(Rgba8Unorm),
+					samples: 1,
 					ops: (load: Clear, store: Store),
 					layouts: (start: General, end: General),
 				),
@@ -56,7 +57,7 @@
 			),
 			rasterizer: (
 				polygon_mode: Fill,
-				cull_face: None,
+				cull_face: (bits: 0),
 				front_face: Clockwise,
 				depth_clamping: false,
 				depth_bias: None,

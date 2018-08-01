@@ -1,0 +1,31 @@
+thread '<unnamed>' panicked at 'called `Option::unwrap()` on a `None` value', libcore/option.rs:335:21
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+
+error: internal compiler error: unexpected panic
+
+note: the compiler unexpectedly panicked. this is a bug.
+
+note: we would appreciate a bug report: https://github.com/rust-lang/rust/blob/master/CONTRIBUTING.md#bug-reports
+
+note: rustc 1.27.2 (58cc626de 2018-07-18) running on x86_64-apple-darwin
+
+thread '<unnamed>' panicked at 'called `Option::unwrap()` on a `None` value', libcore/option.rs:335:21
+
+error: internal compiler error: unexpected panic
+
+note: the compiler unexpectedly panicked. this is a bug.
+
+note: we would appreciate a bug report: https://github.com/rust-lang/rust/blob/master/CONTRIBUTING.md#bug-reports
+
+note: rustc 1.27.2 (58cc626de 2018-07-18) running on x86_64-apple-darwin
+
+thread '<unnamed>' panicked at 'called `Option::unwrap()` on a `None` value', libcore/option.rs:335:21
+
+error: internal compiler error: unexpected panic
+
+note: the compiler unexpectedly panicked. this is a bug.
+
+note: we would appreciate a bug report: https://github.com/rust-lang/rust/blob/master/CONTRIBUTING.md#bug-reports
+
+note: rustc 1.27.2 (58cc626de 2018-07-18) running on x86_64-apple-darwin
+

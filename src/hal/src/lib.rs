@@ -8,6 +8,7 @@ extern crate bitflags;
 #[macro_use]
 extern crate failure;
 extern crate smallvec;
+extern crate fxhash;
 
 #[cfg(feature = "mint")]
 extern crate mint;
@@ -35,7 +36,8 @@ pub use self::queue::{
     Capability, Supports, General, Graphics, Compute, Transfer,
 };
 pub use self::window::{
-    Backbuffer, Frame, FrameSync, Surface, SurfaceCapabilities, Swapchain, SwapchainConfig,
+    Backbuffer, SwapImageIndex, FrameSync, PresentMode,
+    Surface, SurfaceCapabilities, Swapchain, SwapchainConfig,
 };
 
 pub mod adapter;
@@ -64,8 +66,10 @@ pub type VertexCount = u32;
 pub type VertexOffset = i32;
 /// Draw number of indices.
 pub type IndexCount = u32;
-/// Draw number of instances
+/// Draw number of instances.
 pub type InstanceCount = u32;
+/// Indirect draw calls count.
+pub type DrawCount = u32;
 /// Number of vertices in a patch
 pub type PatchSize = u8;
 /// Number of work groups.
@@ -236,13 +240,38 @@ pub struct Limits {
     ///
     pub max_compute_group_size: [u32; 3],
 
+    /// Maximum number of vertex input attributes that can be specified for a graphics pipeline.
+    pub max_vertex_input_attributes: usize,
+    /// Maximum number of vertex buffers that can be specified for providing vertex attributes to a graphics pipeline.
+    pub max_vertex_input_bindings: usize,
+    /// Maximum vertex input attribute offset that can be added to the vertex input binding stride.
+    pub max_vertex_input_attribute_offset: usize,
+    /// Maximum vertex input binding stride that can be specified in a vertex input binding.
+    pub max_vertex_input_binding_stride: usize,
+    /// Maximum number of components of output variables which can be output by a vertex shader.
+    pub max_vertex_output_components: usize,
+
     /// The alignment of the start of the buffer used as a GPU copy source, in bytes, non-zero.
     pub min_buffer_copy_offset_alignment: buffer::Offset,
     /// The alignment of the row pitch of the texture data stored in a buffer that is
     /// used in a GPU copy operation, in bytes, non-zero.
     pub min_buffer_copy_pitch_alignment: buffer::Offset,
+    /// The alignment of the start of buffer used as a texel buffer, in bytes, non-zero.
+    pub min_texel_buffer_offset_alignment: buffer::Offset,
     /// The alignment of the start of buffer used for uniform buffer updates, in bytes, non-zero.
     pub min_uniform_buffer_offset_alignment: buffer::Offset,
+    /// The alignment of the start of buffer used as a storage buffer, in bytes, non-zero.
+    pub min_storage_buffer_offset_alignment: buffer::Offset,
+    /// Number of samples supported for color attachments of framebuffers (floating/fixed point).
+    pub framebuffer_color_samples_count: image::NumSamples,
+    /// Number of samples supported for depth attachments of framebuffers.
+    pub framebuffer_depth_samples_count: image::NumSamples,
+    /// Number of samples supported for stencil attachments of framebuffers.
+    pub framebuffer_stencil_samples_count: image::NumSamples,
+    /// Maximum number of color attachments that can be used by a subpass in a render pass.
+    pub max_color_attachments: usize,
+    /// Size and alignment in bytes that bounds concurrent access to host-mapped device memory.
+    pub non_coherent_atom_size: usize,
 }
 
 /// Describes the type of geometric primitives,

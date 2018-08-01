@@ -2,8 +2,7 @@
 //! The input assembler collects raw vertex and index data.
 
 use format;
-use buffer::Offset;
-use {Backend, Primitive};
+use {Primitive};
 
 /// Shader binding location.
 pub type Location = u32;
@@ -30,6 +29,8 @@ pub struct Element<F> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct VertexBufferDesc {
+    /// Binding number of this vertex buffer descriptor.
+    pub binding: BufferIndex,
     /// Total container size, in bytes.
     /// Specifies the byte distance between two consecutive elements.
     pub stride: ElemStride,
@@ -43,7 +44,7 @@ pub struct VertexBufferDesc {
 pub struct AttributeDesc {
     /// Attribute binding location in the shader.
     pub location: Location,
-    /// Index of the associated vertex buffer descriptor.
+    /// Binding number of the associated vertex buffer descriptor.
     pub binding: BufferIndex,
     /// Attribute element description.
     pub element: Element<format::Format>,
@@ -84,19 +85,5 @@ impl InputAssemblerDesc {
             primitive,
             primitive_restart: PrimitiveRestart::Disabled,
         }
-    }
-}
-
-/// A complete set of vertex buffers to be used for vertex import in PSO.
-#[derive(Clone, Debug)]
-pub struct VertexBufferSet<'a, B: Backend>(
-    /// Array of buffer handles with offsets in them
-    pub Vec<(&'a B::Buffer, Offset)>,
-);
-
-impl<'a, B: Backend> VertexBufferSet<'a, B> {
-    /// Create an empty set
-    pub fn new() -> Self {
-        VertexBufferSet(Vec::new())
     }
 }

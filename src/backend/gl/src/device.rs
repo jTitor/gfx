@@ -1,15 +1,15 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::iter::repeat;
 use std::ops::Range;
 use std::{ptr, mem, slice};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use gl;
 use gl::types::{GLint, GLenum, GLfloat};
 
-use hal::{self as c, device as d, error, image as i, memory, pass, pso, buffer, mapping, query};
+use hal::{self as c, device as d, error, image as i, memory, pass, pso, buffer, mapping, query, window};
+use hal::backend::FastHashMap;
 use hal::format::{ChannelType, Format, Swizzle};
 use hal::pool::CommandPoolCreateFlags;
 use hal::queue::QueueFamilyId;
@@ -213,6 +213,39 @@ impl Device {
             })
     }
 
+    fn specialize_ast(
+        &self,
+        ast: &mut spirv::Ast<glsl::Target>,
+        specializations: &[pso::Specialization],
+    ) -> Result<(), d::ShaderError> {
+        let spec_constants = ast
+            .get_specialization_constants()
+            .map_err(gen_unexpected_error)?;
+
+        for spec_constant in spec_constants {
+            if let Some(constant) = specializations
+                .iter()
+                .find(|c| c.id == spec_constant.constant_id)
+            {
+                // Override specialization constant values
+                unsafe {
+                    let value = match constant.value {
+                        pso::Constant::Bool(v) => v as u64,
+                        pso::Constant::U32(v) => v as u64,
+                        pso::Constant::U64(v) => v,
+                        pso::Constant::I32(v) => *(&v as *const _ as *const u64),
+                        pso::Constant::I64(v) => *(&v as *const _ as *const u64),
+                        pso::Constant::F32(v) => *(&v as *const _ as *const u64),
+                        pso::Constant::F64(v) => *(&v as *const _ as *const u64),
+                    };
+                    ast.set_scalar_constant(spec_constant.id, value).map_err(gen_unexpected_error)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn translate_spirv(
         &self,
         ast: &mut spirv::Ast<glsl::Target>,
@@ -251,20 +284,126 @@ impl Device {
             })
     }
 
+    fn remap_bindings(
+        &self,
+        ast: &mut spirv::Ast<glsl::Target>,
+        desc_remap_data: &mut n::DescRemapData,
+        nb_map: &mut FastHashMap<String, pso::DescriptorBinding>,
+    ) {
+        let res = ast.get_shader_resources().unwrap();
+        self.remap_binding(ast, desc_remap_data, nb_map, &res.sampled_images, n::BindingTypes::Images);
+        self.remap_binding(ast, desc_remap_data, nb_map, &res.uniform_buffers, n::BindingTypes::UniformBuffers);
+    }
+
+    fn remap_binding(
+        &self,
+        ast: &mut spirv::Ast<glsl::Target>,
+        desc_remap_data: &mut n::DescRemapData,
+        nb_map: &mut FastHashMap<String, pso::DescriptorBinding>,
+        all_res: &[spirv::Resource],
+        btype: n::BindingTypes,
+    ) {
+        for res in all_res {
+            let set = ast.get_decoration(res.id, spirv::Decoration::DescriptorSet).unwrap();
+            let binding = ast.get_decoration(res.id, spirv::Decoration::Binding).unwrap();
+            let nbs = desc_remap_data.get_binding(btype, set as _, binding).unwrap();
+
+            for nb in nbs {
+                if self.share.legacy_features.contains(LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER) {
+                    ast.set_decoration(res.id, spirv::Decoration::Binding, *nb).unwrap()
+                } else {
+                    ast.unset_decoration(res.id, spirv::Decoration::Binding).unwrap();
+                    assert!(nb_map.insert(res.name.clone(), *nb).is_none());
+                }
+                ast.unset_decoration(res.id, spirv::Decoration::DescriptorSet).unwrap();
+            }
+        }
+    }
+
+    fn combine_separate_images_and_samplers(
+        &self,
+        ast: &mut spirv::Ast<glsl::Target>,
+        desc_remap_data: &mut n::DescRemapData,
+        nb_map: &mut FastHashMap<String, pso::DescriptorBinding>,
+    ) {
+        let mut id_map = FastHashMap::<u32, (pso::DescriptorSetIndex, pso::DescriptorBinding)>::default();
+        let res = ast.get_shader_resources().unwrap();
+        self.populate_id_map(ast, &mut id_map, &res.separate_images);
+        self.populate_id_map(ast, &mut id_map, &res.separate_samplers);
+
+        for cis in ast.get_combined_image_samplers().unwrap() {
+            let (set, binding) = id_map.get(&cis.image_id).unwrap();
+            let nb = desc_remap_data.reserve_binding(n::BindingTypes::Images);
+            desc_remap_data.insert_missing_binding(
+                nb,
+                n::BindingTypes::Images,
+                *set,
+                *binding,
+            );
+            let (set, binding) = id_map.get(&cis.sampler_id).unwrap();
+            desc_remap_data.insert_missing_binding(
+                nb,
+                n::BindingTypes::Images,
+                *set,
+                *binding,
+            );
+
+            let new_name = "GFX_HAL_COMBINED_SAMPLER".to_owned()
+                + "_" + &cis.sampler_id.to_string()
+                + "_" + &cis.image_id.to_string()
+                + "_" + &cis.combined_id.to_string() ;
+            ast.set_name(cis.combined_id, &new_name).unwrap();
+            if self.share.legacy_features.contains(LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER) {
+                ast.set_decoration(cis.combined_id, spirv::Decoration::Binding, nb).unwrap()
+            } else {
+                ast.unset_decoration(cis.combined_id, spirv::Decoration::Binding).unwrap();
+                assert!(nb_map.insert(new_name, nb).is_none())
+            }
+            ast.unset_decoration(cis.combined_id, spirv::Decoration::DescriptorSet).unwrap();
+        }
+    }
+
+    fn populate_id_map(
+        &self,
+        ast: &mut spirv::Ast<glsl::Target>,
+        id_map: &mut FastHashMap<u32, (pso::DescriptorSetIndex, pso::DescriptorBinding)>,
+        all_res: &[spirv::Resource],
+    ) {
+        for res in all_res {
+            let set = ast.get_decoration(res.id, spirv::Decoration::DescriptorSet).unwrap();
+            let binding = ast.get_decoration(res.id, spirv::Decoration::Binding).unwrap();
+            assert!(id_map.insert(res.id, (set as _, binding)).is_none())
+        }
+    }
+
     fn compile_shader(
-        &self, point: &pso::EntryPoint<B>, stage: pso::Stage
+        &self,
+        point: &pso::EntryPoint<B>,
+        stage: pso::Stage,
+        desc_remap_data: &mut n::DescRemapData,
+        name_binding_map: &mut FastHashMap<String, pso::DescriptorBinding>,
     ) -> n::Shader {
         assert_eq!(point.entry, "main");
         match *point.module {
-            n::ShaderModule::Raw(raw) => raw,
+            n::ShaderModule::Raw(raw) => {
+                debug!("Can't remap bindings for raw shaders. Assuming they are already rebound.");
+                raw
+            }
             n::ShaderModule::Spirv(ref spirv) => {
                 let mut ast = self.parse_spirv(spirv).unwrap();
+
+                self.specialize_ast(&mut ast, point.specialization).unwrap();
+                self.remap_bindings(&mut ast, desc_remap_data, name_binding_map);
+                self.combine_separate_images_and_samplers(&mut ast, desc_remap_data, name_binding_map);
+
                 let glsl = self.translate_spirv(&mut ast).unwrap();
                 info!("Generated:\n{:?}", glsl);
-                match self.create_shader_module_from_source(glsl.as_bytes(), stage).unwrap() {
+                let shader = match self.create_shader_module_from_source(glsl.as_bytes(), stage).unwrap() {
                     n::ShaderModule::Raw(raw) => raw,
                     _ => panic!("Unhandled")
-                }
+                };
+
+                shader
             }
         }
     }
@@ -291,7 +430,7 @@ impl d::Device<B> for Device {
         let limits = self.share.limits.into();
         let memory = if flags.contains(CommandPoolCreateFlags::RESET_INDIVIDUAL) {
             BufferMemory::Individual {
-                storage: HashMap::new(),
+                storage: FastHashMap::default(),
                 next_buffer_id: 0,
             }
         } else {
@@ -349,14 +488,57 @@ impl d::Device<B> for Device {
         }
     }
 
-    fn create_pipeline_layout<IS, IR>(&self, _: IS, _: IR) -> n::PipelineLayout
+    fn create_pipeline_layout<IS, IR>(&self, layouts: IS, _: IR) -> n::PipelineLayout
     where
         IS: IntoIterator,
         IS::Item: Borrow<n::DescriptorSetLayout>,
         IR: IntoIterator,
         IR::Item: Borrow<(pso::ShaderStageFlags, Range<u32>)>,
     {
-        n::PipelineLayout
+        let mut drd = n::DescRemapData::new();
+
+        layouts
+            .into_iter()
+            .enumerate()
+            .for_each(|(set, layout)| {
+                layout.borrow().iter().for_each(|binding| {
+                    // DescriptorType -> Descriptor
+                    //
+                    // Sampler -> Sampler
+                    // Image -> SampledImage, StorageImage, InputAttachment
+                    // CombinedImageSampler -> CombinedImageSampler
+                    // Buffer -> UniformBuffer, StorageBuffer
+                    // UniformTexel -> UniformTexel
+                    // StorageTexel -> StorageTexel
+
+                    assert!(!binding.immutable_samplers); //TODO: Implement immutable_samplers
+                    use pso::DescriptorType::*;
+                    match binding.ty {
+                        CombinedImageSampler => {
+                            drd.insert_missing_binding_into_spare(n::BindingTypes::Images, set as _, binding.binding);
+                        }
+                        Sampler | SampledImage => {
+                            // We need to figure out combos once we get the shaders, until then we
+                            // do nothing
+                        }
+                        UniformBuffer => {
+                            drd.insert_missing_binding_into_spare(n::BindingTypes::UniformBuffers, set as _, binding.binding);
+                        }
+                        StorageImage
+                        | UniformTexelBuffer
+                        | UniformBufferDynamic
+                        | StorageTexelBuffer
+                        | StorageBufferDynamic
+                        | StorageBuffer
+
+                        | InputAttachment => unimplemented!(), // 6
+                    }
+                })
+            });
+
+        n::PipelineLayout {
+            desc_remap_data: Arc::new(RwLock::new(drd)),
+        }
     }
 
     fn create_graphics_pipeline<'a>(
@@ -385,11 +567,17 @@ impl d::Device<B> for Device {
                 (pso::Stage::Fragment, desc.shaders.fragment.as_ref()),
             ];
 
+            let mut name_binding_map = FastHashMap::<String, pso::DescriptorBinding>::default();
             let shader_names = &shaders
                 .iter()
                 .filter_map(|&(stage, point_maybe)| {
                     point_maybe.map(|point| {
-                        let shader_name = self.compile_shader(point, stage);
+                        let shader_name = self.compile_shader(
+                            point,
+                            stage,
+                            &mut desc.layout.desc_remap_data.write().unwrap(),
+                            &mut name_binding_map,
+                        );
                         unsafe { gl.AttachShader(name, shader_name); }
                         shader_name
                     })
@@ -418,6 +606,17 @@ impl d::Device<B> for Device {
                 }
             }
 
+            if !self.share.legacy_features.contains(LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER) {
+                let gl = &self.share.context;
+                unsafe {
+                    gl.UseProgram(name);
+                    for (bname, binding) in name_binding_map.iter() {
+                        let loc = gl.GetUniformLocation(name, bname.as_ptr() as _);
+                        gl.Uniform1i(loc, *binding as _);
+                    }
+                }
+            }
+
             let status = get_program_iv(gl, name, gl::LINK_STATUS);
             let log = get_program_log(gl, name);
             if status != 0 {
@@ -436,12 +635,20 @@ impl d::Device<B> for Device {
             _ => None
         };
 
+        let mut vertex_buffers = Vec::new();
+        for vb in &desc.vertex_buffers {
+            while vertex_buffers.len() <= vb.binding as usize {
+                vertex_buffers.push(None);
+            }
+            vertex_buffers[vb.binding as usize] = Some(*vb);
+        }
+
         Ok(n::GraphicsPipeline {
             program,
             primitive: conv::primitive_to_gl_primitive(desc.input_assembler.primitive),
             patch_size,
             blend_targets: desc.blender.targets.clone(),
-            vertex_buffers: desc.vertex_buffers.clone(),
+            vertex_buffers,
             attributes: desc.attributes
                 .iter()
                 .map(|&a| {
@@ -465,10 +672,17 @@ impl d::Device<B> for Device {
     ) -> Result<n::ComputePipeline, pso::CreationError> {
         let gl = &self.share.context;
         let share = &self.share;
+
         let program = {
             let name = unsafe { gl.CreateProgram() };
 
-            let shader = self.compile_shader(&desc.shader, pso::Stage::Compute);
+            let mut name_binding_map = FastHashMap::<String, pso::DescriptorBinding>::default();
+            let shader = self.compile_shader(
+                &desc.shader,
+                pso::Stage::Compute,
+                &mut desc.layout.desc_remap_data.write().unwrap(),
+                &mut name_binding_map,
+            );
             unsafe { gl.AttachShader(name, shader) };
 
             unsafe { gl.LinkProgram(name) };
@@ -480,6 +694,17 @@ impl d::Device<B> for Device {
             unsafe {
                 gl.DetachShader(name, shader);
                 gl.DeleteShader(shader);
+            }
+
+            if !self.share.legacy_features.contains(LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER) {
+                let gl = &self.share.context;
+                unsafe {
+                    gl.UseProgram(name);
+                    for (bname, binding) in name_binding_map.iter() {
+                        let loc = gl.GetUniformLocation(name, bname.as_ptr() as _);
+                        gl.Uniform1i(loc, *binding as _);
+                    }
+                }
             }
 
             let status = get_program_iv(gl, name, gl::LINK_STATUS);
@@ -546,7 +771,6 @@ impl d::Device<B> for Device {
             assert!(pass.attachments.len() <= att_points.len());
             gl.DrawBuffers(attachments_len as _, att_points.as_ptr());
             let status = gl.CheckFramebufferStatus(target);
-            assert_eq!(status, gl::FRAMEBUFFER_COMPLETE);
             gl.BindFramebuffer(target, 0);
         }
         if let Err(err) = self.share.check() {
@@ -630,8 +854,7 @@ impl d::Device<B> for Device {
     ) -> Result<UnboundBuffer, buffer::CreationError> {
         if !self.share.legacy_features.contains(LegacyFeatures::CONSTANT_BUFFER) &&
             usage.contains(buffer::Usage::UNIFORM) {
-            error!("Constant buffers are not supported by this GL version");
-            return Err(buffer::CreationError::Other);
+            return Err(buffer::CreationError::UnsupportedUsage { usage });
         }
 
         let target = if self.share.private_caps.buffer_role_change {
@@ -639,7 +862,7 @@ impl d::Device<B> for Device {
         } else {
             match conv::buffer_usage_to_gl_target(usage) {
                 Some(target) => target,
-                None => return Err(buffer::CreationError::Usage(usage)),
+                None => return Err(buffer::CreationError::UnsupportedUsage { usage }),
             }
         };
 
@@ -722,6 +945,7 @@ impl d::Device<B> for Device {
         Ok(n::Buffer {
             raw: unbound.name,
             target,
+            size: unbound.requirements.size,
         })
     }
 
@@ -796,7 +1020,7 @@ impl d::Device<B> for Device {
 
     fn create_buffer_view<R: RangeArg<u64>>(
         &self, _: &n::Buffer, _: Option<Format>, _: R
-    ) -> Result<n::BufferView, buffer::ViewError> {
+    ) -> Result<n::BufferView, buffer::ViewCreationError> {
         unimplemented!()
     }
 
@@ -871,6 +1095,12 @@ impl d::Device<B> for Device {
         unbound.requirements
     }
 
+    fn get_image_subresource_footprint(
+        &self, _image: &n::Image, _sub: i::Subresource
+    ) -> i::SubresourceFootprint {
+        unimplemented!()
+    }
+
     fn bind_image_memory(
         &self, _memory: &n::Memory, _offset: u64, unbound: UnboundImage
     ) -> Result<n::Image, d::BindError> {
@@ -925,12 +1155,15 @@ impl d::Device<B> for Device {
         n::DescriptorPool { }
     }
 
-    fn create_descriptor_set_layout<I>(&self, _: I) -> n::DescriptorSetLayout
+    fn create_descriptor_set_layout<I, J>(&self, layout: I, _: J) -> n::DescriptorSetLayout
     where
         I: IntoIterator,
         I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
+        J: IntoIterator,
+        J::Item: Borrow<n::FatSampler>,
     {
-        n::DescriptorSetLayout
+        // Just return it
+        layout.into_iter().map(|l| l.borrow().clone()).collect()
     }
 
     fn write_descriptor_sets<'a, I, J>(&self, writes: I)
@@ -939,9 +1172,66 @@ impl d::Device<B> for Device {
         J: IntoIterator,
         J::Item: Borrow<pso::Descriptor<'a, B>>,
     {
-        for _write in writes {
-            //unimplemented!() // not panicing because of Warden
-            error!("TODO: implement `write_descriptor_sets`");
+        for mut write in writes {
+            let set = &mut write.set;
+            let mut bindings = set.bindings.lock().unwrap();
+            let binding = write.binding;
+            let mut offset = write.array_offset as _;
+
+            for descriptor in write.descriptors {
+                match descriptor.borrow() {
+                    pso::Descriptor::Buffer(buffer, ref range) => {
+                        let start = range.start.unwrap_or(0);
+                        let end = range.end.unwrap_or(buffer.size);
+                        let size = (end - start) as _;
+
+                        bindings
+                            .push(n::DescSetBindings::Buffer {
+                                ty: n::BindingTypes::UniformBuffers,
+                                binding,
+                                buffer: buffer.raw,
+                                offset,
+                                size,
+                            });
+
+                        offset += size;
+                    },
+                    pso::Descriptor::CombinedImageSampler(view, _layout, sampler) => {
+                        match view {
+                            n::ImageView::Texture(tex, _)
+                            | n::ImageView::TextureLayer(tex, _, _) =>
+                                bindings
+                                .push(n::DescSetBindings::Texture(binding, *tex)),
+                            n::ImageView::Surface(_) => unimplemented!(),
+                        }
+                        match sampler {
+                            n::FatSampler::Sampler(sampler) =>
+                                bindings
+                                .push(n::DescSetBindings::Sampler(binding, *sampler)),
+                            n::FatSampler::Info(_) => unimplemented!(),
+                        }
+                    }
+                    pso::Descriptor::Image(view, _layout) => {
+                        match view {
+                            n::ImageView::Texture(tex, _)
+                            | n::ImageView::TextureLayer(tex, _, _) =>
+                                bindings
+                                .push(n::DescSetBindings::Texture(binding, *tex)),
+                            n::ImageView::Surface(_) => unimplemented!(),
+                        }
+                    }
+                    pso::Descriptor::Sampler(sampler) => {
+                        match sampler {
+                            n::FatSampler::Sampler(sampler) =>
+                                bindings
+                                .push(n::DescSetBindings::Sampler(binding, *sampler)),
+                            n::FatSampler::Info(_) => unimplemented!(),
+                        }
+                    }
+                    pso::Descriptor::UniformTexelBuffer(_view) => unimplemented!(),
+                    pso::Descriptor::StorageTexelBuffer(_view) => unimplemented!(),
+                }
+            }
         }
     }
 
@@ -991,11 +1281,11 @@ impl d::Device<B> for Device {
         }
     }
 
-    fn wait_for_fence(&self, fence: &n::Fence, timeout_ms: u32) -> bool {
+    fn wait_for_fence(&self, fence: &n::Fence, timeout_ns: u64) -> bool {
         if !self.share.private_caps.sync {
             return true;
         }
-        match wait_fence(fence, &self.share.context, timeout_ms) {
+        match wait_fence(fence, &self.share.context, timeout_ns) {
             gl::TIMEOUT_EXPIRED => false,
             gl::WAIT_FAILED => {
                 if let Err(err) = self.share.check() {
@@ -1012,7 +1302,7 @@ impl d::Device<B> for Device {
     }
 
     fn free_memory(&self, _memory: n::Memory) {
-        // nothing to do
+        // Nothing to do
     }
 
     fn create_query_pool(&self, _ty: query::QueryType, _count: u32) -> () {
@@ -1028,20 +1318,28 @@ impl d::Device<B> for Device {
     }
 
     fn destroy_render_pass(&self, _: n::RenderPass) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn destroy_pipeline_layout(&self, _: n::PipelineLayout) {
-        unimplemented!()
+        // Nothing to do
     }
-    fn destroy_graphics_pipeline(&self, _: n::GraphicsPipeline) {
-        unimplemented!()
+
+    fn destroy_graphics_pipeline(&self, pipeline: n::GraphicsPipeline) {
+        unsafe {
+            self.share.context.DeleteProgram(pipeline.program);
+        }
     }
-    fn destroy_compute_pipeline(&self, _: n::ComputePipeline) {
-        unimplemented!()
+
+    fn destroy_compute_pipeline(&self, pipeline: n::ComputePipeline) {
+        unsafe {
+            self.share.context.DeleteProgram(pipeline.program);
+        }
     }
-    fn destroy_framebuffer(&self, _: n::FrameBuffer) {
-        unimplemented!()
+
+    fn destroy_framebuffer(&self, frame_buffer: n::FrameBuffer) {
+        let gl = &self.share.context;
+        unsafe { gl.DeleteFramebuffers(1, &frame_buffer); }
     }
 
     fn destroy_buffer(&self, buffer: n::Buffer) {
@@ -1050,24 +1348,35 @@ impl d::Device<B> for Device {
         }
     }
     fn destroy_buffer_view(&self, _: n::BufferView) {
-        unimplemented!()
+        // Nothing to do
     }
-    fn destroy_image(&self, _: n::Image) {
-        unimplemented!()
+
+    fn destroy_image(&self, image: n::Image) {
+        let gl = &self.share.context;
+        match image.kind {
+            n::ImageKind::Surface(rb) => unsafe { gl.DeleteRenderbuffers(1, &rb) },
+            n::ImageKind::Texture(t) => unsafe { gl.DeleteTextures(1, &t) },
+        }
     }
-    fn destroy_image_view(&self, _: n::ImageView) {
-        unimplemented!()
+
+    fn destroy_image_view(&self, _image_view: n::ImageView) {
+        // Nothing to do
     }
-    fn destroy_sampler(&self, _: n::FatSampler) {
-        unimplemented!()
+
+    fn destroy_sampler(&self, sampler: n::FatSampler) {
+        let gl = &self.share.context;
+        match sampler {
+            n::FatSampler::Sampler(s) => unsafe { gl.DeleteSamplers(1, &s) },
+            _ => (),
+        }
     }
 
     fn destroy_descriptor_pool(&self, _: n::DescriptorPool) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn destroy_descriptor_set_layout(&self, _: n::DescriptorSetLayout) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn destroy_fence(&self, fence: n::Fence) {
@@ -1077,19 +1386,21 @@ impl d::Device<B> for Device {
     }
 
     fn destroy_semaphore(&self, _: n::Semaphore) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn create_swapchain(
         &self,
         surface: &mut Surface,
         config: c::SwapchainConfig,
+        _old_swapchain: Option<Swapchain>,
+        _extent: &window::Extent2D,
     ) -> (Swapchain, c::Backbuffer<B>) {
         self.create_swapchain_impl(surface, config)
     }
 
     fn destroy_swapchain(&self, _swapchain: Swapchain) {
-        unimplemented!()
+        // Nothing to do
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
@@ -1098,11 +1409,10 @@ impl d::Device<B> for Device {
     }
 }
 
-pub fn wait_fence(fence: &n::Fence, gl: &gl::Gl, timeout_ms: u32) -> GLenum {
-    let timeout = timeout_ms as u64 * 1_000_000;
+pub fn wait_fence(fence: &n::Fence, gl: &gl::Gl, timeout_ns: u64) -> GLenum {
     // TODO:
     // This can be called by multiple objects wanting to ensure they have exclusive
     // access to a resource. How much does this call costs ? The status of the fence
     // could be cached to avoid calling this more than once (in core or in the backend ?).
-    unsafe { gl.ClientWaitSync(fence.0.get(), gl::SYNC_FLUSH_COMMANDS_BIT, timeout) }
+    unsafe { gl.ClientWaitSync(fence.0.get(), gl::SYNC_FLUSH_COMMANDS_BIT, timeout_ns) }
 }

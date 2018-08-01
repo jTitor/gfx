@@ -2,14 +2,14 @@ use std::any::Any;
 use std::borrow::Borrow;
 use std::ops::Range;
 
-use {buffer, pso};
-use {Backend, IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
+use {buffer, pass, pso};
+use {Backend, DrawCount, IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
 use image::{Filter, Layout, SubresourceRange};
 use memory::{Barrier, Dependencies};
-use query::{Query, QueryControl, QueryId};
+use query::{PipelineStatistic, Query, QueryControl, QueryId};
+use range::RangeArg;
 use super::{
     AttachmentClear, BufferCopy, BufferImageCopy,
-    ClearColor, ClearDepthStencil, ClearValue,
     ImageBlit, ImageCopy, ImageResolve, SubpassContents,
 };
 
@@ -48,6 +48,9 @@ pub union ClearValueRaw {
     _align: [u32; 4],
 }
 
+/// Offset for dynamic descriptors.
+pub type DescriptorSetOffset = u32;
+
 bitflags! {
     /// Option flags for various command buffer settings.
     #[derive(Default)]
@@ -81,11 +84,33 @@ pub enum Level {
     Secondary,
 }
 
+#[allow(missing_docs)]
+#[derive(Debug)]
+pub struct CommandBufferInheritanceInfo<'a, B: Backend> {
+    pub subpass: Option<pass::Subpass<'a, B>>,
+    pub framebuffer: Option<&'a B::Framebuffer>,
+    pub occlusion_query_enable: bool,
+    pub occlusion_query_flags: QueryControl,
+    pub pipeline_statistics: PipelineStatistic,
+}
+
+impl<'a, B: Backend> Default for CommandBufferInheritanceInfo<'a, B> {
+    fn default() -> Self {
+        CommandBufferInheritanceInfo {
+            subpass: None,
+            framebuffer: None,
+            occlusion_query_enable: false,
+            occlusion_query_flags: QueryControl::empty(),
+            pipeline_statistics: PipelineStatistic::empty(),
+        }
+    }
+}
+
 /// A trait that describes all the operations that must be
 /// provided by a `Backend`'s command buffer.
 pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
     /// Begins recording commands to a command buffer.
-    fn begin(&mut self, flags: CommandBufferFlags);
+    fn begin(&mut self, flags: CommandBufferFlags, inheritance_info: CommandBufferInheritanceInfo<B>);
 
     /// Finish recording commands to a command buffer.
     fn finish(&mut self);
@@ -108,12 +133,13 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
         T::Item: Borrow<Barrier<'a, B>>;
 
     /// Fill a buffer with the given `u32` value.
-    fn fill_buffer(
+    fn fill_buffer<R>(
         &mut self,
         buffer: &B::Buffer,
-        range: Range<buffer::Offset>,
+        range: R,
         data: u32,
-    );
+    ) where
+        R: RangeArg<buffer::Offset>;
 
     /// Copy data from the given slice into a buffer.
     fn update_buffer(
@@ -123,56 +149,17 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
         data: &[u8],
     );
 
-    /// Clears an image to the given color.
-    /// Just calls `clear_color_raw` with some minor type conversion.
-    fn clear_color_image(
+    /// Clears an image to the given color/depth/stencil.
+    fn clear_image<T>(
         &mut self,
         image: &B::Image,
         layout: Layout,
-        range: SubresourceRange,
-        cv: ClearColor,
-    ) {
-        self.clear_color_image_raw(
-            image,
-            layout,
-            range,
-            cv.into(),
-        )
-    }
-
-    /// Clears an image to the given color.
-    fn clear_color_image_raw(
-        &mut self,
-        &B::Image,
-        Layout,
-        SubresourceRange,
-        ClearColorRaw,
-    );
-
-    /// Clear a depth-stencil image to the given value.
-    /// Just calls `clear_depth_stencil_image_raw` with some minor type conversion.
-    fn clear_depth_stencil_image(
-        &mut self,
-        image: &B::Image,
-        layout: Layout,
-        range: SubresourceRange,
-        cv: ClearDepthStencil,
-    ) {
-        let cv = ClearDepthStencilRaw {
-            depth: cv.0,
-            stencil: cv.1,
-        };
-        self.clear_depth_stencil_image_raw(image, layout, range, cv)
-    }
-
-    /// Clear a depth-stencil image to the given value.
-    fn clear_depth_stencil_image_raw(
-        &mut self,
-        &B::Image,
-        Layout,
-        SubresourceRange,
-        ClearDepthStencilRaw,
-    );
+        color: ClearColorRaw,
+        depth_stencil: ClearDepthStencilRaw,
+        subresource_ranges: T,
+    ) where
+        T: IntoIterator,
+        T::Item: Borrow<SubresourceRange>;
 
     /// Takes an iterator of attachments and an iterator of rect's,
     /// and clears the given rect's for *each* attachment.
@@ -181,7 +168,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
         T: IntoIterator,
         T::Item: Borrow<AttachmentClear>,
         U: IntoIterator,
-        U::Item: Borrow<pso::Rect>;
+        U::Item: Borrow<pso::ClearRect>;
 
     /// "Resolves" a multisampled image, converting it into a non-multisampled
     /// image. Takes an iterator of regions to apply the resolution to.
@@ -216,48 +203,54 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
 
     /// Bind the vertex buffer set, making it the "current" one that draw commands
     /// will operate on.
-    fn bind_vertex_buffers(&mut self, pso::VertexBufferSet<B>);
+    ///
+    /// Each buffer passed corresponds to the vertex input binding with the same index,
+    /// starting from an offset index `first_binding`.
+    fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    where
+        I: IntoIterator<Item = (T, buffer::Offset)>,
+        T: Borrow<B::Buffer>;
 
     /// Set the viewport parameters for the rasterizer.
     ///
-    /// Every other viewport, which is not specified in this call,
-    /// will be disabled.
-    ///
-    /// Ensure that the number of set viewports at draw time is equal
-    /// (or higher) to the number specified in the bound pipeline.
+    /// Each viewport passed corresponds to the viewport with the same index,
+    /// starting from an offset index `first_viewport`.
     ///
     /// # Errors
     ///
     /// This function does not return an error. Invalid usage of this function
-    /// will result in an error on `finish`.
+    /// will result in undefined behavior.
     ///
     /// - Command buffer must be in recording state.
-    /// - Number of viewports must be between 1 and `max_viewports`.
+    /// - Number of viewports must be between 1 and `max_viewports - first_viewport`.
+    /// - The first viewport must be less than `max_viewports`.
     /// - Only queues with graphics capability support this function.
-    fn set_viewports<T>(&mut self, viewports: T)
+    /// - The bound pipeline must not have baked viewport state.
+    /// - All viewports used by the pipeline must be specified before the first
+    ///   draw call.
+    fn set_viewports<T>(&mut self, first_viewport: u32, viewports: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Viewport>;
 
     /// Set the scissor rectangles for the rasterizer.
     ///
-    /// Every other scissor, which is not specified in this call,
-    /// will be disabled.
-    ///
-    /// Each scissor corresponds to the viewport with the same index.
-    ///
-    /// Ensure that the number of set scissors at draw time is equal (or higher)
-    /// to the number of viewports specified in the bound pipeline.
+    /// Each scissor corresponds to the viewport with the same index, starting
+    /// from an offset index `first_scissor`.
     ///
     /// # Errors
     ///
     /// This function does not return an error. Invalid usage of this function
-    /// will result in an error on `finish`.
+    /// will result in undefined behavior.
     ///
     /// - Command buffer must be in recording state.
-    /// - Number of scissors must be between 1 and `max_viewports`.
+    /// - Number of scissors must be between 1 and `max_viewports - first_scissor`.
+    /// - The first scissor must be less than `max_viewports`.
     /// - Only queues with graphics capability support this function.
-    fn set_scissors<T>(&mut self, rects: T)
+    /// - The bound pipeline must not have baked scissor state.
+    /// - All scissors used by the pipeline must be specified before the first draw
+    ///   call.
+    fn set_scissors<T>(&mut self, first_scissor: u32, rects: T)
     where
         T: IntoIterator,
         T::Item: Borrow<pso::Rect>;
@@ -265,55 +258,34 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
     /// Sets the stencil reference value for comparison operations and store operations.
     /// Will be used on the LHS of stencil compare ops and as store value when the
     /// store op is Reference.
-    fn set_stencil_reference(&mut self, front: pso::StencilValue, back: pso::StencilValue);
+    fn set_stencil_reference(&mut self, faces: pso::Face, value: pso::StencilValue);
+
+    /// Sets the stencil read mask.
+    fn set_stencil_read_mask(&mut self, faces: pso::Face, value: pso::StencilValue);
+
+    /// Sets the stencil write mask.
+    fn set_stencil_write_mask(&mut self, faces: pso::Face, value: pso::StencilValue);
 
     /// Set the blend constant values dynamically.
     fn set_blend_constants(&mut self, pso::ColorValue);
 
-    /// Just does some type conversions and calls `begin_render_pass_raw`.
-    fn begin_render_pass<T>(
-        &mut self,
-        render_pass: &B::RenderPass,
-        framebuffer: &B::Framebuffer,
-        render_area: pso::Rect,
-        clear_values: T,
-        first_subpass: SubpassContents,
-    ) where
-        T: IntoIterator,
-        T::Item: Borrow<ClearValue>
-    {
-        let clear_values = clear_values
-            .into_iter()
-            .map(|cv| {
-                match *cv.borrow() {
-                    ClearValue::Color(ClearColor::Float(cv)) =>
-                        ClearValueRaw { color: ClearColorRaw { float32: cv }},
-                    ClearValue::Color(ClearColor::Int(cv)) =>
-                        ClearValueRaw { color: ClearColorRaw { int32: cv }},
-                    ClearValue::Color(ClearColor::Uint(cv)) =>
-                        ClearValueRaw { color: ClearColorRaw { uint32: cv }},
-                    ClearValue::DepthStencil(ClearDepthStencil(depth, stencil)) =>
-                        ClearValueRaw { depth_stencil: ClearDepthStencilRaw { depth, stencil }},
-                }
-            });
+    /// Set the depth bounds test values dynamically.
+    fn set_depth_bounds(&mut self, bounds: Range<f32>);
 
-        self.begin_render_pass_raw(
-            render_pass,
-            framebuffer,
-            render_area,
-            clear_values,
-            first_subpass,
-        )
-    }
+    /// Set the line width dynamically.
+    fn set_line_width(&mut self, width: f32);
+
+    /// Set the depth bias dynamically.
+    fn set_depth_bias(&mut self, depth_bias: pso::DepthBias);
 
     /// Begins recording commands for a render pass on the given framebuffer.
     /// `render_area` is the section of the framebuffer to render,
-    /// `clear_values` is an iterator of `ClearValue`'s to use to use for
+    /// `clear_values` is an iterator of `ClearValueRaw`'s to use to use for
     /// `clear_*` commands, one for each attachment of the render pass.
     /// `first_subpass` specifies, for the first subpass, whether the
     /// rendering commands are provided inline or whether the render
     /// pass is composed of subpasses.
-    fn begin_render_pass_raw<T>(
+    fn begin_render_pass<T>(
         &mut self,
         render_pass: &B::RenderPass,
         framebuffer: &B::Framebuffer,
@@ -343,14 +315,17 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
 
     /// Takes an iterator of graphics `DescriptorSet`'s, and binds them to the command buffer.
     /// `first_set` is the index that the first descriptor is mapped to in the command buffer.
-    fn bind_graphics_descriptor_sets<T>(
+    fn bind_graphics_descriptor_sets<I, J>(
         &mut self,
         layout: &B::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<B::DescriptorSet>;
+        I: IntoIterator,
+        I::Item: Borrow<B::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<DescriptorSetOffset>;
 
     /// Bind a compute pipeline.
     ///
@@ -365,14 +340,17 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
 
     /// Takes an iterator of compute `DescriptorSet`'s, and binds them to the command buffer,
     /// `first_set` is the index that the first descriptor is mapped to in the command buffer.
-    fn bind_compute_descriptor_sets<T>(
+    fn bind_compute_descriptor_sets<I, J>(
         &mut self,
         layout: &B::PipelineLayout,
         first_set: usize,
-        sets: T,
+        sets: I,
+        offsets: J,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<B::DescriptorSet>;
+        I: IntoIterator,
+        I::Item: Borrow<B::DescriptorSet>,
+        J: IntoIterator,
+        J::Item: Borrow<DescriptorSetOffset>;
 
     /// Execute a workgroup in the compute pipeline. `x`, `y` and `z` are the
     /// number of local workgroups to dispatch along each "axis"; a total of `x`*`y`*`z`
@@ -480,7 +458,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
         &mut self,
         buffer: &B::Buffer,
         offset: buffer::Offset,
-        draw_count: u32,
+        draw_count: DrawCount,
         stride: u32,
     );
 
@@ -495,7 +473,7 @@ pub trait RawCommandBuffer<B: Backend>: Clone + Any + Send + Sync {
         &mut self,
         buffer: &B::Buffer,
         offset: buffer::Offset,
-        draw_count: u32,
+        draw_count: DrawCount,
         stride: u32,
     );
 

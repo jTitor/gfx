@@ -229,3 +229,36 @@ pub enum Constant {
     F32(f32),
     F64(f64),
 }
+
+/// Pipeline state which may be static or dynamic.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum State<T> {
+    /// Static state that cannot be altered.
+    Static(T),
+    /// Dynamic state set through a command buffer.
+    Dynamic,
+}
+
+impl<T> State<T> {
+    /// Returns the static value or a default.
+    pub fn static_or(self, default: T) -> T {
+        match self {
+            State::Static(v) => v,
+            State::Dynamic => default,
+        }
+    }
+
+    /// Whether the state is static.
+    pub fn is_static(self) -> bool {
+        match self {
+            State::Static(_) => true,
+            State::Dynamic => false,
+        }
+    }
+
+    /// Whether the state is dynamic.
+    pub fn is_dynamic(self) -> bool {
+        !self.is_static()
+    }
+}
