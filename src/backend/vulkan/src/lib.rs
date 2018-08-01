@@ -1,3 +1,6 @@
+//Ensure this is dummied out on macOS/iOS
+#![cfg(all(not(target_os = "macos"), not(target_os = "ios")))]
+
 #[macro_use]
 extern crate log;
 #[macro_use]

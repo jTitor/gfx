@@ -1,3 +1,8 @@
+//Since winapi::shared and winapi::um aren't
+//imported into winapi when #[cfg(not(windows))],
+//add a flag to not build anything when not under windows
+#![cfg(windows)]
+
 #[macro_use]
 extern crate bitflags;
 #[macro_use]
