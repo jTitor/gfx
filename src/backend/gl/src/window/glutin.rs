@@ -193,7 +193,7 @@ pub fn config_context(
 }
 
 
-pub struct Headless(pub glutin::HeadlessContext);
+pub struct Headless(pub glutin::Context);
 
 unsafe impl Send for Headless {}
 unsafe impl Sync for Headless {}

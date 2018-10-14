@@ -246,8 +246,7 @@ fn main() {
     #[cfg(feature = "gl-headless")]
     {
         println!("Warding GL headless:");
-        let context = gfx_backend_gl::glutin::HeadlessRendererBuilder::new(1, 1)
-            .build()
+        let context = gfx_backend_gl::glutin::Context::new(1, 1)
             .unwrap();
         let instance = gfx_backend_gl::Headless(context);
         num_failures += harness.run(instance, Disabilities::default());

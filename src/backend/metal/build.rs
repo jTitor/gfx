@@ -1,6 +1,4 @@
-/*!
- * Compiles the shaders used internally by some commands
- */
+// Compiles the shaders used internally by some commands
 
 use std::env;
 use std::ffi::OsStr;
@@ -51,11 +49,20 @@ fn main() {
                 }
             });
 
+        // Compile all the metal files into OUT_DIR
+        let mut compiled_shader_files: Vec<PathBuf> = Vec::new();
+        for shader_path in shader_files.into_iter() {
+            println!("cargo:rerun-if-changed={}", shader_path.to_str().unwrap());
+
+            let mut out_path = out_dir.join(shader_path.file_name().unwrap());
+            out_path.set_extension("air");
+
             let status = Command::new("xcrun")
-                .args(&["-sdk", "macosx", "metal"])
+                .args(&["-sdk", sdk_name, "metal", "-c"])
                 .arg(shader_path.as_os_str())
                 .arg("-o")
                 .arg(out_path.as_os_str())
+                .args(platform_args)
                 .status()
                 .expect("failed to execute metal compiler");
 
@@ -69,11 +76,10 @@ fn main() {
 
         // Link all the compiled files into a single library
         let status = Command::new("xcrun")
-            .args(&["-sdk", sdk_name, "metal", "-c"])
-            .arg(shader_path.as_os_str())
+            .args(&["-sdk", sdk_name, "metallib"])
+            .args(compiled_shader_files.iter().map(|p| p.as_os_str()))
             .arg("-o")
-            .arg(out_path.as_os_str())
-            .args(platform_args)
+            .arg(out_lib.as_os_str())
             .status()
             .expect("failed to execute metal library builder");
 
