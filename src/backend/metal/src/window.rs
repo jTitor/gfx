@@ -3,15 +3,15 @@ use device::{Device, PhysicalDevice};
 use internal::Channel;
 use native;
 
+use std::ptr::NonNull;
 use std::sync::Arc;
+use std::thread;
 
 use hal::{self, format, image};
 use hal::{Backbuffer, SwapchainConfig};
 use hal::window::Extent2D;
 
-use core_graphics::base::CGFloat;
-use core_graphics::geometry::CGRect;
-use cocoa::foundation::{NSRect};
+use core_graphics::geometry::{CGRect, CGSize};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use parking_lot::{Mutex, MutexGuard};
 use metal;
@@ -19,18 +19,20 @@ use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 
 
+//TODO: make it a weak pointer, so that we know which
+// frames can be replaced if we receive an unknown
+// texture pointer by an acquired drawable.
 pub type CAMetalLayer = *mut Object;
 
 pub struct Surface {
-    pub(crate) inner: Arc<SurfaceInner>,
-    pub(crate) apply_pixel_scale: bool,
-    pub(crate) has_swapchain: bool
+    inner: Arc<SurfaceInner>,
+    main_thread_id: thread::ThreadId,
 }
 
 #[derive(Debug)]
-pub(crate) struct SurfaceInner {
-    pub(crate) nsview: *mut Object,
-    pub(crate) render_layer: Mutex<CAMetalLayer>,
+pub struct SurfaceInner {
+    view: Option<NonNull<Object>>,
+    render_layer: Mutex<CAMetalLayer>,
 }
 
 unsafe impl Send for SurfaceInner {}
@@ -38,12 +40,39 @@ unsafe impl Sync for SurfaceInner {}
 
 impl Drop for SurfaceInner {
     fn drop(&mut self) {
-        unsafe { msg_send![self.nsview, release]; }
+        let object = match self.view {
+            Some(view) => view.as_ptr(),
+            None => *self.render_layer.lock(),
+        };
+        unsafe {
+            msg_send![object, release];
+        }
     }
 }
 
+#[derive(Debug)]
+struct FrameNotFound {
+    drawable: metal::Drawable,
+    texture: metal::Texture,
+}
+
+
 impl SurfaceInner {
-    fn next_frame<'a>(&self, frames: &'a [Frame]) -> (usize, MutexGuard<'a, FrameInner>) {
+    pub fn new(view: Option<NonNull<Object>>, layer: CAMetalLayer) -> Self {
+        SurfaceInner {
+            view,
+            render_layer: Mutex::new(layer),
+        }
+    }
+
+    pub fn into_surface(self) -> Surface {
+        Surface {
+            inner: Arc::new(self),
+            main_thread_id: thread::current().id(),
+        }
+    }
+
+    fn next_frame<'a>(&self, frames: &'a [Frame]) -> Result<(usize, MutexGuard<'a, FrameInner>), FrameNotFound> {
         let layer_ref = self.render_layer.lock();
         autoreleasepool(|| { // for the drawable
             let (drawable, texture_temp): (&metal::DrawableRef, &metal::TextureRef) = unsafe {
@@ -52,20 +81,40 @@ impl SurfaceInner {
             };
 
             trace!("looking for {:?}", texture_temp);
-            let index = frames
-                .iter()
-                .position(|f| f.texture.as_ptr() == texture_temp.as_ptr())
-                .expect("Surface lost?");
+            match frames.iter().position(|f| f.texture.as_ptr() == texture_temp.as_ptr()) {
+                Some(index) => {
+                    let mut frame = frames[index].inner.lock();
+                    assert!(frame.drawable.is_none());
+                    frame.drawable = Some(drawable.to_owned());
 
-            let mut frame = frames[index].inner.lock();
-            assert!(frame.drawable.is_none());
-            frame.drawable = Some(drawable.to_owned());
-
-            debug!("next is frame[{}]", index);
-            (index, frame)
+                    debug!("next is frame[{}]", index);
+                    Ok((index, frame))
+                }
+                None => Err(FrameNotFound {
+                    drawable: drawable.to_owned(),
+                    texture: texture_temp.to_owned(),
+                }),
+            }
         })
     }
+
+    fn dimensions(&self) -> Extent2D {
+        let size = match self.view {
+            Some(view) => unsafe {
+                let bounds: CGRect = msg_send![view.as_ptr(), bounds];
+                bounds.size
+            },
+            None => unsafe {
+                msg_send![*self.render_layer.lock(), drawableSize]
+            },
+        };
+        Extent2D {
+            width: size.width as _,
+            height: size.height as _,
+        }
+    }
 }
+
 
 #[derive(Debug)]
 struct FrameInner {
@@ -74,6 +123,9 @@ struct FrameInner {
     /// If there is `None`, `available == false` means that the frame has already
     /// been acquired and the `drawable` will appear at some point.
     available: bool,
+    /// Stays true for as long as the drawable is circulating through the
+    /// CAMetalLayer's frame queue.
+    linked: bool,
     last_frame: usize,
 }
 
@@ -92,12 +144,19 @@ impl Drop for Frame {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcquireMode {
+    Wait,
+    Oldest,
+}
+
 pub struct Swapchain {
     frames: Arc<Vec<Frame>>,
     surface: Arc<SurfaceInner>,
-    size_pixels: (image::Size, image::Size),
+    extent: Extent2D,
     last_frame: usize,
     image_ready_callbacks: Vec<Arc<Mutex<Option<SwapchainImage>>>>,
+    pub acquire_mode: AcquireMode,
 }
 
 impl Drop for Swapchain {
@@ -114,16 +173,23 @@ impl Drop for Swapchain {
 impl Swapchain {
     /// Returns the drawable for the specified swapchain image index,
     /// marks the index as free for future use.
-    pub(crate) fn take_drawable(&self, index: hal::SwapImageIndex) -> metal::Drawable {
+    pub(crate) fn take_drawable(&self, index: hal::SwapImageIndex) -> Result<metal::Drawable, ()> {
         let mut frame = self
             .frames[index as usize]
             .inner
             .lock();
-        assert!(!frame.available);
-        frame.available = true;
-        frame.drawable
-            .take()
-            .expect("Drawable has not been acquired!")
+        assert!(!frame.available && frame.linked);
+
+        match frame.drawable.take() {
+            Some(drawable) => {
+                frame.available = true;
+                Ok(drawable)
+            }
+            None => {
+                frame.linked = false;
+                Err(())
+            }
+        }
     }
 
     fn signal_sync(&self, sync: hal::FrameSync<Backend>) {
@@ -161,10 +227,21 @@ impl SwapchainImage {
         }
         // wait for new frames to come until we meet the chosen one
         let mut count = 1;
-        while self.surface.next_frame(&self.frames).0 != self.index as usize {
-            count += 1;
-        }
-        debug!("Swapchain image is ready after {} frames", count);
+        loop {
+            match self.surface.next_frame(&self.frames) {
+                Ok((index, _)) if index == self.index as usize => {
+                    debug!("Swapchain image is ready after {} frames", count);
+                    break
+                }
+                Ok(_) => {
+                    count += 1;
+                }
+                Err(_e) => {
+                    debug!("Swapchain drawables are changed");
+                    break
+                }
+            }
+        }        
         count
     }
 }
@@ -172,20 +249,28 @@ impl SwapchainImage {
 
 impl hal::Surface<Backend> for Surface {
     fn kind(&self) -> image::Kind {
-        let (width, height) = self.inner.pixel_dimensions();
-
-        image::Kind::D2(width, height, 1, 1)
+        let ex = self.inner.dimensions();
+        image::Kind::D2(ex.width, ex.height, 1, 1)
     }
 
     fn compatibility(
-        &self, _: &PhysicalDevice,
+        &self, device: &PhysicalDevice,
     ) -> (hal::SurfaceCapabilities, Option<Vec<format::Format>>, Vec<hal::PresentMode>) {
+        let current_extent = if self.main_thread_id == thread::current().id() {
+            Some(self.inner.dimensions())
+        } else {
+            warn!("Unable to get the current view dimensions on a non-main thread");
+            None
+        };
+
         let caps = hal::SurfaceCapabilities {
             //Note: this is hardcoded in `CAMetalLayer` documentation
             image_count: 2 .. 4,
-            current_extent: None,
+            current_extent,
             extents: Extent2D { width: 4, height: 4} .. Extent2D { width: 4096, height: 4096 },
             max_image_layers: 1,
+            usage: image::Usage::COLOR_ATTACHMENT | image::Usage::SAMPLED |
+                image::Usage::TRANSFER_SRC | image::Usage::TRANSFER_DST,
         };
 
         let formats = vec![
@@ -193,10 +278,15 @@ impl hal::Surface<Backend> for Surface {
             format::Format::Bgra8Srgb,
             format::Format::Rgba16Float,
         ];
-        let present_modes = vec![
-            hal::PresentMode::Fifo,
-            hal::PresentMode::Immediate,
-        ];
+
+        let device_caps = &device.private_caps;
+        let can_set_display_sync = device_caps.os_is_mac && device_caps.has_version_at_least(10, 13);
+
+        let present_modes = if can_set_display_sync {
+            vec![hal::PresentMode::Fifo, hal::PresentMode::Immediate]
+        } else {
+            vec![hal::PresentMode::Fifo]
+        };
 
         (caps, Some(formats), present_modes)
     }
@@ -207,69 +297,49 @@ impl hal::Surface<Backend> for Surface {
     }
 }
 
-impl SurfaceInner {
-    fn pixel_dimensions(&self) -> (image::Size, image::Size) {
-        unsafe {
-            // NSView bounds are measured in DIPs
-            let bounds: NSRect = msg_send![self.nsview, bounds];
-            let bounds_pixel: NSRect = msg_send![self.nsview, convertRectToBacking:bounds];
-            (bounds_pixel.size.width as _, bounds_pixel.size.height as _)
-        }
-    }
-}
-
 impl Device {
     pub(crate) fn build_swapchain(
         &self,
         surface: &mut Surface,
         config: SwapchainConfig,
+        old_swapchain: Option<Swapchain>,
     ) -> (Swapchain, Backbuffer<Backend>) {
         info!("build_swapchain {:?}", config);
 
-        let mtl_format = self.private_caps
-            .map_format(config.color_format)
+        let caps = &self.private_caps;
+        let mtl_format = caps
+            .map_format(config.format)
             .expect("unsupported backbuffer format");
 
         let render_layer_borrow = surface.inner.render_layer.lock();
         let render_layer = *render_layer_borrow;
-        let nsview = surface.inner.nsview;
-        let format_desc = config.color_format.surface_desc();
+        let format_desc = config.format.surface_desc();
         let framebuffer_only = config.image_usage == image::Usage::COLOR_ATTACHMENT;
-        let display_sync = match config.present_mode {
-            hal::PresentMode::Immediate => false,
-            _ => true,
+        let display_sync = config.present_mode != hal::PresentMode::Immediate;
+        let is_mac = caps.os_is_mac;
+        let can_set_next_drawable_timeout = if is_mac {
+            caps.has_version_at_least(10, 13)
+        } else {
+            caps.has_version_at_least(11, 0)
         };
-        let device = self.shared.device.lock();
-        let device_raw: &metal::DeviceRef = &*device;
+        let can_set_display_sync = is_mac && caps.has_version_at_least(10, 13);
 
-        let (view_size, scale_factor) = unsafe {
+        let cmd_queue = self.shared.queue.lock();
+
+        unsafe {
+            let device_raw = self.shared.device.lock().as_ptr();
             msg_send![render_layer, setDevice: device_raw];
             msg_send![render_layer, setPixelFormat: mtl_format];
             msg_send![render_layer, setFramebufferOnly: framebuffer_only];
             msg_send![render_layer, setMaximumDrawableCount: config.image_count as u64];
-            //TODO: only set it where supported
-            msg_send![render_layer, setDisplaySyncEnabled: display_sync];
-
-            // Update render layer size
-            let view_points_size: CGRect = msg_send![nsview, bounds];
-            msg_send![render_layer, setBounds: view_points_size];
-
-            let view_window: *mut Object = msg_send![nsview, window];
-            if view_window.is_null() {
-                panic!("surface is not attached to a window");
+            msg_send![render_layer, setDrawableSize: CGSize::new(config.extent.width as f64, config.extent.height as f64)];
+            if can_set_next_drawable_timeout {
+                msg_send![render_layer, setAllowsNextDrawableTimeout:false];
             }
-            let scale_factor: CGFloat = if surface.apply_pixel_scale {
-                msg_send![view_window, backingScaleFactor]
-            } else {
-                1.0
-            };
-            msg_send![render_layer, setContentsScale: scale_factor];
-            info!("view points size {:?} scale factor {:?}", view_points_size, scale_factor);
-            (view_points_size.size, scale_factor)
+            if can_set_display_sync {
+                msg_send![render_layer, setDisplaySyncEnabled: display_sync];
+            }
         };
-
-        let pixel_width = (view_size.width * scale_factor) as image::Size;
-        let pixel_height = (view_size.height * scale_factor) as image::Size;
 
         let frames = (0 .. config.image_count)
             .map(|index| autoreleasepool(|| { // for the drawable & texture
@@ -281,11 +351,27 @@ impl Device {
                 };
                 trace!("\tframe[{}] = {:?}", index, texture);
 
-                let drawable = if index == 0 && surface.has_swapchain {
+                let drawable = if index == 0 {
                     // when resizing, this trick frees up the currently shown frame
-                    // HACK: the has_swapchain is unfortunate, and might not be
-                    //       correct in all cases.
-                    drawable.present();
+                    match old_swapchain {
+                        Some(ref old) => {
+                            let cmd_buffer = cmd_queue.spawn_temp();
+                            self.shared.service_pipes.simple_blit(
+                                &self.shared.device,
+                                cmd_buffer,
+                                &old.frames[0].texture,
+                                texture,
+                            );
+                            cmd_buffer.present_drawable(drawable);
+                            cmd_buffer.set_label("build_swapchain");
+                            cmd_buffer.commit();
+                            cmd_buffer.wait_until_completed();
+                        }
+                        None => {
+                            // this will look as a black frame
+                            drawable.present();
+                        }
+                    }
                     None
                 } else {
                     Some(drawable.to_owned())
@@ -294,6 +380,7 @@ impl Device {
                     inner: Mutex::new(FrameInner {
                         drawable,
                         available: true,
+                        linked: true,
                         last_frame: 0,
                     }),
                     texture: texture.to_owned(),
@@ -304,8 +391,8 @@ impl Device {
         let images = frames
             .iter()
             .map(|frame| native::Image {
-                raw: frame.texture.clone(),
-                kind: image::Kind::D2(pixel_width, pixel_height, 1, 1),
+                like: native::ImageLike::Texture(frame.texture.clone()),
+                kind: image::Kind::D2(config.extent.width, config.extent.height, 1, 1),
                 format_desc,
                 shader_channel: Channel::Float,
                 mtl_format,
@@ -313,28 +400,28 @@ impl Device {
             })
             .collect();
 
-        surface.has_swapchain = true;
-
         let swapchain = Swapchain {
             frames: Arc::new(frames),
             surface: surface.inner.clone(),
-            size_pixels: (pixel_width, pixel_height),
+            extent: config.extent,
             last_frame: 0,
             image_ready_callbacks: Vec::new(),
+            acquire_mode: AcquireMode::Oldest,
         };
-
 
         (swapchain, Backbuffer::Images(images))
     }
 }
 
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_image(&mut self, sync: hal::FrameSync<Backend>) -> Result<hal::SwapImageIndex, ()> {
+    fn acquire_image(
+        &mut self, _timeout_ns: u64, sync: hal::FrameSync<Backend>
+    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
         self.last_frame += 1;
 
         //TODO: figure out a proper story of HiDPI
-        if false && self.surface.pixel_dimensions() != self.size_pixels {
-            return Err(())
+        if false && self.surface.dimensions() != self.extent {
+            unimplemented!()
         }
 
         let mut oldest_index = 0;
@@ -357,31 +444,38 @@ impl hal::Swapchain<Backend> for Swapchain {
             }
         }
 
-        let blocking = false;
-
-        let (index, mut frame) = if blocking {
-            self.surface.next_frame(&self.frames)
-        } else {
-            self.image_ready_callbacks.retain(|ir| ir.lock().is_some());
-            match sync {
-                hal::FrameSync::Semaphore(semaphore) => {
-                    self.image_ready_callbacks.push(Arc::clone(&semaphore.image_ready));
-                    let mut sw_image = semaphore.image_ready.lock();
-                    assert!(sw_image.is_none());
-                    *sw_image = Some(SwapchainImage {
-                        frames: self.frames.clone(),
-                        surface: self.surface.clone(),
-                        index: oldest_index as _,
-                    });
-                }
-                hal::FrameSync::Fence(_fence) => {
-                    //TODO: need presentation handlers always created and setting a bool
-                    unimplemented!()
-                }
+        let (index, mut frame) = match self.acquire_mode {
+            AcquireMode::Wait => {
+                self.surface.next_frame(&self.frames)
+                    .map_err(|_| hal::AcquireError::OutOfDate)?
             }
+            AcquireMode::Oldest => {
+                self.image_ready_callbacks.retain(|ir| ir.lock().is_some());
+                match sync {
+                    hal::FrameSync::Semaphore(semaphore) => {
+                        self.image_ready_callbacks.push(Arc::clone(&semaphore.image_ready));
+                        let mut sw_image = semaphore.image_ready.lock();
+                        if let Some(ref swi) = *sw_image {
+                            warn!("frame {} hasn't been waited upon", swi.index);
+                        }
+                        *sw_image = Some(SwapchainImage {
+                            frames: self.frames.clone(),
+                            surface: self.surface.clone(),
+                            index: oldest_index as _,
+                        });
+                    }
+                    hal::FrameSync::Fence(_fence) => {
+                        //TODO: need presentation handlers always created and setting a bool
+                        unimplemented!()
+                    }
+                }
 
-            let frame = self.frames[oldest_index].inner.lock();
-            (oldest_index, frame)
+                let frame = self.frames[oldest_index].inner.lock();
+                if !frame.linked {
+                    return Err(hal::AcquireError::OutOfDate);
+                }
+                (oldest_index, frame)
+            }
         };
 
         assert!(frame.available);

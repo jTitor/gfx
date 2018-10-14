@@ -1,11 +1,10 @@
-use {Backend, BufferPtr, SamplerPtr, TexturePtr};
+use {AsNative, Backend, ResourceIndex, BufferPtr, SamplerPtr, TexturePtr};
 use internal::{Channel, FastStorageMap};
 use range_alloc::RangeAllocator;
 use window::SwapchainImage;
 
-use std::borrow::Borrow;
 use std::cell::RefCell;
-use std::{fmt, iter};
+use std::fmt;
 use std::ops::Range;
 use std::os::raw::{c_void, c_long};
 use std::sync::Arc;
@@ -13,13 +12,11 @@ use std::sync::Arc;
 use hal::{buffer, image, pso};
 use hal::{DescriptorPool as HalDescriptorPool, MemoryTypeId};
 use hal::backend::FastHashMap;
-use hal::command::{ClearColorRaw, ClearValueRaw};
-use hal::format::{Aspects, Format, FormatDesc};
-use hal::pass::{Attachment, AttachmentLoadOp, AttachmentOps};
+use hal::format::{Format, FormatDesc};
+use hal::pass::{Attachment, AttachmentId};
 use hal::range::RangeArg;
 
-use cocoa::foundation::{NSUInteger};
-use foreign_types::ForeignType;
+use cocoa::foundation::{NSRange, NSUInteger};
 use metal;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
@@ -27,21 +24,20 @@ use spirv_cross::{msl, spirv};
 
 
 pub type EntryPointMap = FastHashMap<String, spirv::EntryPoint>;
+/// An index of a resource within descriptor pool.
+pub type PoolResourceIndex = u32;
 
 /// Shader module can be compiled in advance if it's resource bindings do not
 /// depend on pipeline layout, in which case the value would become `Compiled`.
 pub enum ShaderModule {
-    Compiled {
-        library: metal::Library,
-        entry_point_map: EntryPointMap,
-    },
+    Compiled(ModuleInfo),
     Raw(Vec<u8>),
 }
 
 impl fmt::Debug for ShaderModule {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ShaderModule::Compiled { .. } => {
+            ShaderModule::Compiled(_) => {
                 write!(formatter, "ShaderModule::Compiled(..)")
             }
             ShaderModule::Raw(ref vec) => {
@@ -54,107 +50,94 @@ impl fmt::Debug for ShaderModule {
 unsafe impl Send for ShaderModule {}
 unsafe impl Sync for ShaderModule {}
 
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
-pub struct RenderPassKey {
-    // enough room for 4 color targets + depth/stencil
-    pub clear_data: SmallVec<[u32; 20]>,
-    operations: SmallVec<[AttachmentOps; 6]>,
+
+bitflags! {
+    /// Subpass attachment operations.
+    pub struct SubpassOps: u8 {
+        const LOAD = 0x0;
+        const STORE = 0x1;
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SubpassFormats {
+    pub colors: SmallVec<[(metal::MTLPixelFormat, Channel); 4]>,
+    pub depth_stencil: Option<metal::MTLPixelFormat>,
+}
+
+impl SubpassFormats {
+    pub fn copy_from(&mut self, other: &Self) {
+        self.colors.clear();
+        self.colors.extend_from_slice(&other.colors);
+        self.depth_stencil = other.depth_stencil;
+    }
+}
+
+#[derive(Debug)]
+pub struct Subpass {
+    pub colors: Vec<(AttachmentId, SubpassOps)>,
+    pub depth_stencil: Option<(AttachmentId, SubpassOps)>,
+    pub inputs: Vec<AttachmentId>,
+    pub target_formats: SubpassFormats,
 }
 
 #[derive(Debug)]
 pub struct RenderPass {
     pub(crate) attachments: Vec<Attachment>,
+    pub(crate) subpasses: Vec<Subpass>,
 }
 
 unsafe impl Send for RenderPass {}
 unsafe impl Sync for RenderPass {}
 
-impl RenderPass {
-    pub fn build_key<T>(&self, clear_values: T) -> (RenderPassKey, Aspects)
-    where
-        T: IntoIterator,
-        T::Item: Borrow<ClearValueRaw>,
-    {
-        let mut key = RenderPassKey::default();
-        let mut full_aspects = Aspects::empty();
-
-        let dummy_value = ClearValueRaw {
-            color: ClearColorRaw {
-                int32: [0; 4],
-            },
-        };
-        let clear_values_iter = clear_values
-            .into_iter()
-            .map(|c| *c.borrow())
-            .chain(iter::repeat(dummy_value));
-
-        for (rat, clear_value) in self.attachments.iter().zip(clear_values_iter) {
-            //TODO: avoid calling `surface_desc` as often
-            let aspects = match rat.format {
-                Some(format) => format.surface_desc().aspects,
-                None => continue,
-            };
-            full_aspects |= aspects;
-            let cv = clear_value.borrow();
-
-            if aspects.contains(Aspects::COLOR) {
-                key.operations.push(rat.ops);
-                if rat.ops.load == AttachmentLoadOp::Clear {
-                    key.clear_data.extend_from_slice(unsafe { &cv.color.uint32 });
-                }
-            }
-            if aspects.contains(Aspects::DEPTH) {
-                key.operations.push(rat.ops);
-                if rat.ops.load == AttachmentLoadOp::Clear {
-                    key.clear_data.push(unsafe { *(&cv.depth_stencil.depth as *const _ as *const u32) });
-                }
-            }
-            if aspects.contains(Aspects::STENCIL) {
-                key.operations.push(rat.stencil_ops);
-                if rat.stencil_ops.load == AttachmentLoadOp::Clear {
-                    key.clear_data.push(unsafe { cv.depth_stencil.stencil });
-                }
-            }
-        }
-
-        (key, full_aspects)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ColorAttachment {
-    pub mtl_format: metal::MTLPixelFormat,
-    pub channel: Channel,
-}
-
-#[derive(Clone, Debug)]
-pub struct FramebufferInner {
-    pub extent: image::Extent,
-    pub aspects: Aspects,
-    pub colors: SmallVec<[ColorAttachment; 4]>,
-    pub depth_stencil: Option<metal::MTLPixelFormat>,
-}
 
 #[derive(Debug)]
 pub struct Framebuffer {
-    pub(crate) descriptor: metal::RenderPassDescriptor,
-    pub(crate) desc_storage: FastStorageMap<RenderPassKey, metal::RenderPassDescriptor>,
-    pub(crate) inner: FramebufferInner,
+    pub(crate) extent: image::Extent,
+    pub(crate) attachments: Vec<metal::Texture>,
 }
 
 unsafe impl Send for Framebuffer {}
 unsafe impl Sync for Framebuffer {}
 
-pub type ResourceOverrideMap = FastHashMap<msl::ResourceBindingLocation, msl::ResourceBinding>;
 
 #[derive(Clone, Debug)]
-pub struct ResourceCounters {
-    pub buffers: usize,
-    pub textures: usize,
-    pub samplers: usize,
+pub struct ResourceData<T> {
+    pub buffers: T,
+    pub textures: T,
+    pub samplers: T,
 }
 
-impl ResourceCounters {
+impl<T> ResourceData<T> {
+    pub fn map<V, F: Fn(&T) -> V>(&self, fun: F) -> ResourceData<V> {
+        ResourceData {
+            buffers: fun(&self.buffers),
+            textures: fun(&self.textures),
+            samplers: fun(&self.samplers),
+        }
+    }
+}
+
+impl<T: Copy + Ord> ResourceData<Range<T>> {
+    pub fn expand(&mut self, point: ResourceData<T>) {
+        //TODO: modify `start` as well?
+        self.buffers.end = self.buffers.end.max(point.buffers);
+        self.textures.end = self.textures.end.max(point.textures);
+        self.samplers.end = self.samplers.end.max(point.samplers);
+    }
+}
+
+impl ResourceData<PoolResourceIndex> {
+    pub fn new() -> Self {
+        ResourceData {
+            buffers: 0,
+            textures: 0,
+            samplers: 0,
+        }
+    }
+}
+/*
+impl ResourceData<ResourceIndex> {
     pub fn new() -> Self {
         ResourceCounters {
             buffers: 0,
@@ -162,41 +145,84 @@ impl ResourceCounters {
             samplers: 0,
         }
     }
-
-    pub fn add(&mut self, content: DescriptorContent) {
+}
+*/
+impl ResourceData<PoolResourceIndex> {
+    #[inline]
+    pub fn add_many(&mut self, content: DescriptorContent, count: PoolResourceIndex) {
         if content.contains(DescriptorContent::BUFFER) {
-            self.buffers += 1;
+            self.buffers += count;
         }
         if content.contains(DescriptorContent::TEXTURE) {
-            self.textures += 1;
+            self.textures += count;
         }
         if content.contains(DescriptorContent::SAMPLER) {
-            self.samplers += 1;
+            self.samplers += count;
         }
+    }
+    #[inline]
+    pub fn add(&mut self, content: DescriptorContent) {
+        self.add_many(content, 1)
     }
 }
 
+
 #[derive(Clone, Debug)]
-pub struct MultiStageResourceCounters {
-    pub vs: ResourceCounters,
-    pub ps: ResourceCounters,
-    pub cs: ResourceCounters,
+pub struct MultiStageData<T> {
+    pub vs: T,
+    pub ps: T,
+    pub cs: T,
+}
+
+pub type MultiStageResourceCounters = MultiStageData<ResourceData<ResourceIndex>>;
+
+#[derive(Debug)]
+pub struct DescriptorSetInfo {
+    pub offsets: MultiStageResourceCounters,
+    pub dynamic_buffers: Vec<MultiStageData<PoolResourceIndex>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PushConstantInfo {
+    pub count: u32,
+    pub buffer_index: ResourceIndex,
 }
 
 #[derive(Debug)]
 pub struct PipelineLayout {
-    pub(crate) res_overrides: ResourceOverrideMap,
-    pub(crate) offsets: Vec<MultiStageResourceCounters>,
+    pub(crate) shader_compiler_options: msl::CompilerOptions,
+    pub(crate) shader_compiler_options_point: msl::CompilerOptions,
+    pub(crate) infos: Vec<DescriptorSetInfo>,
     pub(crate) total: MultiStageResourceCounters,
+    pub(crate) push_constants: MultiStageData<Option<PushConstantInfo>>,
+    pub(crate) total_push_constants: u32,
 }
 
 impl PipelineLayout {
     /// Get the first vertex buffer index to be used by attributes.
     #[inline(always)]
-    pub(crate) fn attribute_buffer_index(&self) -> u32 {
+    pub(crate) fn attribute_buffer_index(&self) -> ResourceIndex {
         self.total.vs.buffers as _
     }
 }
+
+#[derive(Clone)]
+pub struct ModuleInfo {
+    pub library: metal::Library,
+    pub entry_point_map: EntryPointMap,
+    pub rasterization_enabled: bool,
+}
+
+pub struct PipelineCache {
+    pub(crate) modules: FastStorageMap<msl::CompilerOptions, FastStorageMap<Vec<u8>, ModuleInfo>>,
+}
+
+impl fmt::Debug for PipelineCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "PipelineCache")
+    }
+}
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RasterizerState {
@@ -226,7 +252,7 @@ pub struct StencilState<T> {
     pub back_write_mask: T,
 }
 
-pub type VertexBufferMap = FastHashMap<(pso::BufferIndex, pso::ElemOffset), pso::VertexBufferDesc>;
+pub type VertexBufferVec = Vec<(pso::VertexBufferDesc, pso::ElemOffset)>;
 
 #[derive(Debug)]
 pub struct GraphicsPipeline {
@@ -236,18 +262,20 @@ pub struct GraphicsPipeline {
     pub(crate) fs_lib: Option<metal::Library>,
     pub(crate) raw: metal::RenderPipelineState,
     pub(crate) primitive_type: metal::MTLPrimitiveType,
-    pub(crate) attribute_buffer_index: u32,
+    pub(crate) attribute_buffer_index: ResourceIndex,
+    pub(crate) vs_pc_info: Option<PushConstantInfo>,
+    pub(crate) ps_pc_info: Option<PushConstantInfo>,
     pub(crate) rasterizer_state: Option<RasterizerState>,
     pub(crate) depth_bias: pso::State<pso::DepthBias>,
     pub(crate) depth_stencil_desc: pso::DepthStencilDesc,
     pub(crate) baked_states: pso::BakedStates,
-    /// The mapping of additional vertex buffer bindings over the original ones.
+    /// The mapping from Metal vertex buffers to Vulkan ones.
     /// This is needed because Vulkan allows attribute offsets to exceed the strides,
     /// while Metal does not. Thus, we register extra vertex buffer bindings with
     /// adjusted offsets to cover this use case.
-    pub(crate) vertex_buffer_map: VertexBufferMap,
-    /// Tracked attachment formats for figuring (roughly) renderpass compatibility.
-    pub(crate) attachment_formats: Vec<Option<Format>>,
+    pub(crate) vertex_buffers: VertexBufferVec,
+    /// Tracked attachment formats
+    pub(crate) attachment_formats: SubpassFormats,
 }
 
 unsafe impl Send for GraphicsPipeline {}
@@ -258,14 +286,32 @@ pub struct ComputePipeline {
     pub(crate) cs_lib: metal::Library,
     pub(crate) raw: metal::ComputePipelineState,
     pub(crate) work_group_size: metal::MTLSize,
+    pub(crate) pc_info: Option<PushConstantInfo>,
 }
 
 unsafe impl Send for ComputePipeline {}
 unsafe impl Sync for ComputePipeline {}
 
 #[derive(Debug)]
+pub enum ImageLike {
+    /// This is a linearly tiled HOST-visible image, which is represented by a buffer.
+    Buffer(Buffer),
+    /// This is a regular image represented by a texture.
+    Texture(metal::Texture),
+}
+
+impl ImageLike {
+    pub fn as_texture(&self) -> &metal::TextureRef {
+        match *self {
+            ImageLike::Buffer(..) => panic!("Unexpected buffer-backed image"),
+            ImageLike::Texture(ref tex) => tex,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Image {
-    pub(crate) raw: metal::Texture,
+    pub(crate) like: ImageLike,
     pub(crate) kind: image::Kind,
     pub(crate) format_desc: FormatDesc,
     pub(crate) shader_channel: Channel,
@@ -276,16 +322,48 @@ pub struct Image {
 impl Image {
     pub(crate) fn pitches_impl(
         extent: image::Extent, format_desc: FormatDesc
-    ) -> [buffer::Offset; 3] {
+    ) -> [buffer::Offset; 4] {
         let bytes_per_texel = format_desc.bits as image::Size >> 3;
         let row_pitch = extent.width * bytes_per_texel;
         let depth_pitch = extent.height * row_pitch;
         let array_pitch = extent.depth * depth_pitch;
-        [row_pitch as _, depth_pitch as _, array_pitch as _]
+        [bytes_per_texel as _, row_pitch as _, depth_pitch as _, array_pitch as _]
     }
-    pub(crate) fn pitches(&self, level: image::Level) -> [buffer::Offset; 3] {
+    pub(crate) fn pitches(&self, level: image::Level) -> [buffer::Offset; 4] {
         let extent = self.kind.extent().at_level(level);
         Self::pitches_impl(extent, self.format_desc)
+    }
+    pub(crate) fn byte_offset(&self, offset: image::Offset) -> buffer::Offset {
+        let pitches = Self::pitches_impl(self.kind.extent(), self.format_desc);
+        pitches[0] * offset.x as buffer::Offset +
+        pitches[1] * offset.y as buffer::Offset +
+        pitches[2] * offset.z as buffer::Offset
+    }
+    pub(crate) fn byte_extent(&self, extent: image::Extent) -> buffer::Offset {
+        let bytes_per_texel = self.format_desc.bits as image::Size >> 3;
+        (bytes_per_texel * extent.width * extent.height * extent.depth) as _
+    }
+    /// View this cube texture as a 2D array.
+    pub(crate) fn view_cube_as_2d(&self) -> Option<metal::Texture> {
+        match self.mtl_type {
+            metal::MTLTextureType::Cube |
+            metal::MTLTextureType::CubeArray => {
+                let raw = self.like.as_texture();
+                Some(raw.new_texture_view_from_slice(
+                    self.mtl_format,
+                    metal::MTLTextureType::D2Array,
+                    NSRange {
+                        location: 0,
+                        length: raw.mipmap_level_count(),
+                    },
+                    NSRange {
+                        location: 0,
+                        length: self.kind.num_layers() as _,
+                    },
+                ))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -325,7 +403,7 @@ pub struct Semaphore {
 pub struct Buffer {
     pub(crate) raw: metal::Buffer,
     pub(crate) range: Range<u64>,
-    pub(crate) res_options: metal::MTLResourceOptions,
+    pub(crate) options: metal::MTLResourceOptions,
 }
 
 unsafe impl Send for Buffer {}
@@ -336,9 +414,7 @@ unsafe impl Sync for Buffer {}
 pub enum DescriptorPool {
     Emulated {
         inner: Arc<RwLock<DescriptorPoolInner>>,
-        sampler_alloc: RangeAllocator<pso::DescriptorBinding>,
-        texture_alloc: RangeAllocator<pso::DescriptorBinding>,
-        buffer_alloc: RangeAllocator<pso::DescriptorBinding>,
+        allocators: ResourceData<RangeAllocator<PoolResourceIndex>>,
     },
     ArgumentBuffer {
         raw: metal::Buffer,
@@ -357,27 +433,29 @@ pub struct DescriptorPoolInner {
 }
 
 impl DescriptorPool {
-    pub(crate) fn new_emulated(num_samplers: usize, num_textures: usize, num_buffers: usize) -> Self {
+    pub(crate) fn new_emulated(counters: ResourceData<PoolResourceIndex>) -> Self {
         let inner = DescriptorPoolInner {
-            samplers: vec![None; num_samplers],
-            textures: vec![None; num_textures],
-            buffers: vec![None; num_buffers],
+            samplers: vec![None; counters.samplers as usize],
+            textures: vec![None; counters.textures as usize],
+            buffers: vec![None; counters.buffers as usize],
         };
         DescriptorPool::Emulated {
             inner: Arc::new(RwLock::new(inner)),
-            sampler_alloc: RangeAllocator::new(0 .. num_samplers as pso::DescriptorBinding),
-            texture_alloc: RangeAllocator::new(0 .. num_textures as pso::DescriptorBinding),
-            buffer_alloc: RangeAllocator::new(0 .. num_buffers as pso::DescriptorBinding),
+            allocators: ResourceData {
+                samplers: RangeAllocator::new(0 .. counters.samplers),
+                textures: RangeAllocator::new(0 .. counters.textures),
+                buffers: RangeAllocator::new(0 .. counters.buffers),
+            }
         }
     }
 
     fn report_available(&self) {
         match *self {
-            DescriptorPool::Emulated { ref sampler_alloc, ref texture_alloc, ref buffer_alloc, .. } => {
+            DescriptorPool::Emulated { ref allocators, .. } => {
                 trace!("\tavailable {} samplers, {} textures, and {} buffers",
-                    sampler_alloc.total_available(),
-                    texture_alloc.total_available(),
-                    buffer_alloc.total_available(),
+                    allocators.samplers.total_available(),
+                    allocators.textures.total_available(),
+                    allocators.buffers.total_available(),
                 );
             }
             DescriptorPool::ArgumentBuffer { .. } => {}
@@ -389,7 +467,7 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
     fn allocate_set(&mut self, set_layout: &DescriptorSetLayout) -> Result<DescriptorSet, pso::AllocationError> {
         self.report_available();
         match *self {
-            DescriptorPool::Emulated { ref inner, ref mut sampler_alloc, ref mut texture_alloc, ref mut buffer_alloc } => {
+            DescriptorPool::Emulated { ref inner, ref mut allocators } => {
                 debug!("pool: allocate_set");
                 let (layouts, immutable_samplers) = match set_layout {
                     &DescriptorSetLayout::Emulated(ref layouts, ref samplers) => (layouts, samplers),
@@ -397,20 +475,18 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
                 };
 
                 // step[1]: count the total number of descriptors needed
-                let mut total = ResourceCounters::new();
-                let mut has_immutable_samplers = false;
+                let mut total = ResourceData::new();
                 for layout in layouts.iter() {
                     total.add(layout.content);
-                    has_immutable_samplers |= layout.content.contains(DescriptorContent::IMMUTABLE_SAMPLER);
                 }
                 debug!("\ttotal {:?}", total);
 
                 // step[2]: try to allocate the ranges from the pool
                 let sampler_range = if total.samplers != 0 {
-                    match sampler_alloc.allocate_range(total.samplers as _) {
+                    match allocators.samplers.allocate_range(total.samplers as _) {
                         Ok(range) => range,
                         Err(e) => {
-                            return Err(if e.fragmented_free_length >= total.samplers as u32 {
+                            return Err(if e.fragmented_free_length >= total.samplers {
                                 pso::AllocationError::FragmentedPool
                             } else {
                                 pso::AllocationError::OutOfPoolMemory
@@ -421,13 +497,13 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
                     0 .. 0
                 };
                 let texture_range = if total.textures != 0 {
-                    match texture_alloc.allocate_range(total.textures as _) {
+                    match allocators.textures.allocate_range(total.textures as _) {
                         Ok(range) => range,
                         Err(e) => {
                             if sampler_range.end != 0 {
-                                sampler_alloc.free_range(sampler_range);
+                                allocators.samplers.free_range(sampler_range);
                             }
-                            return Err(if e.fragmented_free_length >= total.samplers as u32 {
+                            return Err(if e.fragmented_free_length >= total.samplers {
                                 pso::AllocationError::FragmentedPool
                             } else {
                                 pso::AllocationError::OutOfPoolMemory
@@ -438,16 +514,16 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
                     0 .. 0
                 };
                 let buffer_range = if total.buffers != 0 {
-                    match buffer_alloc.allocate_range(total.buffers as _) {
+                    match allocators.buffers.allocate_range(total.buffers as _) {
                         Ok(range) => range,
                         Err(e) => {
                             if sampler_range.end != 0 {
-                                sampler_alloc.free_range(sampler_range);
+                                allocators.samplers.free_range(sampler_range);
                             }
                             if texture_range.end != 0 {
-                                texture_alloc.free_range(texture_range);
+                                allocators.textures.free_range(texture_range);
                             }
-                            return Err(if e.fragmented_free_length >= total.samplers as u32 {
+                            return Err(if e.fragmented_free_length >= total.samplers {
                                 pso::AllocationError::FragmentedPool
                             } else {
                                 pso::AllocationError::OutOfPoolMemory
@@ -459,28 +535,33 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
                 };
 
                 // step[3]: fill out immutable samplers
-                if has_immutable_samplers {
+                if !immutable_samplers.is_empty() {
                     let mut data = inner.write();
-                    let mut sampler_offset = sampler_range.start as usize;
+                    let mut data_iter = data.samplers[sampler_range.start as usize .. sampler_range.end as usize].iter_mut();
+                    let mut sampler_iter = immutable_samplers.iter();
 
                     for layout in layouts.iter() {
                         if layout.content.contains(DescriptorContent::SAMPLER) {
-                            if layout.content.contains(DescriptorContent::IMMUTABLE_SAMPLER) {
-                                let value = &immutable_samplers[layout.associated_data_index as usize];
-                                data.samplers[sampler_offset] = Some(SamplerPtr(value.as_ptr()));
-                            }
-                            sampler_offset += 1;
+                            *data_iter.next().unwrap() = if layout.content.contains(DescriptorContent::IMMUTABLE_SAMPLER) {
+                                Some(AsNative::from(sampler_iter.next().unwrap().as_ref()))
+                            } else {
+                                None
+                            };
                         }
                     }
                     debug!("\tassigning {} immutable_samplers", immutable_samplers.len());
                 }
 
+                let resources = ResourceData {
+                    buffers: buffer_range,
+                    textures: texture_range,
+                    samplers: sampler_range,
+                };
+
                 Ok(DescriptorSet::Emulated {
                     pool: Arc::clone(inner),
                     layouts: Arc::clone(layouts),
-                    sampler_range,
-                    texture_range,
-                    buffer_range,
+                    resources,
                 })
             }
             DescriptorPool::ArgumentBuffer { ref raw, ref mut range_allocator, } => {
@@ -506,31 +587,30 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
         I: IntoIterator<Item = DescriptorSet>
     {
         match self {
-            DescriptorPool::Emulated { ref inner, ref mut sampler_alloc, ref mut texture_alloc, ref mut buffer_alloc } => {
+            DescriptorPool::Emulated { ref inner, ref mut allocators } => {
                 debug!("pool: free_sets");
                 let mut data = inner.write();
                 for descriptor_set in descriptor_sets {
                     match descriptor_set {
-                        DescriptorSet::Emulated { sampler_range, texture_range, buffer_range, .. } => {
-                            debug!("\t{:?} samplers, {:?} textures, and {:?} buffers",
-                                sampler_range, texture_range, buffer_range);
-                            for sampler in &mut data.samplers[sampler_range.start as usize .. sampler_range.end as usize] {
+                        DescriptorSet::Emulated { resources, .. } => {
+                            debug!("\t{:?} resources", resources);
+                            for sampler in &mut data.samplers[resources.samplers.start as usize .. resources.samplers.end as usize] {
                                 *sampler = None;
                             }
-                            if sampler_range.start != sampler_range.end {
-                                sampler_alloc.free_range(sampler_range);
+                            if resources.samplers.start != resources.samplers.end {
+                                allocators.samplers.free_range(resources.samplers);
                             }
-                            for image in &mut data.textures[texture_range.start as usize .. texture_range.end as usize] {
+                            for image in &mut data.textures[resources.textures.start as usize .. resources.textures.end as usize] {
                                 *image = None;
                             }
-                            if texture_range.start != texture_range.end {
-                                texture_alloc.free_range(texture_range);
+                            if resources.textures.start != resources.textures.end {
+                                allocators.textures.free_range(resources.textures);
                             }
-                            for buffer in &mut data.buffers[buffer_range.start as usize .. buffer_range.end as usize] {
+                            for buffer in &mut data.buffers[resources.buffers.start as usize .. resources.buffers.end as usize] {
                                 *buffer = None;
                             }
-                            if buffer_range.start != buffer_range.end {
-                                buffer_alloc.free_range(buffer_range);
+                            if resources.buffers.start != resources.buffers.end {
+                                allocators.buffers.free_range(resources.buffers);
                             }
                         }
                         DescriptorSet::ArgumentBuffer{..} => {
@@ -558,32 +638,32 @@ impl HalDescriptorPool<Backend> for DescriptorPool {
 
     fn reset(&mut self) {
         match *self {
-            DescriptorPool::Emulated { ref inner, ref mut sampler_alloc, ref mut texture_alloc, ref mut buffer_alloc } => {
+            DescriptorPool::Emulated { ref inner, ref mut allocators } => {
                 debug!("pool: reset");
-                if sampler_alloc.is_empty() && texture_alloc.is_empty() && buffer_alloc.is_empty() {
+                if allocators.samplers.is_empty() && allocators.textures.is_empty() && allocators.buffers.is_empty() {
                     return // spare the locking
                 }
                 let mut data = inner.write();
 
-                for range in sampler_alloc.allocated_ranges() {
+                for range in allocators.samplers.allocated_ranges() {
                     for sampler in &mut data.samplers[range.start as usize .. range.end as usize] {
                         *sampler = None;
                     }
                 }
-                for range in texture_alloc.allocated_ranges() {
+                for range in allocators.textures.allocated_ranges() {
                     for texture in &mut data.textures[range.start as usize .. range.end as usize] {
                         *texture = None;
                     }
                 }
-                for range in buffer_alloc.allocated_ranges() {
+                for range in allocators.buffers.allocated_ranges() {
                     for buffer in &mut data.buffers[range.start as usize .. range.end as usize] {
                         *buffer = None;
                     }
                 }
 
-                sampler_alloc.reset();
-                texture_alloc.reset();
-                buffer_alloc.reset();
+                allocators.samplers.reset();
+                allocators.textures.reset();
+                allocators.buffers.reset();
             }
             DescriptorPool::ArgumentBuffer { ref mut range_allocator, .. } => {
                 range_allocator.reset();
@@ -635,8 +715,6 @@ impl From<pso::DescriptorType> for DescriptorContent {
 #[derive(Debug)]
 pub struct DescriptorLayout {
     pub content: DescriptorContent,
-    /// Index of either an immutable sampler or a dynamic offset entry, if applicable
-    pub associated_data_index: u16,
     pub stages: pso::ShaderStageFlags,
     pub binding: pso::DescriptorBinding,
     pub array_index: pso::DescriptorArrayIndex,
@@ -650,15 +728,12 @@ pub enum DescriptorSetLayout {
 unsafe impl Send for DescriptorSetLayout {}
 unsafe impl Sync for DescriptorSetLayout {}
 
-
 #[derive(Debug)]
 pub enum DescriptorSet {
     Emulated {
         pool: Arc<RwLock<DescriptorPoolInner>>,
         layouts: Arc<Vec<DescriptorLayout>>,
-        sampler_range: Range<pso::DescriptorBinding>,
-        texture_range: Range<pso::DescriptorBinding>,
-        buffer_range: Range<pso::DescriptorBinding>
+        resources: ResourceData<Range<PoolResourceIndex>>,
     },
     ArgumentBuffer {
         raw: metal::Buffer,
@@ -718,6 +793,11 @@ pub struct UnboundImage {
 }
 unsafe impl Send for UnboundImage {}
 unsafe impl Sync for UnboundImage {}
+
+#[derive(Debug)]
+pub enum QueryPool {
+    Occlusion(Range<u32>),
+}
 
 #[derive(Debug)]
 pub enum FenceInner {

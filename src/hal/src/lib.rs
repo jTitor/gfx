@@ -36,7 +36,7 @@ pub use self::queue::{
     Capability, Supports, General, Graphics, Compute, Transfer,
 };
 pub use self::window::{
-    Backbuffer, SwapImageIndex, FrameSync, PresentMode,
+    AcquireError, Backbuffer, SwapImageIndex, FrameSync, PresentMode,
     Surface, SurfaceCapabilities, Swapchain, SwapchainConfig,
 };
 
@@ -226,11 +226,13 @@ bitflags! {
 }
 
 /// Resource limits of a particular graphics device.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Limits {
     /// Maximum supported texture size.
     pub max_texture_size: usize,
+    /// Maximum number of elements for the BufferView to see.
+    pub max_texel_elements: usize,
     /// Maximum number of vertices for each patch.
     pub max_patch_size: PatchSize,
     /// Maximum number of viewports.
@@ -272,6 +274,8 @@ pub struct Limits {
     pub max_color_attachments: usize,
     /// Size and alignment in bytes that bounds concurrent access to host-mapped device memory.
     pub non_coherent_atom_size: usize,
+    /// Maximum degree of sampler anisotropy.
+    pub max_sampler_anisotropy: f32,
 }
 
 /// Describes the type of geometric primitives,
@@ -330,7 +334,29 @@ pub enum IndexType {
     U32,
 }
 
-/// Basic backend instance trait.
+/// An instantiated backend.
+///
+/// Any startup the backend needs to perform will be done when creating the type that implements
+/// `Instance`.
+///
+/// # Examples
+///
+/// ```rust
+/// # extern crate gfx_backend_empty;
+/// # extern crate gfx_hal;
+/// use gfx_backend_empty as backend;
+/// use gfx_hal as hal;
+///
+/// // Create a concrete instance of our backend (this is backend-dependent and may be more
+/// // complicated for some backends).
+/// let instance = backend::Instance;
+/// // We can get a list of the available adapters, which are either physical graphics
+/// // devices, or virtual adapters. Because we are using the dummy `empty` backend,
+/// // there will be nothing in this list.
+/// for (idx, adapter) in hal::Instance::enumerate_adapters(&instance).iter().enumerate() {
+///     println!("Adapter {}: {:?}", idx, adapter.info);
+/// }
+/// ```
 pub trait Instance: Any + Send + Sync {
     /// Associated backend type of this instance.
     type Backend: Backend;
@@ -371,6 +397,7 @@ pub trait Backend: 'static + Sized + Eq + Clone + Hash + fmt::Debug + Any + Send
 
     type ComputePipeline:     fmt::Debug + Any + Send + Sync;
     type GraphicsPipeline:    fmt::Debug + Any + Send + Sync;
+    type PipelineCache:       fmt::Debug + Any + Send + Sync;
     type PipelineLayout:      fmt::Debug + Any + Send + Sync;
     type DescriptorPool:      pso::DescriptorPool<Self>;
     type DescriptorSet:       fmt::Debug + Any + Send + Sync;

@@ -1,12 +1,11 @@
 //! Raw Pipeline State Objects
 //!
-//! This module contains items used to create and manage a raw pipeline state object. Most users
-//! will want to use the typed and safe `PipelineState`. See the `pso` module inside the `gfx`
-//! crate.
+//! This module contains items used to create and manage Pipelines.
 
 use {device, pass};
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 
 mod compute;
 mod descriptor;
@@ -146,6 +145,19 @@ impl From<Stage> for ShaderStageFlags {
     }
 }
 
+impl fmt::Display for Stage {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Stage::Vertex => "vertex",
+            Stage::Hull => "hull",
+            Stage::Domain => "domain",
+            Stage::Geometry => "geometry",
+            Stage::Fragment => "fragment",
+            Stage::Compute => "compute"
+        })
+    }
+}
+
 
 /// Shader entry point.
 #[derive(Debug, Copy)]
@@ -154,8 +166,8 @@ pub struct EntryPoint<'a, B: Backend> {
     pub entry: &'a str,
     /// Shader module reference.
     pub module: &'a B::ShaderModule,
-    /// Specialization info.
-    pub specialization: &'a [Specialization],
+    /// Specialization.
+    pub specialization: Specialization<'a>,
 }
 
 impl<'a, B: Backend> Clone for EntryPoint<'a, B> {
@@ -185,7 +197,7 @@ bitflags!(
 
 /// A reference to a parent pipeline.  The assumption is that
 /// a parent and derivative/child pipeline have most settings
-/// in common, and one may be switched for another more quickly 
+/// in common, and one may be switched for another more quickly
 /// than entirely unrelated pipelines would be.
 #[derive(Debug)]
 pub enum BasePipeline<'a, P: 'a> {
@@ -199,35 +211,49 @@ pub enum BasePipeline<'a, P: 'a> {
     None,
 }
 
-/// Specialization information for pipelines.
-/// 
-/// Specialization constants allow for easy configuration of 
-/// multiple similar pipelines. For example, there may be a 
+/// Specialization constant for pipelines.
+///
+/// Specialization constants allow for easy configuration of
+/// multiple similar pipelines. For example, there may be a
 /// boolean exposed to the shader that switches the specularity on/off
 /// provided via a specialization constant.
-/// That would produce separate PSO's for the "on" and "off" states 
-/// but they share most of the internal stuff and are fast to produce. 
-/// More importantly, they are fast to execute, since the driver 
+/// That would produce separate PSO's for the "on" and "off" states
+/// but they share most of the internal stuff and are fast to produce.
+/// More importantly, they are fast to execute, since the driver
 /// can optimize out the branch on that other PSO creation.
 #[derive(Debug, Clone)]
-pub struct Specialization {
+pub struct SpecializationConstant {
     /// Constant identifier in shader source.
     pub id: u32,
     /// Value to override specialization constant.
-    pub value: Constant,
+    pub range: Range<u16>,
 }
 
-/// Scalar specialization constant with value for overriding.
-#[allow(missing_docs)]
-#[derive(Debug, Clone)]
-pub enum Constant {
-    Bool(bool),
-    U32(u32),
-    U64(u64),
-    I32(i32),
-    I64(i64),
-    F32(f32),
-    F64(f64),
+/// Specialization information structure.
+#[derive(Debug, Copy)]
+pub struct Specialization<'a> {
+    /// Constant array.
+    pub constants: &'a [SpecializationConstant],
+    /// Raw data.
+    pub data: &'a [u8],
+}
+
+impl<'a> Default for Specialization<'a> {
+    fn default() -> Self {
+        Specialization {
+            constants: &[],
+            data: &[],
+        }
+    }
+}
+
+impl<'a> Clone for Specialization<'a> {
+    fn clone(&self) -> Self {
+        Specialization {
+            constants: self.constants,
+            data: self.data,
+        }
+    }
 }
 
 /// Pipeline state which may be static or dynamic.

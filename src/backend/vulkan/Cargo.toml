@@ -26,7 +26,12 @@ shared_library = { version = "0.1.9", optional = true }
 ash = "0.24.4"
 gfx-hal = { path = "../../hal", version = "0.1" }
 smallvec = "0.6"
-winit = { git = "https://github.com/jTitor/winit", version = "^0.16", optional = true }
+<<<<<<< HEAD
+#Current upstream: 0.17
+winit = { git = "https://github.com/jTitor/winit", version = "^0.17", optional = true }
+=======
+winit = { version = "0.17", optional = true }
+>>>>>>> c7fd2338fff2dfd95c56adf481801780169bc74d
 glsl-to-spirv = { version = "0.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -65,7 +65,9 @@ pub struct Swapchain {
 }
 
 impl hal::Swapchain<B> for Swapchain {
-    fn acquire_image(&mut self, _sync: hal::FrameSync<B>) -> Result<hal::SwapImageIndex, ()> {
+    fn acquire_image(
+        &mut self, _timeout_ns: u64, _sync: hal::FrameSync<B>
+    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
         // TODO: sync
         Ok(0)
     }
@@ -138,6 +140,7 @@ impl hal::Surface<B> for Surface {
                 height: ex.height + 1,
             },
             max_image_layers: 1,
+            usage: image::Usage::COLOR_ATTACHMENT | image::Usage::TRANSFER_SRC,
         };
         let present_modes = vec![hal::PresentMode::Fifo]; //TODO
 

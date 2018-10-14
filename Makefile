@@ -8,6 +8,11 @@ SDL2_DEST=$(HOME)/deps
 SDL2_CONFIG=$(SDL2_DEST)/usr/bin/sdl2-config
 SDL2_PPA=http://ppa.launchpad.net/zoogie/sdl2-snapshots/ubuntu/pool/main/libs/libsdl2
 
+ifeq (,$(TARGET))
+	CHECK_TARGET_FLAG=
+else
+	CHECK_TARGET_FLAG=--target $(TARGET)
+endif
 
 ifeq ($(OS),Windows_NT)
 	EXCLUDES+= --exclude gfx-backend-metal
@@ -36,7 +41,7 @@ else
 endif
 
 
-.PHONY: all check quad test reftests travis-sdl2
+.PHONY: all check quad test doc reftests travis-sdl2
 
 all: check test
 
@@ -45,15 +50,18 @@ help:
 
 check:
 	@echo "Note: excluding \`warden\` here, since it depends on serialization"
-	cargo check --all $(EXCLUDES) --exclude gfx-warden
-	cd examples && cargo check --features "gl"
-	cd examples && cargo check --features "$(FEATURES_HAL)"
-	cd examples && cargo check --features "$(FEATURES_HAL2)"
-	cd src/warden && cargo check --no-default-features
-	cd src/warden && cargo check --features "env_logger gl gl-headless $(FEATURES_HAL) $(FEATURES_HAL2)"
+	cargo check --all $(CHECK_TARGET_FLAG) $(EXCLUDES) --exclude gfx-warden
+	cd examples && cargo check $(CHECK_TARGET_FLAG) --features "gl"
+	cd examples && cargo check $(CHECK_TARGET_FLAG) --features "$(FEATURES_HAL)"
+	cd examples && cargo check $(CHECK_TARGET_FLAG) --features "$(FEATURES_HAL2)"
+	cd src/warden && cargo check $(CHECK_TARGET_FLAG) --no-default-features
+	cd src/warden && cargo check $(CHECK_TARGET_FLAG) --features "env_logger gl gl-headless $(FEATURES_HAL) $(FEATURES_HAL2)"
 
 test:
 	cargo test --all $(EXCLUDES)
+
+doc:
+	cargo doc --all $(EXCLUDES)
 
 reftests:
 	cd src/warden && cargo run --features "$(FEATURES_HAL) $(FEATURES_HAL2)" -- local #TODO: gl

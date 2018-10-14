@@ -7,7 +7,7 @@ use std::borrow::Borrow;
 use std::ops::Range;
 use hal::{
     buffer, command, device, error, format, image, mapping,
-    memory, pass, pool, pso, query, queue, window
+    memory, pass, pool, pso, query, queue
 };
 use hal::range::RangeArg;
 
@@ -42,6 +42,7 @@ impl hal::Backend for Backend {
 
     type ComputePipeline = ();
     type GraphicsPipeline = ();
+    type PipelineCache = ();
     type PipelineLayout = ();
     type DescriptorSetLayout = ();
     type DescriptorPool = DescriptorPool;
@@ -67,7 +68,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 
     fn image_format_properties(
         &self, _: format::Format, _dim: u8, _: image:: Tiling,
-        _: image::Usage, _: image::StorageFlags,
+        _: image::Usage, _: image::ViewCapabilities,
     ) -> Option<image::FormatProperties> {
         unimplemented!()
     }
@@ -148,6 +149,22 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
+    fn create_pipeline_cache(&self) -> () {
+        unimplemented!()
+    }
+
+    fn destroy_pipeline_cache(&self, _: ()) {
+        unimplemented!()
+    }
+
+    fn merge_pipeline_caches<I>(&self, _: &(), _: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<()>,
+    {
+        unimplemented!()
+    }
+
     fn create_framebuffer<I>(
         &self, _: &(), _: I, _: image::Extent
     ) -> Result<(), device::FramebufferError>
@@ -188,7 +205,7 @@ impl hal::Device<Backend> for Device {
         _: format::Format,
         _: image::Tiling,
         _: image::Usage,
-        _: image::StorageFlags,
+        _: image::ViewCapabilities,
     ) -> Result<(), image::CreationError> {
         unimplemented!()
     }
@@ -263,11 +280,19 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
-    fn create_query_pool(&self, _: query::QueryType, _: u32) -> () {
+    fn create_query_pool(&self, _: query::Type, _: u32) -> Result<(), query::Error> {
         unimplemented!()
     }
 
     fn destroy_query_pool(&self, _: ()) {
+        unimplemented!()
+    }
+
+    fn get_query_pool_results(
+        &self, _: &(), _: Range<query::Id>,
+        _: &mut [u8], _: buffer::Offset,
+        _: query::ResultFlags,
+    ) -> Result<bool, query::Error> {
         unimplemented!()
     }
 
@@ -359,7 +384,6 @@ impl hal::Device<Backend> for Device {
         _: &mut Surface,
         _: hal::SwapchainConfig,
         _: Option<Swapchain>,
-        _: &window::Extent2D,
     ) -> (Swapchain, hal::Backbuffer<Backend>) {
         unimplemented!()
     }
@@ -696,7 +720,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn begin_query(
         &mut self,
         _: query::Query<Backend>,
-        _: query::QueryControl,
+        _: query::ControlFlags,
     ) {
         unimplemented!()
     }
@@ -711,7 +735,19 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     fn reset_query_pool(
         &mut self,
         _: &(),
-        _: Range<query::QueryId>,
+        _: Range<query::Id>,
+    ) {
+        unimplemented!()
+    }
+
+    fn copy_query_pool_results(
+        &mut self,
+        _: &(),
+        _: Range<query::Id>,
+        _: &(),
+        _: buffer::Offset,
+        _: buffer::Offset,
+        _: query::ResultFlags,
     ) {
         unimplemented!()
     }
@@ -792,7 +828,9 @@ impl hal::Surface<Backend> for Surface {
 /// Dummy swapchain.
 pub struct Swapchain;
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_image(&mut self, _: hal::FrameSync<Backend>) -> Result<hal::SwapImageIndex, ()> {
+    fn acquire_image(
+        &mut self, _: u64, _: hal::FrameSync<Backend>
+    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
         unimplemented!()
     }
 }
@@ -801,6 +839,6 @@ pub struct Instance;
 impl hal::Instance for Instance {
     type Backend = Backend;
     fn enumerate_adapters(&self) -> Vec<hal::Adapter<Backend>> {
-        unimplemented!()
+        vec![]
     }
 }

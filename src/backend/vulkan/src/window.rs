@@ -254,9 +254,10 @@ impl Instance {
         #[cfg(target_os = "android")]
         {
             use winit::os::android::WindowExt;
-            let (width, height) = window.get_inner_size().unwrap();
-            self.create_surface_android(window.get_native_window(), width, height)
-
+            let logical_size = window.get_inner_size().unwrap();
+            let width = logical_size.width * window.get_hidpi_factor();
+            let height = logical_size.height * window.get_hidpi_factor();
+            self.create_surface_android(window.get_native_window(), width as _, height as _)
         }
         #[cfg(windows)]
         {
@@ -310,7 +311,7 @@ impl hal::Surface<Backend> for Surface {
 
         // `0xFFFFFFFF` indicates that the extent depends on the created swapchain.
         let current_extent =
-            if caps.current_extent.width != 0xFFFFFFFF && caps.current_extent.height != 0xFFFFFFFF {
+            if caps.current_extent.width != !0 && caps.current_extent.height != !0 {
                 Some(hal::window::Extent2D {
                     width: caps.current_extent.width,
                     height: caps.current_extent.height,
@@ -334,6 +335,7 @@ impl hal::Surface<Backend> for Surface {
             current_extent,
             extents: min_extent..max_extent,
             max_image_layers: caps.max_image_array_layers as _,
+            usage: conv::map_vk_image_usage(caps.supported_usage_flags),
         };
 
         // Swapchain formats
@@ -386,7 +388,9 @@ pub struct Swapchain {
 
 
 impl hal::Swapchain<Backend> for Swapchain {
-    fn acquire_image(&mut self, sync: hal::FrameSync<Backend>) -> Result<hal::SwapImageIndex, ()> {
+    fn acquire_image(
+        &mut self, timeout_ns: u64, sync: hal::FrameSync<Backend>
+    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
         let (semaphore, fence) = match sync {
             hal::FrameSync::Semaphore(semaphore) => (semaphore.0, vk::Fence::null()),
             hal::FrameSync::Fence(fence) => (vk::Semaphore::null(), fence.0),
@@ -394,12 +398,14 @@ impl hal::Swapchain<Backend> for Swapchain {
 
         let index = unsafe {
             // will block if no image is available
-            self.functor.acquire_next_image_khr(self.raw, !0, semaphore, fence)
+            self.functor.acquire_next_image_khr(self.raw, timeout_ns, semaphore, fence)
         };
 
         match index {
             Ok(i) => Ok(i),
-            Err(vk::Result::SuboptimalKhr) | Err(vk::Result::ErrorOutOfDateKhr) => Err(()),
+            Err(vk::Result::NotReady) => Err(hal::AcquireError::NotReady),
+            Err(vk::Result::SuboptimalKhr) | Err(vk::Result::ErrorOutOfDateKhr) => Err(hal::AcquireError::OutOfDate),
+            Err(vk::Result::ErrorSurfaceLostKhr) => Err(hal::AcquireError::SurfaceLost),
             _ => panic!("Failed to acquire image."),
         }
     }

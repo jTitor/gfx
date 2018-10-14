@@ -26,9 +26,10 @@ path = "compute/main.rs"
 
 [dependencies]
 env_logger = "0.5"
-image = "0.18"
+image = "0.19"
 log = "0.4"
-winit = { git = "https://github.com/jTitor/winit", version = "^0.16" }
+#latest upstream: 0.17
+winit = { git = "https://github.com/jTitor/winit", version = "^0.17" }
 glsl-to-spirv = "0.1.4"
 gfx-hal = { path = "../src/hal", version = "0.1" }
 gfx-backend-empty = { path = "../src/backend/empty", version = "0.1" }
@@ -45,7 +46,7 @@ version = "0.1"
 #features = ["glsl-to-spirv"]
 optional = true
 
-[target.'cfg(target_os = "macos")'.dependencies.gfx-backend-metal]
+[target.'cfg(any(target_os = "macos", all(target_os = "ios", target_arch = "aarch64")))'.dependencies.gfx-backend-metal]
 path = "../src/backend/metal"
 version = "0.1"
 optional = true

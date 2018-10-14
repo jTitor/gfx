@@ -34,7 +34,7 @@
 //! let acquisition_semaphore = device.create_semaphore();
 //! let render_semaphore = device.create_semaphore();
 //!
-//! let frame = swapchain.acquire_image(FrameSync::Semaphore(&acquisition_semaphore));
+//! let frame = swapchain.acquire_image(!0, FrameSync::Semaphore(&acquisition_semaphore));
 //! // render the scene..
 //! // `render_semaphore` will be signalled once rendering has been finished
 //! swapchain.present(&mut present_queue, 0, &[render_semaphore]);
@@ -58,6 +58,7 @@ use std::any::Any;
 use std::borrow::Borrow;
 use std::ops::Range;
 
+
 /// An extent describes the size of a rectangle, such as
 /// a window or texture. It is not used for referring to a
 /// sub-rectangle; for that see `command::Rect`.
@@ -75,6 +76,17 @@ impl From<image::Extent> for Extent2D {
         Extent2D {
             width: ex.width,
             height: ex.height,
+        }
+    }
+}
+
+impl Extent2D {
+    /// Convert into a regular image extent.
+    pub fn to_extent(&self) -> image::Extent {
+        image::Extent {
+            width: self.width,
+            height: self.height,
+            depth: 1,
         }
     }
 }
@@ -105,6 +117,9 @@ pub struct SurfaceCapabilities {
     ///
     /// Must be at least 1.
     pub max_image_layers: image::Layer,
+
+    /// Supported image usage flags.
+    pub usage: image::Usage,
 }
 
 /// A `Surface` abstracts the surface of a native window, which will be presented
@@ -184,22 +199,24 @@ pub enum PresentMode {
 /// # fn main() {
 /// # use gfx_hal::{SwapchainConfig};
 /// # use gfx_hal::format::Format;
-/// let config = SwapchainConfig::new()
-///     .with_color(Format::Bgra8Unorm)
-///     .with_depth_stencil(Format::D16Unorm)
-///     .with_image_count(2);
+/// let config = SwapchainConfig::new(100, 100, Format::Bgra8Unorm, 2);
 /// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct SwapchainConfig {
     /// Presentation mode.
     pub present_mode: PresentMode,
-    /// Color format of the backbuffer images.
-    pub color_format: Format,
-    /// Depth stencil format of the backbuffer images (optional).
-    pub depth_stencil_format: Option<Format>,
-    /// Number of images in the swapchain.
+    /// Format of the backbuffer images.
+    pub format: Format,
+    /// Requested image extent. Must be in
+    /// `SurfaceCapabilities::extents` range.
+    pub extent: Extent2D,
+    /// Number of images in the swapchain. Must be in
+    /// `SurfaceCapabilities::image_count` range.
     pub image_count: SwapImageIndex,
+    /// Number of image layers. Must be lower or equal to
+    /// `SurfaceCapabilities::max_image_layers`.
+    pub image_layers: image::Layer,
     /// Image usage of the backbuffer images.
     pub image_usage: image::Usage,
 }
@@ -212,13 +229,27 @@ impl SwapchainConfig {
     /// ```no_run
     ///
     /// ```
-    pub fn new() -> Self {
+    pub fn new(width: u32, height: u32, format: Format, image_count: SwapImageIndex) -> Self {
         SwapchainConfig {
             present_mode: PresentMode::Fifo,
-            color_format: Format::Bgra8Unorm, // TODO: try to find best default format
-            depth_stencil_format: None,
-            image_count: 2,
-            image_usage: image::Usage::empty(),
+            format,
+            extent: Extent2D { width, height },
+            image_count,
+            image_layers: 1,
+            image_usage: image::Usage::COLOR_ATTACHMENT,
+        }
+    }
+
+    /// Create a swapchain configuration based on the capabilities
+    /// returned from a physical device query.
+    pub fn from_caps(caps: &SurfaceCapabilities, format: Format) -> Self {
+        SwapchainConfig {
+            present_mode: PresentMode::Fifo,
+            format,
+            extent: caps.current_extent.unwrap_or(caps.extents.start),
+            image_count: caps.image_count.start,
+            image_layers: 1,
+            image_usage: image::Usage::COLOR_ATTACHMENT,
         }
     }
 
@@ -231,46 +262,6 @@ impl SwapchainConfig {
     /// ```
     pub fn with_mode(mut self, mode: PresentMode) -> Self {
         self.present_mode = mode;
-        self
-    }
-
-    /// Specify the color format for the backbuffer images.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    ///
-    /// ```
-    pub fn with_color(mut self, cf: Format) -> Self {
-        self.color_format = cf;
-        self
-    }
-
-    /// Specify the depth stencil format for the backbuffer images.
-    ///
-    /// The Swapchain will create additional depth-stencil images for each backbuffer.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    ///
-    /// ```
-    pub fn with_depth_stencil(mut self, dsf: Format) -> Self {
-        self.depth_stencil_format = Some(dsf);
-        self
-    }
-
-    /// Specify the requested number of backbuffer images.
-    ///
-    /// The implementation may choose to create more if necessary.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    ///
-    /// ```
-    pub fn with_image_count(mut self, count: u32) -> Self {
-        self.image_count = count;
         self
     }
 
@@ -298,12 +289,24 @@ pub enum Backbuffer<B: Backend> {
     Framebuffer(B::Framebuffer),
 }
 
+
+/// Error on acquiring the next image from a swapchain.
+#[derive(Debug)]
+pub enum AcquireError {
+    /// No image was ready after the specified timeout expired.
+    NotReady,
+    /// The swapchain is no longer in sync with the surface, needs to be re-created.
+    OutOfDate,
+    /// The surface was lost, and the swapchain is no longer usable.
+    SurfaceLost,
+}
+
 /// The `Swapchain` is the backend representation of the surface.
 /// It consists of multiple buffers, which will be presented on the surface.
 pub trait Swapchain<B: Backend>: Any + Send + Sync {
     /// Acquire a new swapchain image for rendering. This needs to be called before presenting.
     ///
-    /// Will fail if the swapchain needs recreation.
+    /// May fail according to one of the reasons indicated in `AcquireError` enum.
     ///
     /// # Synchronization
     ///
@@ -317,7 +320,9 @@ pub trait Swapchain<B: Backend>: Any + Send + Sync {
     /// ```no_run
     ///
     /// ```
-    fn acquire_image(&mut self, sync: FrameSync<B>) -> Result<SwapImageIndex, ()>;
+    fn acquire_image(
+        &mut self, timeout_ns: u64, sync: FrameSync<B>
+    ) -> Result<SwapImageIndex, AcquireError>;
 
     /// Present one acquired image.
     ///

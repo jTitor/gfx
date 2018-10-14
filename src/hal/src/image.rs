@@ -35,6 +35,10 @@ pub struct Extent {
 }
 
 impl Extent {
+    /// Return true if one of the dimensions is zero.
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0 || self.depth == 0
+    }
     /// Get the extent at a particular mipmap level.
     pub fn at_level(&self, level: Level) -> Self {
         Extent {
@@ -378,11 +382,15 @@ pub enum ViewKind {
 }
 
 bitflags!(
-    /// Image storage flags
+    /// Capabilities to create views into an image.
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-    pub struct StorageFlags: u32 {
-        /// Support creation of `Cube` and `CubeArray` views.
-        const CUBE_VIEW = 0b0010000;
+    pub struct ViewCapabilities: u32 {
+        /// Support creation of views with different formats.
+        const MUTABLE_FORMAT = 0x00000008;
+        /// Support creation of `Cube` and `CubeArray` kinds of views.
+        const KIND_CUBE      = 0x00000010;
+        /// Support creation of `D2Array` kind of view.
+        const KIND_2D_ARRAY  = 0x00000020;
     }
 );
 

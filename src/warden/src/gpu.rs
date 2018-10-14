@@ -305,7 +305,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                     raw::Resource::Image { kind, num_levels, format, usage, ref data } => {
                         // allocate memory
                         let unbound = device.create_image(
-                            kind, num_levels, format, i::Tiling::Optimal, usage, i::StorageFlags::empty()
+                            kind, num_levels, format, i::Tiling::Optimal, usage, i::ViewCapabilities::empty()
                             ).unwrap();
                         let requirements = device.get_image_requirements(&unbound);
                         let memory_type = memory_types
@@ -645,7 +645,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                     module: reshaders
                                         .get(shader)
                                         .expect(&format!("Missing shader: {}", shader)),
-                                    specialization: &[],
+                                    specialization: pso::Specialization::default(),
                                 })
                             }
                         };
@@ -656,7 +656,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                     module: reshaders
                                         .get(&shaders.vertex)
                                         .expect(&format!("Missing vertex shader: {}", shaders.vertex)),
-                                    specialization: &[],
+                                    specialization: pso::Specialization::default(),
                                 },
                                 hull: entry(&shaders.hull),
                                 domain: entry(&shaders.domain),
@@ -679,7 +679,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             flags: pso::PipelineCreationFlags::empty(),
                             parent: pso::BasePipeline::None,
                         };
-                        let pso = device.create_graphics_pipelines(&[desc])
+                        let pso = device.create_graphics_pipelines(&[desc], None)
                             .swap_remove(0)
                             .unwrap();
                         resources.graphics_pipelines.insert(name.clone(), pso);
@@ -691,7 +691,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                                 module: resources.shaders
                                     .get(shader)
                                     .expect(&format!("Missing compute shader: {}", shader)),
-                                specialization: &[],
+                                specialization: pso::Specialization::default(),
                             },
                             layout: resources.pipeline_layouts
                                 .get(layout)
@@ -699,7 +699,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             flags: pso::PipelineCreationFlags::empty(),
                             parent: pso::BasePipeline::None,
                         };
-                        let pso = device.create_compute_pipelines(&[desc])
+                        let pso = device.create_compute_pipelines(&[desc], None)
                             .swap_remove(0)
                             .unwrap();
                         resources.compute_pipelines.insert(name.clone(), (layout.clone(), pso));

@@ -22,22 +22,23 @@ name = "gfx_backend_metal"
 gfx-hal = { path = "../../hal", version = "0.1" }
 bitflags = "1.0"
 log = { version = "0.4", features = ["release_max_level_error"] }
-winit = { git = "https://github.com/jTitor/winit", version = "^0.15.1", optional = true }
+#Current upstream: 0.17
+winit = { git = "https://github.com/jTitor/winit", version = "^0.17", optional = true }
 
-dispatch = "0.1"
+dispatch = { version = "0.1", optional = true }
 smallvec = "0.6"
-spirv_cross = "0.9"
+spirv_cross = "0.11.2"
 parking_lot = "0.6.3"
-storage-map = "0.1.1"
+storage-map = "0.1.2"
 
 #Unclear which of these aren't available
 #under iOS.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-metal-rs = "0.10.4"
+metal = { version = "0.13.0", features = ["private"] }
 foreign-types = "0.3"
 objc = "0.2.5"
 block = "0.1"
-cocoa = "0.15"
-core-graphics = "0.14"
+cocoa = "0.18"
+core-graphics = "0.17"
 #unclear if still needed?
 #io-surface = "0.10"

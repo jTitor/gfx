@@ -74,9 +74,13 @@ fn main() {
         );
 
         let pipeline_layout = device.create_pipeline_layout(Some(&set_layout), &[]);
-        let entry_point = pso::EntryPoint { entry: "main", module: &shader, specialization: &[] };
+        let entry_point = pso::EntryPoint {
+            entry: "main",
+            module: &shader,
+            specialization: pso::Specialization::default(),
+        };
         let pipeline = device
-            .create_compute_pipeline(&pso::ComputePipelineDesc::new(entry_point, &pipeline_layout))
+            .create_compute_pipeline(&pso::ComputePipelineDesc::new(entry_point, &pipeline_layout), None)
             .expect("Error creating compute pipeline!");
 
         let desc_pool = device.create_descriptor_pool(
@@ -91,7 +95,7 @@ fn main() {
         (pipeline_layout, pipeline, set_layout, desc_pool)
     };
 
-    let (staging_memory, staging_buffer) = create_buffer::<back::Backend>(
+    let (staging_memory, staging_buffer, staging_size) = create_buffer::<back::Backend>(
         &mut device,
         &memory_properties.memory_types,
         memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT,
@@ -101,12 +105,12 @@ fn main() {
     );
 
     {
-        let mut writer = device.acquire_mapping_writer::<u32>(&staging_memory, 0..stride * numbers.len() as u64).unwrap();
-        writer.copy_from_slice(&numbers);
+        let mut writer = device.acquire_mapping_writer::<u32>(&staging_memory, 0..staging_size).unwrap();
+        writer[0..numbers.len()].copy_from_slice(&numbers);
         device.release_mapping_writer(writer);
     }
 
-    let (device_memory, device_buffer) = create_buffer::<back::Backend>(
+    let (device_memory, device_buffer, _device_buffer_size) = create_buffer::<back::Backend>(
         &mut device,
         &memory_properties.memory_types,
         memory::Properties::DEVICE_LOCAL,
@@ -158,8 +162,8 @@ fn main() {
     device.wait_for_fence(&fence, !0);
 
     {
-        let reader = device.acquire_mapping_reader::<u32>(&staging_memory, 0..stride * numbers.len() as u64).unwrap();
-        println!("Times: {:?}", reader.into_iter().map(|n| *n).collect::<Vec<u32>>());
+        let reader = device.acquire_mapping_reader::<u32>(&staging_memory, 0..staging_size).unwrap();
+        println!("Times: {:?}", reader[0..numbers.len()].into_iter().map(|n| *n).collect::<Vec<u32>>());
         device.release_mapping_reader(reader);
     }
 
@@ -183,7 +187,7 @@ fn create_buffer<B: Backend>(
     usage: buffer::Usage,
     stride: u64,
     len: u64,
-) -> (B::Memory, B::Buffer) {
+) -> (B::Memory, B::Buffer, u64) {
     let buffer = device.create_buffer(stride * len, usage).unwrap();
     let requirements = device.get_buffer_requirements(&buffer);
 
@@ -200,7 +204,7 @@ fn create_buffer<B: Backend>(
     let memory = device.allocate_memory(ty, requirements.size).unwrap();
     let buffer = device.bind_buffer_memory(&memory, 0, buffer).unwrap();
 
-    (memory, buffer)
+    (memory, buffer, requirements.size)
 }
 
 #[cfg(not(any(feature = "vulkan", feature = "dx12", feature = "metal")))]

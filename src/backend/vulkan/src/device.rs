@@ -3,7 +3,7 @@ use ash::extensions as ext;
 use ash::version::DeviceV1_0;
 use smallvec::SmallVec;
 
-use hal::{buffer, device as d, format, image, mapping, pass, pso, query, queue, window};
+use hal::{buffer, device as d, format, image, mapping, pass, pso, query, queue};
 use hal::{Backbuffer, Features, MemoryTypeId, SwapchainConfig};
 use hal::error::HostExecutionError;
 use hal::memory::Requirements;
@@ -260,15 +260,55 @@ impl d::Device<B> for Device {
         };
 
         let raw = unsafe {
-            self.raw.0.create_pipeline_layout(&info, None)
+            self.raw.0
+                .create_pipeline_layout(&info, None)
                 .expect("Error on pipeline signature creation") // TODO: handle this better
         };
 
         n::PipelineLayout { raw }
     }
 
+    fn create_pipeline_cache(&self) -> n::PipelineCache {
+        let info = vk::PipelineCacheCreateInfo {
+            s_type: vk::StructureType::PipelineCacheCreateInfo,
+            p_next: ptr::null(),
+            flags: vk::PipelineCacheCreateFlags::empty(),
+            initial_data_size: 0, //TODO
+            p_initial_data: ptr::null(),
+        };
+
+        let raw = unsafe {
+            self.raw.0
+                .create_pipeline_cache(&info, None)
+                .expect("Error on pipeline cache creation")
+        };
+
+        n::PipelineCache {
+            raw
+        }
+    }
+
+    fn destroy_pipeline_cache(&self, cache: n::PipelineCache) {
+        unsafe {
+            self.raw.0.destroy_pipeline_cache(cache.raw, None)
+        };
+    }
+
+    fn merge_pipeline_caches<I>(&self, target: &n::PipelineCache, sources: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<n::PipelineCache>,
+    {
+        let caches = sources.into_iter().map(|s| s.borrow().raw).collect::<Vec<_>>();
+        unsafe  {
+            self.raw.0
+                .fp_v1_0()
+                .merge_pipeline_caches(self.raw.0.handle(), target.raw, caches.len() as u32, caches.as_ptr())
+        };
+    }
+
     fn create_graphics_pipelines<'a, T>(
-        &self, descs: T
+        &self, descs: T, cache: Option<&n::PipelineCache>
     ) -> Vec<Result<n::GraphicsPipeline, pso::CreationError>>
     where
         T: IntoIterator,
@@ -293,7 +333,7 @@ impl d::Device<B> for Device {
         let mut info_dynamic_states        = Vec::with_capacity(descs.len());
         let mut color_attachments          = Vec::with_capacity(descs.len());
         let mut info_specializations       = Vec::with_capacity(descs.len() * NUM_STAGES);
-        let mut specialization_data        = Vec::with_capacity(descs.len() * NUM_STAGES);
+        let mut specialization_entries     = Vec::with_capacity(descs.len() * NUM_STAGES);
         let mut dynamic_states             = Vec::with_capacity(descs.len() * MAX_DYNAMIC_STATES);
         let mut viewports                  = Vec::with_capacity(descs.len());
         let mut scissors                   = Vec::with_capacity(descs.len());
@@ -305,20 +345,23 @@ impl d::Device<B> for Device {
             let p_name = string.as_ptr();
             c_strings.push(string);
 
-            let mut data = SmallVec::<[u8; 64]>::new();
-            let map_entries = conv::map_specialization_constants(
-                &source.specialization,
-                &mut data,
-            ).unwrap();
+            let map_entries = source.specialization.constants
+                .iter()
+                .map(|c| vk::SpecializationMapEntry {
+                    constant_id: c.id,
+                    offset: c.range.start as _,
+                    size: (c.range.end - c.range.start) as _,
+                })
+                .collect::<SmallVec<[_; 4]>>();
 
-            specialization_data.push((data, map_entries));
-            let &(ref data, ref map_entries) = specialization_data.last().unwrap();
+            specialization_entries.push(map_entries);
+            let map_entries = specialization_entries.last().unwrap();
 
             info_specializations.push(vk::SpecializationInfo {
                 map_entry_count: map_entries.len() as _,
                 p_map_entries: map_entries.as_ptr(),
-                data_size: data.len() as _,
-                p_data: data.as_ptr() as _,
+                data_size: source.specialization.data.len() as _,
+                p_data: source.specialization.data.as_ptr() as _,
             });
             let info = info_specializations.last().unwrap();
 
@@ -652,7 +695,10 @@ impl d::Device<B> for Device {
         } else {
             unsafe {
                 self.raw.0.create_graphics_pipelines(
-                    vk::PipelineCache::null(),
+                    match cache {
+                        Some(cache) => cache.raw,
+                        None => vk::PipelineCache::null(),
+                    },
                     &valid_infos,
                     None,
                 )
@@ -679,7 +725,7 @@ impl d::Device<B> for Device {
     }
 
     fn create_compute_pipelines<'a, T>(
-        &self, descs: T
+        &self, descs: T, cache: Option<&n::PipelineCache>
     ) -> Vec<Result<n::ComputePipeline, pso::CreationError>>
     where
         T: IntoIterator,
@@ -688,7 +734,7 @@ impl d::Device<B> for Device {
         let descs = descs.into_iter().collect::<Vec<_>>();
         let mut c_strings = Vec::new(); // hold the C strings temporarily
         let mut info_specializations = Vec::with_capacity(descs.len());
-        let mut specialization_data = Vec::with_capacity(descs.len());
+        let mut specialization_entries = Vec::with_capacity(descs.len());
 
         let infos = descs.iter().map(|desc| {
             let desc = desc.borrow();
@@ -696,20 +742,23 @@ impl d::Device<B> for Device {
             let p_name = string.as_ptr();
             c_strings.push(string);
 
-            let mut data = SmallVec::<[u8; 64]>::new();
-            let map_entries = conv::map_specialization_constants(
-                &desc.shader.specialization,
-                &mut data,
-            ).unwrap();
+            let map_entries = desc.shader.specialization.constants
+                .iter()
+                .map(|c| vk::SpecializationMapEntry {
+                    constant_id: c.id,
+                    offset: c.range.start as _,
+                    size: (c.range.end - c.range.start) as _,
+                })
+                .collect::<SmallVec<[_; 4]>>();
 
-            specialization_data.push((data, map_entries));
-            let &(ref data, ref map_entries) = specialization_data.last().unwrap();
+            specialization_entries.push(map_entries);
+            let map_entries = specialization_entries.last().unwrap();
 
             info_specializations.push(vk::SpecializationInfo {
                 map_entry_count: map_entries.len() as _,
                 p_map_entries: map_entries.as_ptr(),
-                data_size: data.len() as _,
-                p_data: data.as_ptr() as _,
+                data_size: desc.shader.specialization.data.len() as _,
+                p_data: desc.shader.specialization.data.as_ptr() as _,
             });
             let info = info_specializations.last().unwrap();
 
@@ -758,7 +807,10 @@ impl d::Device<B> for Device {
         } else {
             unsafe {
                 self.raw.0.create_compute_pipelines(
-                    vk::PipelineCache::null(),
+                    match cache {
+                        Some(cache) => cache.raw,
+                        None => vk::PipelineCache::null(),
+                    },
                     &valid_infos,
                     None,
                 )
@@ -963,9 +1015,9 @@ impl d::Device<B> for Device {
         format: format::Format,
         tiling: image::Tiling,
         usage: image::Usage,
-        storage_flags: image::StorageFlags,
+        view_caps: image::ViewCapabilities,
     ) -> Result<UnboundImage, image::CreationError> {
-        let flags = conv::map_image_flags(storage_flags);
+        let flags = conv::map_view_capabilities(view_caps);
         let extent = conv::map_extent(kind.extent());
         let array_layers = kind.num_layers();
         let samples = kind.num_samples() as u32;
@@ -1258,14 +1310,14 @@ impl d::Device<B> for Device {
                     raw.p_texel_buffer_view = texel_buffer_views[base..].as_ptr();
                 }
                 Dt::UniformBuffer |
-                Dt::StorageBuffer => {
+                Dt::StorageBuffer |
+                Dt::StorageBufferDynamic |
+                Dt::UniformBufferDynamic => {
                     raw.p_image_info = ptr::null();
                     raw.p_texel_buffer_view = ptr::null();
                     let base = raw.p_buffer_info as usize - raw.descriptor_count as usize;
                     raw.p_buffer_info = buffer_infos[base..].as_ptr();
                 }
-                Dt::StorageBufferDynamic |
-                Dt::UniformBufferDynamic => unimplemented!()
             }
         }
 
@@ -1428,13 +1480,13 @@ impl d::Device<B> for Device {
         unsafe { self.raw.0.free_memory(memory.raw, None); }
     }
 
-    fn create_query_pool(&self, ty: query::QueryType, query_count: u32) -> n::QueryPool {
+    fn create_query_pool(&self, ty: query::Type, query_count: query::Id) -> Result<n::QueryPool, query::Error> {
         let (query_type, pipeline_statistics) = match ty {
-            query::QueryType::Occlusion =>
+            query::Type::Occlusion =>
                 (vk::QueryType::Occlusion, vk::QueryPipelineStatisticFlags::empty()),
-            query::QueryType::PipelineStatistics(statistics) =>
+            query::Type::PipelineStatistics(statistics) =>
                 (vk::QueryType::PipelineStatistics, conv::map_pipeline_statistics(statistics)),
-            query::QueryType::Timestamp =>
+            query::Type::Timestamp =>
                 (vk::QueryType::Timestamp, vk::QueryPipelineStatisticFlags::empty()),
         };
 
@@ -1452,7 +1504,33 @@ impl d::Device<B> for Device {
                         .expect("Error on query pool creation") // TODO: error handling
         };
 
-        n::QueryPool(pool)
+        Ok(n::QueryPool(pool))
+    }
+
+    fn get_query_pool_results(
+        &self, pool: &n::QueryPool, queries: Range<query::Id>,
+        data: &mut [u8], stride: buffer::Offset,
+        flags: query::ResultFlags,
+    ) -> Result<bool, query::Error> {
+        let result = unsafe {
+            self.raw.0
+                .fp_v1_0()
+                .get_query_pool_results(
+                    self.raw.0.handle(),
+                    pool.0, queries.start, queries.end - queries.start,
+                    data.len(), data.as_mut_ptr() as *mut _, stride,
+                    conv::map_query_result_flags(flags),
+                )
+        };
+
+        match result {
+            vk::Result::Success => Ok(true),
+            vk::Result::NotReady => Ok(false),
+            _ => {
+                error!("get_query_pool_results error {:?}", result);
+                Err(())
+            }
+        }
     }
 
     fn create_swapchain(
@@ -1460,21 +1538,17 @@ impl d::Device<B> for Device {
         surface: &mut w::Surface,
         config: SwapchainConfig,
         provided_old_swapchain: Option<w::Swapchain>,
-        extent: &window::Extent2D,
     ) -> (w::Swapchain, Backbuffer<B>) {
         let functor = ext::Swapchain::new(&surface.raw.instance.0, &self.raw.0)
             .expect("Unable to query swapchain function");
-
-        // TODO: handle depth stencil
-        let format = config.color_format;
 
         let old_swapchain = match provided_old_swapchain {
             Some(osc) => osc.raw,
             None => vk::SwapchainKHR::null(),
         };
 
-        surface.width = extent.width;
-        surface.height = extent.height;
+        surface.width = config.extent.width;
+        surface.height = config.extent.height;
 
         let info = vk::SwapchainCreateInfoKHR {
             s_type: vk::StructureType::SwapchainCreateInfoKhr,
@@ -1482,7 +1556,7 @@ impl d::Device<B> for Device {
             flags: vk::SwapchainCreateFlagsKHR::empty(),
             surface: surface.raw.handle,
             min_image_count: config.image_count,
-            image_format: conv::map_format(format),
+            image_format: conv::map_format(config.format),
             image_color_space: vk::ColorSpaceKHR::SrgbNonlinear,
             image_extent: vk::Extent2D {
                 width: surface.width,

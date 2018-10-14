@@ -3,16 +3,34 @@
  */
 
 use std::env;
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
-use std::ffi::OsStr;
 
 fn main() {
     //Naturally, don't run if we're not building under macOS/iOS
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let pd = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let target = env::var("TARGET").unwrap();
+        let os = if target.ends_with("ios") {
+            "ios"
+        } else if target.ends_with("darwin") {
+            "darwin"
+        } else {
+            panic!("unsupported target {}", target)
+        };
+        let arch = &target[..target.chars().position(|c| c == '-').unwrap()];
+
+        let (sdk_name, platform_args): (_, &[_]) = match (os, arch) {
+            ("ios", "aarch64") => ("iphoneos", &["-mios-version-min=8.0"]),
+            ("ios", "armv7s") | ("ios", "armv7") => panic!("32-bit iOS does not have metal support"),
+            ("ios", "i386") | ("ios", "x86_64") => panic!("iOS simulator does not have metal support"),
+            ("darwin", _) => ("macosx", &["-mmacosx-version-min=10.11"]),
+            _ => panic!("unsupported target {}", target),
+        };
+
         let project_dir = Path::new(&pd);
         let shader_dir = project_dir.join("shaders");
         println!("cargo:rerun-if-changed={}", shader_dir.to_str().unwrap());
@@ -29,17 +47,9 @@ fn main() {
                 let path = entry.path();
                 match path.extension().and_then(OsStr::to_str) {
                     Some("metal") => Some(path),
-                    _ => None
+                    _ => None,
                 }
             });
-
-        // Compile all the metal files into OUT_DIR
-        let mut compiled_shader_files: Vec<PathBuf> = Vec::new();
-        for shader_path in shader_files.into_iter() {
-            println!("cargo:rerun-if-changed={}", shader_path.to_str().unwrap());
-
-            let mut out_path = out_dir.join(shader_path.file_name().unwrap());
-            out_path.set_extension("air");
 
             let status = Command::new("xcrun")
                 .args(&["-sdk", "macosx", "metal"])
@@ -59,10 +69,11 @@ fn main() {
 
         // Link all the compiled files into a single library
         let status = Command::new("xcrun")
-            .args(&["-sdk", "macosx", "metallib"])
-            .args(compiled_shader_files.iter().map(|p| p.as_os_str()))
+            .args(&["-sdk", sdk_name, "metal", "-c"])
+            .arg(shader_path.as_os_str())
             .arg("-o")
-            .arg(out_lib.as_os_str())
+            .arg(out_path.as_os_str())
+            .args(platform_args)
             .status()
             .expect("failed to execute metal library builder");
 
@@ -71,4 +82,3 @@ fn main() {
         }
     }
 }
-

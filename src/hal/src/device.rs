@@ -11,13 +11,13 @@
 //! handle to that physical device that has the requested capabilities
 //! and is used to actually do things.
 
-use std::{fmt, mem, slice};
 use std::any::Any;
 use std::borrow::Borrow;
 use std::error::Error;
 use std::ops::Range;
+use std::{fmt, iter, mem, slice};
 
-use {buffer, format, image, mapping, pass, pso, query, window};
+use {buffer, format, image, mapping, pass, pso, query};
 use {Backend, MemoryTypeId};
 
 use error::HostExecutionError;
@@ -26,7 +26,6 @@ use pool::{CommandPool, CommandPoolCreateFlags};
 use queue::{QueueFamilyId, QueueGroup};
 use range::RangeArg;
 use window::{Backbuffer, SwapchainConfig};
-
 
 /// Error allocating memory.
 #[derive(Clone, PartialEq, Debug)]
@@ -93,22 +92,38 @@ pub enum ShaderError {
     UnsupportedStage(pso::Stage),
 }
 
+impl fmt::Display for ShaderError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ShaderError::CompilationFailed(ref msg) => {
+                write!(f, "shader compilation failed: {}", msg)
+            }
+            ShaderError::MissingEntryPoint(ref msg) => {
+                write!(f, "shader is missing an entry point: {}", msg)
+            }
+            ShaderError::InterfaceMismatch(ref msg) => {
+                write!(f, "shader interface mismatch: {}", msg)
+            }
+            ShaderError::UnsupportedStage(stage) => {
+                write!(f, "shader stage \"{}\" is unsupported", stage)
+            }
+        }
+    }
+}
+
+impl Error for ShaderError {}
+
 /// An error from creating a framebuffer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FramebufferError;
 
 impl fmt::Display for FramebufferError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.description())
+        write!(f, "Error creating framebuffer")
     }
 }
 
-impl Error for FramebufferError {
-    fn description(&self) -> &str {
-        "Error creating framebuffer"
-    }
-}
-
+impl Error for FramebufferError {}
 
 /// # Overview
 ///
@@ -139,7 +154,11 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     /// * `memory_type` - Index of the memory type in the memory properties of the associated physical device.
     /// * `size` - Size of the allocation.
-    fn allocate_memory(&self, memory_type: MemoryTypeId, size: u64) -> Result<B::Memory, OutOfMemory>;
+    fn allocate_memory(
+        &self,
+        memory_type: MemoryTypeId,
+        size: u64,
+    ) -> Result<B::Memory, OutOfMemory>;
 
     /// Free device memory
     fn free_memory(&self, memory: B::Memory);
@@ -147,7 +166,11 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Create a new command pool for a given queue family.
     ///
     /// *Note*: the family has to be associated by one as the `Gpu::queue_groups`.
-    fn create_command_pool(&self, family: QueueFamilyId, create_flags: CommandPoolCreateFlags) -> B::CommandPool;
+    fn create_command_pool(
+        &self,
+        family: QueueFamilyId,
+        create_flags: CommandPoolCreateFlags,
+    ) -> B::CommandPool;
 
     /// Create a strongly typed command pool wrapper.
     fn create_command_pool_typed<C>(
@@ -218,17 +241,34 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Destroy a pipeline layout object
     fn destroy_pipeline_layout(&self, layout: B::PipelineLayout);
 
+    /// Create a pipeline cache object.
+    //TODO: allow loading from disk
+    fn create_pipeline_cache(&self) -> B::PipelineCache;
+
+    /// Merge a number of source pipeline caches into the target one.
+    fn merge_pipeline_caches<I>(&self, target: &B::PipelineCache, sources: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<B::PipelineCache>;
+
+    /// Destroy a pipeline cache object.
+    fn destroy_pipeline_cache(&self, cache: B::PipelineCache);
+
     /// Create a graphics pipeline.
     fn create_graphics_pipeline<'a>(
         &self,
-        desc: &pso::GraphicsPipelineDesc<'a, B>
+        desc: &pso::GraphicsPipelineDesc<'a, B>,
+        cache: Option<&B::PipelineCache>,
     ) -> Result<B::GraphicsPipeline, pso::CreationError> {
-        self.create_graphics_pipelines(Some(desc)).remove(0)
+        self.create_graphics_pipelines(iter::once(desc), cache)
+            .remove(0)
     }
 
     /// Create graphics pipelines.
     fn create_graphics_pipelines<'a, I>(
-        &self, descs: I
+        &self,
+        descs: I,
+        cache: Option<&B::PipelineCache>,
     ) -> Vec<Result<B::GraphicsPipeline, pso::CreationError>>
     where
         I: IntoIterator,
@@ -236,7 +276,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     {
         descs
             .into_iter()
-            .map(|desc| self.create_graphics_pipeline(desc.borrow()))
+            .map(|desc| self.create_graphics_pipeline(desc.borrow(), cache))
             .collect()
     }
 
@@ -249,14 +289,18 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Create a compute pipeline.
     fn create_compute_pipeline<'a>(
         &self,
-        desc: &pso::ComputePipelineDesc<'a, B>
+        desc: &pso::ComputePipelineDesc<'a, B>,
+        cache: Option<&B::PipelineCache>,
     ) -> Result<B::ComputePipeline, pso::CreationError> {
-        self.create_compute_pipelines(Some(desc)).remove(0)
+        self.create_compute_pipelines(iter::once(desc), cache)
+            .remove(0)
     }
 
     /// Create compute pipelines.
     fn create_compute_pipelines<'a, I>(
-        &self, descs: I
+        &self,
+        descs: I,
+        cache: Option<&B::PipelineCache>,
     ) -> Vec<Result<B::ComputePipeline, pso::CreationError>>
     where
         I: IntoIterator,
@@ -264,7 +308,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     {
         descs
             .into_iter()
-            .map(|desc| self.create_compute_pipeline(desc.borrow()))
+            .map(|desc| self.create_compute_pipeline(desc.borrow(), cache))
             .collect()
     }
 
@@ -295,9 +339,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     /// Once a shader module has been created, any entry points it contains can be used in pipeline
     /// shader stages as described in *Compute Pipelines* and *Graphics Pipelines*.
-    fn create_shader_module(
-        &self, spirv_data: &[u8]
-    ) -> Result<B::ShaderModule, ShaderError>;
+    fn create_shader_module(&self, spirv_data: &[u8]) -> Result<B::ShaderModule, ShaderError>;
 
     /// Destroy a shader module module
     ///
@@ -308,7 +350,9 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     /// The created buffer won't have associated memory until `bind_buffer_memory` is called.
     fn create_buffer(
-        &self, size: u64, usage: buffer::Usage,
+        &self,
+        size: u64,
+        usage: buffer::Usage,
     ) -> Result<B::UnboundBuffer, buffer::CreationError>;
 
     /// Get memory requirements for the unbound buffer
@@ -320,7 +364,10 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Be sure to check that there is enough memory available for the buffer.
     /// Use `get_buffer_requirements` to acquire the memory requirements.
     fn bind_buffer_memory(
-        &self, memory: &B::Memory, offset: u64, buf: B::UnboundBuffer
+        &self,
+        memory: &B::Memory,
+        offset: u64,
+        buf: B::UnboundBuffer,
     ) -> Result<B::Buffer, BindError>;
 
     /// Destroy a buffer.
@@ -331,7 +378,10 @@ pub trait Device<B: Backend>: Any + Send + Sync {
 
     /// Create a new buffer view object
     fn create_buffer_view<R: RangeArg<u64>>(
-        &self, buf: &B::Buffer, fmt: Option<format::Format>, range: R
+        &self,
+        buf: &B::Buffer,
+        fmt: Option<format::Format>,
+        range: R,
     ) -> Result<B::BufferView, buffer::ViewCreationError>;
 
     /// Destroy a buffer view object
@@ -339,8 +389,13 @@ pub trait Device<B: Backend>: Any + Send + Sync {
 
     /// Create a new image object
     fn create_image(
-        &self, kind: image::Kind, mip_levels: image::Level, format: format::Format,
-        tiling: image::Tiling, usage: image::Usage, storage_flags: image::StorageFlags,
+        &self,
+        kind: image::Kind,
+        mip_levels: image::Level,
+        format: format::Format,
+        tiling: image::Tiling,
+        usage: image::Usage,
+        view_caps: image::ViewCapabilities,
     ) -> Result<B::UnboundImage, image::CreationError>;
 
     /// Get memory requirements for the unbound Image
@@ -348,12 +403,17 @@ pub trait Device<B: Backend>: Any + Send + Sync {
 
     ///
     fn get_image_subresource_footprint(
-        &self, image: &B::Image, subresource: image::Subresource
+        &self,
+        image: &B::Image,
+        subresource: image::Subresource,
     ) -> image::SubresourceFootprint;
 
     /// Bind device memory to an image object
     fn bind_image_memory(
-        &self, &B::Memory, offset: u64, B::UnboundImage
+        &self,
+        &B::Memory,
+        offset: u64,
+        B::UnboundImage,
     ) -> Result<B::Image, BindError>;
 
     /// Destroy an image.
@@ -404,7 +464,9 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// of the number of descriptors in the binding, a set of shader stages that **can** access the
     /// binding, and (if using immutable samplers) an array of sampler descriptors.
     fn create_descriptor_set_layout<I, J>(
-        &self, bindings: I, immutable_samplers: J
+        &self,
+        bindings: I,
+        immutable_samplers: J,
     ) -> B::DescriptorSetLayout
     where
         I: IntoIterator,
@@ -455,24 +517,26 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Acquire a mapping Reader.
     ///
     /// The accessible slice will correspond to the specified range (in bytes).
-    fn acquire_mapping_reader<'a, T>(&self, memory: &'a B::Memory, range: Range<u64>)
-        -> Result<mapping::Reader<'a, B, T>, mapping::Error>
+    fn acquire_mapping_reader<'a, T>(
+        &self,
+        memory: &'a B::Memory,
+        range: Range<u64>,
+    ) -> Result<mapping::Reader<'a, B, T>, mapping::Error>
     where
         T: Copy,
     {
         let len = range.end - range.start;
         let count = len as usize / mem::size_of::<T>();
-        self.map_memory(memory, range.clone())
-            .map(|ptr| unsafe {
-                let start_ptr = ptr as *const _;
-                self.invalidate_mapped_memory_ranges(Some((memory, range.clone())));
+        self.map_memory(memory, range.clone()).map(|ptr| unsafe {
+            let start_ptr = ptr as *const _;
+            self.invalidate_mapped_memory_ranges(iter::once((memory, range.clone())));
 
-                mapping::Reader {
-                    slice: slice::from_raw_parts(start_ptr, count),
-                    memory,
-                    released: false,
-                }
-            })
+            mapping::Reader {
+                slice: slice::from_raw_parts(start_ptr, count),
+                memory,
+                released: false,
+            }
+        })
     }
 
     /// Release a mapping Reader.
@@ -484,28 +548,30 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Acquire a mapping Writer.
     ///
     /// The accessible slice will correspond to the specified range (in bytes).
-    fn acquire_mapping_writer<'a, T>(&self, memory: &'a B::Memory, range: Range<u64>)
-        -> Result<mapping::Writer<'a, B, T>, mapping::Error>
+    fn acquire_mapping_writer<'a, T>(
+        &self,
+        memory: &'a B::Memory,
+        range: Range<u64>,
+    ) -> Result<mapping::Writer<'a, B, T>, mapping::Error>
     where
         T: Copy,
     {
         let count = (range.end - range.start) as usize / mem::size_of::<T>();
-        self.map_memory(memory, range.clone())
-            .map(|ptr| unsafe {
-                let start_ptr = ptr as *mut _;
-                mapping::Writer {
-                    slice: slice::from_raw_parts_mut(start_ptr, count),
-                    memory,
-                    range,
-                    released: false,
-                }
-            })
+        self.map_memory(memory, range.clone()).map(|ptr| unsafe {
+            let start_ptr = ptr as *mut _;
+            mapping::Writer {
+                slice: slice::from_raw_parts_mut(start_ptr, count),
+                memory,
+                range,
+                released: false,
+            }
+        })
     }
 
     /// Release a mapping Writer.
     fn release_mapping_writer<'a, T>(&self, mut writer: mapping::Writer<'a, B, T>) {
         writer.released = true;
-        self.flush_mapped_memory_ranges(Some((writer.memory, writer.range.clone())));
+        self.flush_mapped_memory_ranges(iter::once((writer.memory, writer.range.clone())));
         self.unmap_memory(writer.memory);
     }
 
@@ -526,7 +592,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
 
     ///
     fn reset_fence(&self, fence: &B::Fence) {
-        self.reset_fences(Some(fence));
+        self.reset_fences(iter::once(fence));
     }
 
     ///
@@ -543,7 +609,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Blocks until the given fence is signaled.
     /// Returns true if the fence was signaled before the timeout.
     fn wait_for_fence(&self, fence: &B::Fence, timeout_ns: u64) -> bool {
-        self.wait_for_fences(Some(fence), WaitFor::All, timeout_ns)
+        self.wait_for_fences(iter::once(fence), WaitFor::All, timeout_ns)
     }
 
     /// Blocks until all or one of the given fences are signaled.
@@ -553,7 +619,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
         I: IntoIterator,
         I::Item: Borrow<B::Fence>,
     {
-        use std::{time, thread};
+        use std::{thread, time};
         fn to_ns(duration: time::Duration) -> u64 {
             duration.as_secs() * 1_000_000_000 + duration.subsec_nanos() as u64
         }
@@ -601,10 +667,25 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     /// Queries are managed using query pool objects. Each query pool is a collection of a specific
     /// number of queries of a particular type.
-    fn create_query_pool(&self, ty: query::QueryType, count: u32) -> B::QueryPool;
+    fn create_query_pool(
+        &self,
+        ty: query::Type,
+        count: query::Id,
+    ) -> Result<B::QueryPool, query::Error>;
 
     /// Destroy a query pool object
     fn destroy_query_pool(&self, pool: B::QueryPool);
+
+    /// Get query pool results into the specified CPU memory.
+    /// Returns `Ok(false)` if the results are not ready yet and neither of `WAIT` or `PARTIAL` flags are set.
+    fn get_query_pool_results(
+        &self,
+        pool: &B::QueryPool,
+        queries: Range<query::Id>,
+        data: &mut [u8],
+        stride: buffer::Offset,
+        flags: query::ResultFlags,
+    ) -> Result<bool, query::Error>;
 
     /// Create a new swapchain from a surface and a queue family, optionally providing the old
     /// swapchain to aid in resource reuse and rendering continuity.
@@ -630,9 +711,8 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     ///
     /// # let mut surface: empty::Surface = return;
     /// # let device: empty::Device = return;
-    /// # let extent = gfx_hal::window::Extent2D {width: 0, height: 0} ;
-    /// let swapchain_config = SwapchainConfig::new().with_color(Format::Rgba8Srgb);
-    /// device.create_swapchain(&mut surface, swapchain_config, None, &extent);
+    /// let swapchain_config = SwapchainConfig::new(100, 100, Format::Rgba8Srgb, 2);
+    /// device.create_swapchain(&mut surface, swapchain_config, None);
     /// # }
     /// ```
     fn create_swapchain(
@@ -640,13 +720,10 @@ pub trait Device<B: Backend>: Any + Send + Sync {
         surface: &mut B::Surface,
         config: SwapchainConfig,
         old_swapchain: Option<B::Swapchain>,
-        extent: &window::Extent2D,
     ) -> (B::Swapchain, Backbuffer<B>);
 
     ///
-    fn destroy_swapchain(
-        &self,
-        swapchain: B::Swapchain);
+    fn destroy_swapchain(&self, swapchain: B::Swapchain);
 
     /// Wait for all queues associated with this device to idle.
     ///

@@ -1,6 +1,4 @@
 use ash::vk;
-use byteorder::{NativeEndian, WriteBytesExt};
-use smallvec::SmallVec;
 
 use hal::{buffer, command, format, image, pass, pso, query};
 use hal::{IndexType, Primitive, PresentMode};
@@ -8,7 +6,7 @@ use hal::range::RangeArg;
 
 use native as n;
 
-use std::{io, mem};
+use std::mem;
 use std::borrow::Borrow;
 use std::ptr;
 
@@ -177,6 +175,11 @@ pub fn map_buffer_usage(usage: buffer::Usage) -> vk::BufferUsageFlags {
 }
 
 pub fn map_image_usage(usage: image::Usage) -> vk::ImageUsageFlags {
+    // Safe due to equivalence of HAL values and Vulkan values
+    unsafe { mem::transmute(usage) }
+}
+
+pub fn map_vk_image_usage(usage: vk::ImageUsageFlags) -> image::Usage {
     // Safe due to equivalence of HAL values and Vulkan values
     unsafe { mem::transmute(usage) }
 }
@@ -359,33 +362,6 @@ pub fn map_blend_op(
     }
 }
 
-pub fn map_specialization_constants(
-    specialization: &[pso::Specialization],
-    data: &mut SmallVec<[u8; 64]>,
-) -> Result<SmallVec<[vk::SpecializationMapEntry; 16]>, io::Error> {
-    specialization
-        .iter()
-        .map(|constant| {
-            let offset = data.len();
-            match constant.value {
-                pso::Constant::Bool(v) => { data.write_u32::<NativeEndian>(v as u32) }
-                pso::Constant::U32(v)  => { data.write_u32::<NativeEndian>(v) }
-                pso::Constant::U64(v)  => { data.write_u64::<NativeEndian>(v) }
-                pso::Constant::I32(v)  => { data.write_i32::<NativeEndian>(v) }
-                pso::Constant::I64(v)  => { data.write_i64::<NativeEndian>(v) }
-                pso::Constant::F32(v)  => { data.write_f32::<NativeEndian>(v) }
-                pso::Constant::F64(v)  => { data.write_f64::<NativeEndian>(v) }
-            }?;
-
-            Ok(vk::SpecializationMapEntry {
-                constant_id: constant.id,
-                offset: offset as _,
-                size: (data.len() - offset) as _,
-            })
-        })
-        .collect::<Result<_, _>>()
-}
-
 pub fn map_pipeline_statistics(
     statistics: query::PipelineStatistic,
 ) -> vk::QueryPipelineStatisticFlags {
@@ -393,9 +369,13 @@ pub fn map_pipeline_statistics(
     unsafe { mem::transmute(statistics) }
 }
 
-pub fn map_query_control_flags(flags: query::QueryControl) -> vk::QueryControlFlags {
+pub fn map_query_control_flags(flags: query::ControlFlags) -> vk::QueryControlFlags {
     // Safe due to equivalence of HAL values and Vulkan values
-    unsafe { mem::transmute(flags) }
+    vk::QueryControlFlags::from_flags_truncate(flags.bits())
+}
+
+pub fn map_query_result_flags(flags: query::ResultFlags) -> vk::QueryResultFlags {
+    vk::QueryResultFlags::from_flags_truncate(flags.bits())
 }
 
 pub fn map_image_features(features: vk::FormatFeatureFlags) -> format::ImageFeature {
@@ -511,9 +491,9 @@ pub fn map_viewport(vp: &pso::Viewport) -> vk::Viewport {
     }
 }
 
-pub fn map_image_flags(flags: image::StorageFlags) -> vk::ImageCreateFlags {
+pub fn map_view_capabilities(caps: image::ViewCapabilities) -> vk::ImageCreateFlags {
     // the flag values have to match Vulkan
-    unsafe { mem::transmute(flags) }
+    unsafe { mem::transmute(caps) }
 }
 
 pub fn map_vk_present_mode(mode: vk::PresentModeKHR) -> PresentMode {

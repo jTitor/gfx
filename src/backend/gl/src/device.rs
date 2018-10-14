@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use gl;
 use gl::types::{GLint, GLenum, GLfloat};
 
-use hal::{self as c, device as d, error, image as i, memory, pass, pso, buffer, mapping, query, window};
+use hal::{self as c, device as d, error, image as i, memory, pass, pso, buffer, mapping, query};
 use hal::backend::FastHashMap;
 use hal::format::{ChannelType, Format, Swizzle};
 use hal::pool::CommandPoolCreateFlags;
@@ -216,30 +216,26 @@ impl Device {
     fn specialize_ast(
         &self,
         ast: &mut spirv::Ast<glsl::Target>,
-        specializations: &[pso::Specialization],
+        specialization: pso::Specialization,
     ) -> Result<(), d::ShaderError> {
         let spec_constants = ast
             .get_specialization_constants()
             .map_err(gen_unexpected_error)?;
 
         for spec_constant in spec_constants {
-            if let Some(constant) = specializations
+            if let Some(constant) = specialization.constants
                 .iter()
                 .find(|c| c.id == spec_constant.constant_id)
             {
                 // Override specialization constant values
-                unsafe {
-                    let value = match constant.value {
-                        pso::Constant::Bool(v) => v as u64,
-                        pso::Constant::U32(v) => v as u64,
-                        pso::Constant::U64(v) => v,
-                        pso::Constant::I32(v) => *(&v as *const _ as *const u64),
-                        pso::Constant::I64(v) => *(&v as *const _ as *const u64),
-                        pso::Constant::F32(v) => *(&v as *const _ as *const u64),
-                        pso::Constant::F64(v) => *(&v as *const _ as *const u64),
-                    };
-                    ast.set_scalar_constant(spec_constant.id, value).map_err(gen_unexpected_error)?;
-                }
+                let value = specialization
+                    .data[constant.range.start as usize .. constant.range.end as usize]
+                    .iter()
+                    .rev()
+                    .fold(0u64, |u, &b| (u<<8) + b as u64);
+
+                ast.set_scalar_constant(spec_constant.id, value)
+                    .map_err(gen_unexpected_error)?;
             }
         }
 
@@ -541,8 +537,24 @@ impl d::Device<B> for Device {
         }
     }
 
+    fn create_pipeline_cache(&self) -> () {
+        ()
+    }
+
+    fn destroy_pipeline_cache(&self, _: ()) {
+        //empty
+    }
+
+    fn merge_pipeline_caches<I>(&self, _: &(), _: I)
+    where
+        I: IntoIterator,
+        I::Item: Borrow<()>,
+    {
+        //empty
+    }
+
     fn create_graphics_pipeline<'a>(
-        &self, desc: &pso::GraphicsPipelineDesc<'a, B>
+        &self, desc: &pso::GraphicsPipelineDesc<'a, B>, _cache: Option<&()>,
     ) -> Result<n::GraphicsPipeline, pso::CreationError> {
         let gl = &self.share.context;
         let share = &self.share;
@@ -667,8 +679,7 @@ impl d::Device<B> for Device {
     }
 
     fn create_compute_pipeline<'a>(
-        &self,
-        desc: &pso::ComputePipelineDesc<'a, B>,
+        &self, desc: &pso::ComputePipelineDesc<'a, B>, _cache: Option<&()>
     ) -> Result<n::ComputePipeline, pso::CreationError> {
         let gl = &self.share.context;
         let share = &self.share;
@@ -770,7 +781,7 @@ impl d::Device<B> for Device {
         unsafe {
             assert!(pass.attachments.len() <= att_points.len());
             gl.DrawBuffers(attachments_len as _, att_points.as_ptr());
-            let status = gl.CheckFramebufferStatus(target);
+            let _status = gl.CheckFramebufferStatus(target); //TODO: check status
             gl.BindFramebuffer(target, 0);
         }
         if let Err(err) = self.share.check() {
@@ -1031,7 +1042,7 @@ impl d::Device<B> for Device {
         format: Format,
         _tiling: i::Tiling,
         usage: i::Usage,
-        _flags: i::StorageFlags,
+        _view_caps: i::ViewCapabilities,
     ) -> Result<UnboundImage, i::CreationError> {
         let gl = &self.share.context;
 
@@ -1305,11 +1316,19 @@ impl d::Device<B> for Device {
         // Nothing to do
     }
 
-    fn create_query_pool(&self, _ty: query::QueryType, _count: u32) -> () {
+    fn create_query_pool(&self, _ty: query::Type, _count: query::Id) -> Result<(), query::Error> {
         unimplemented!()
     }
 
     fn destroy_query_pool(&self, _: ()) {
+        unimplemented!()
+    }
+
+    fn get_query_pool_results(
+        &self, _pool: &(), _queries: Range<query::Id>,
+        _data: &mut [u8], _stride: buffer::Offset,
+        _flags: query::ResultFlags,
+    ) -> Result<bool, query::Error> {
         unimplemented!()
     }
 
@@ -1394,7 +1413,6 @@ impl d::Device<B> for Device {
         surface: &mut Surface,
         config: c::SwapchainConfig,
         _old_swapchain: Option<Swapchain>,
-        _extent: &window::Extent2D,
     ) -> (Swapchain, c::Backbuffer<B>) {
         self.create_swapchain_impl(surface, config)
     }
